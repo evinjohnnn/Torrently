@@ -28,6 +28,7 @@ import { Backdrop } from "./Backdrop";
 const Player = lazy(() =>
   import("./Player").then((module) => ({ default: module.Player })),
 );
+import "@fontsource/doto/latin-900.css";
 import "@fontsource/space-grotesk/latin-400.css";
 import "@fontsource/space-grotesk/latin-500.css";
 import "@fontsource/space-grotesk/latin-600.css";
