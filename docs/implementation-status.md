@@ -20,7 +20,7 @@ All 63 public Webtor organization repositories were enumerated. Sixteen deployed
 | Evidence/docs | `docs/audit/`, `docs/api.md`, `architecture.md`, `security.md`, `features.md`, deployment/operations/migration/acceptance guides |
 | Supply chain | `upstream.lock.json`, `package-lock.json`, `LICENSES/`, `THIRD-PARTY-NOTICES.md`, `.github/workflows/verify.yml` |
 
-All working files were created on `feat/torrently-platform`. Existing code/history was not overwritten. Local `.env` secrets and `.data`/cache files are ignored by Git and excluded from the Docker build context. No repository content has been pushed, no PR created, and no public infrastructure provisioned.
+All working files were created on `feat/torrently-platform`. Existing code/history was not overwritten. Local `.env` secrets and `.data`/cache files are ignored by Git and excluded from the Docker build context. At initial delivery this branch was local only. Both Torrently and the pinned Webtor source are now included in the repository for the requested GitHub publication. No PR or public infrastructure was created.
 
 ## 3. Verified functionality
 

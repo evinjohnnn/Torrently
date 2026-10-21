@@ -12,3 +12,6 @@ test-results
 *.log
 
 .data
+
+# The Webtor service has its own independent build context.
+backend/

@@ -12,7 +12,7 @@ scripts/health.sh
 scripts/check-disk.sh "./data/torrent-cache" 25
 ```
 
-Use the privately provisioned Webtor API key. In a sibling checkout of the pinned `webtor-io/self-hosted` SHA, execute `tests/run.sh torrently-webtor:dbab88e` to verify upstream boot, real controlled torrent fixture, DDL/Range, ZIP, direct HLS, transcode, subtitles, S3 and restart persistence. Read its fixture scripts first. Tests create and tear down their own containers; use an isolated Docker project/host and unused ports. These are own-deployment tests, never load against Webtor.io. Preserve test output with secrets removed.
+Use the privately provisioned Webtor API key. From the committed `backend/webtor/` snapshot, execute `tests/run.sh torrently-webtor:dbab88e` to verify upstream boot, real controlled torrent fixture, DDL/Range, ZIP, direct HLS, transcode, subtitles, S3 and restart persistence. Read its fixture scripts first. Tests create and tear down their own containers; use an isolated Docker project/host and unused ports. These are own-deployment tests, never load against Webtor.io. Preserve test output with secrets removed.
 
 For Torrently acceptance, use its tests and browser checklist against the deployed stack:
 

@@ -4,6 +4,17 @@ A self-hosted React torrent workspace with a secure TypeScript adapter for Webto
 
 **Current status:** the application builds and its local API/database/browser checks pass. The real Webtor containers and BitTorrent playback have **not** been run on this development Mac. This is an implemented integration awaiting Linux engine acceptance, not a claim of complete Webtor parity. The Predator laptop was unavailable. See [implementation status](docs/implementation-status.md), [feature boundaries](docs/features.md), and the [target acceptance checklist](docs/tests/acceptance.md).
 
+## Repository layout
+
+This repository contains both applications:
+
+- `client/`: Torrently website and media player.
+- `server/`: Torrently authenticated API adapter and persistence.
+- `backend/webtor/`: complete pinned source snapshot of the official Webtor self-hosted repository, including its Dockerfile, configuration, service supervision and tests.
+- `compose.yaml`: builds the website/API and the local Webtor backend together.
+
+The backend is committed as ordinary files, not a submodule or a floating Git build URL. Its provenance and update process are in [backend/README.md](backend/README.md). The all-in-one Dockerfile still downloads its pinned upstream service images; this is not an offline build.
+
 ## Run the application locally
 
 Use Node 24.10 or newer (below 26). From this checkout:

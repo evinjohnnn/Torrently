@@ -1,0 +1,36 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "description": "Webtor components: keep the tag, bump the digest, one PR each. Automerged once the smoke checks pass — by the time a digest lands here the same build has already been serving production webtor.io, so green CI is the only remaining question. Renovate merges these itself on a later run (platformAutomerge off) rather than relying on GitHub native auto-merge, which would require branch protection.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["ghcr.io/webtor-io/**"],
+      "pinDigests": true,
+      "groupName": null,
+      "schedule": ["at any time"],
+      "automerge": true,
+      "platformAutomerge": false
+    },
+    {
+      "description": "Base images (alpine, nats, nats-box, versitygw, plus nginx in the test compose): non-major bumps are grouped into one PR, wait 7 days after the upstream release so regressions surface elsewhere first, then automerge on green smoke. Unlike webtor components these never ran anywhere before landing here, hence the bake time.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["alpine", "nats", "natsio/nats-box", "ghcr.io/versity/versitygw", "nginx"],
+      "matchUpdateTypes": ["digest", "patch", "minor", "pin", "pinDigest"],
+      "groupName": "base images",
+      "minimumReleaseAge": "7 days",
+      "automerge": true,
+      "platformAutomerge": false
+    },
+    {
+      "description": "Base-image majors (e.g. an alpine version bump changes musl/openssl for every binary in the image): a human reads the release notes first. The PR is only created after it is approved on the dependency dashboard, and is never automerged.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["alpine", "nats", "natsio/nats-box", "ghcr.io/versity/versitygw", "nginx"],
+      "matchUpdateTypes": ["major"],
+      "groupName": null,
+      "automerge": false,
+      "dependencyDashboardApproval": true
+    }
+  ]
+}

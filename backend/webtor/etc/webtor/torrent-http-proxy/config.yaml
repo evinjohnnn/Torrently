@@ -1,0 +1,27 @@
+default:
+  name: torrent-web-seeder
+  endpointsProvider: Environment
+vod:
+  name: nginx-vod
+  endpointsProvider: Environment
+arch:
+  name: torrent-archiver
+  endpointsProvider: Environment
+hls:
+  name: content-transcoder
+  endpointsProvider: Environment
+vtt:
+  name: srt2vtt
+  endpointsProvider: Environment
+ext:
+  name: external-proxy
+  endpointsProvider: Environment
+cp:
+  name: content-prober-http
+  endpointsProvider: Environment
+tr:
+  name: subtitle-translate
+  endpointsProvider: Environment
+vi:
+  name: video-info
+  endpointsProvider: Environment

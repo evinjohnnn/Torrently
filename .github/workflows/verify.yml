@@ -42,7 +42,5 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Assemble pinned upstream source and execute controlled fixtures
         run: |
-          git clone https://github.com/webtor-io/self-hosted.git /tmp/webtor-self-hosted
-          git -C /tmp/webtor-self-hosted checkout --detach dbab88e695660d96073eb16ffd6738c57251d9e0
-          docker build -t torrently-webtor:dbab88e /tmp/webtor-self-hosted
-          /tmp/webtor-self-hosted/tests/run.sh torrently-webtor:dbab88e
+          docker build -t torrently-webtor:dbab88e backend/webtor
+          backend/webtor/tests/run.sh torrently-webtor:dbab88e

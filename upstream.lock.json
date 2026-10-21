@@ -5,7 +5,9 @@
     "repository": "https://github.com/webtor-io/self-hosted",
     "commit": "dbab88e695660d96073eb16ffd6738c57251d9e0",
     "latestReleaseObserved": "v2.1.2",
-    "selectionReason": "Pinned HEAD includes verified multiarch video-info fix, optional OpenAI subtitle-launcher fix and newer compatible archiver/proxy pins; no floating latest"
+    "selectionReason": "Pinned HEAD includes verified multiarch video-info fix, optional OpenAI subtitle-launcher fix and newer compatible archiver/proxy pins; no floating latest",
+    "vendoredPath": "backend/webtor",
+    "sourceTree": "fd622dbcce5f0f3bdc5b455da2ef436d384325c3"
   },
   "components": {
     "torrent-store": {

@@ -1,0 +1,37 @@
+#!/command/with-contenv sh
+set -a
+source /etc/webtor/common.env
+source /etc/webtor/secrets/api.env
+source /etc/webtor/secrets/s3.env
+source /etc/webtor/secrets/session.env
+WEBTOR_API_KEY=$API_KEY
+WEBTOR_API_SECRET=$API_SECRET
+TORRENT_HTTP_PROXY_SERVICE_PORT=$WEB_PORT
+TORRENT_HTTP_PROXY_SERVICE_HOST=127.0.0.1
+WEB_PORT=$WEB_UI_SERVICE_PORT
+# web-ui keys its vault degradation off an empty VAULT_SERVICE_HOST:
+# vault.NewApi returns nil, the /vault routes are never registered, and the
+# page-level CTAs disappear. common.env sets the host unconditionally --
+# envsubst has no conditionals -- so blank it here when the store is off.
+# Leaving it set would point web-ui at a sleeping service: the UI would
+# render and every vault page would fail against a dead endpoint instead of
+# degrading.
+if [ "${USE_VAULT:-true}" = "false" ]; then
+  VAULT_SERVICE_HOST=
+fi
+# AI subtitles follow the AI-features contract (README, "Configuring AI
+# features"): the switch alone enables nothing without an AI key
+# (ANTHROPIC_API_KEY or OPENAI_API_KEY), and a key alone enables nothing
+# without the switch. Resolve the pair here, with the same test as
+# subtitle-translate's run script, so a half-configured one cannot leave the
+# UI offering tracks against a subtitle-translate that idles.
+if [ "${SUBTITLE_TRANSLATE_ENABLED:-false}" = "true" ] && [ -n "${ANTHROPIC_API_KEY:-}${OPENAI_API_KEY:-}" ]; then
+  SUBTITLE_TRANSLATE_ENABLED=true
+  # No claims provider in this image, every viewer is free-tier: without
+  # this the track would render locked behind a paid-tier CTA for everyone.
+  SUBTITLE_TRANSLATE_FREE=true
+else
+  SUBTITLE_TRANSLATE_ENABLED=false
+fi
+set +a
+cd /app/web-ui && ./web-ui serve 2>&1 | s6-log p"[web-ui]" 1

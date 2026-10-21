@@ -1,6 +1,6 @@
 # Private Webtor bootstrap
 
-Torrently uses the official all-in-one source at the exact SHA in `compose.yaml`. Its external API is `/api/v1`, authenticated with a **profile-generated API credential**. The upstream `API_KEY`/`API_SECRET` are internal signing keys and cannot be used as that credential. Never place any of them in `VITE_*` variables.
+Torrently builds the committed official all-in-one source in `backend/webtor/`, with its upstream SHA recorded in `upstream.lock.json`. Its external API is `/api/v1`, authenticated with a **profile-generated API credential**. The upstream `API_KEY`/`API_SECRET` are internal signing keys and cannot be used as that credential. Never place any of them in `VITE_*` variables.
 
 1. Install Docker Engine and Compose; run `node scripts/init-env.mjs`. Set your administrator email and a password you know in `.env` using a private local editor. The generated random passwords and secrets stay in that private file. Keep the Webtor administrator password distinct from Torrently's.
 2. Build and start the private upstream and the library database:

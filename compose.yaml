@@ -94,7 +94,7 @@ services:
     # plus the compatible archiver/proxy component versions recorded in the lock.
     # Upstream Dockerfile pins component image digests; see upstream.lock.json.
     build:
-      context: https://github.com/webtor-io/self-hosted.git#dbab88e695660d96073eb16ffd6738c57251d9e0
+      context: ./backend/webtor
     image: torrently-webtor:dbab88e
     restart: unless-stopped
     environment:

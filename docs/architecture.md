@@ -1,6 +1,6 @@
 # Architecture
 
-Approach A: React + a secure Node/TypeScript adapter + the official Webtor self-hosted backend. There was no existing application in the initial checkout, so no working code was replaced. Work is isolated on `feat/torrently-platform`; no remote main changes were made.
+Approach A: React + a secure Node/TypeScript adapter + the official Webtor self-hosted backend. The complete selected self-hosted repository is committed under `backend/webtor/`, and Compose builds that local source. There was no existing application in the initial checkout, so no working code was replaced. Work is isolated on `feat/torrently-platform`; no remote main changes were made.
 
 | Component | Responsibility | State |
 |---|---|---|
