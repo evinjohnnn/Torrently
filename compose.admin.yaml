@@ -1,0 +1,7 @@
+# Temporary private operator access ONLY. See docs/deployment/webtor-bootstrap.md.
+services:
+  webtor:
+    environment:
+      DOMAIN: http://localhost:18080
+    ports:
+      - "127.0.0.1:18080:8080"

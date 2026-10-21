@@ -1,0 +1,10 @@
+import { randomBytes } from 'node:crypto';
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
+const target = new URL('../.env', import.meta.url);
+const source = await readFile(new URL('../.env.example', import.meta.url), 'utf8');
+const keys = ['ADMIN_PASSWORD','SESSION_SECRET','POSTGRES_PASSWORD','WEBTOR_ADMIN_PASSWORD','WEBTOR_PG_PASSWORD','WEBTOR_SESSION_SECRET','WEBTOR_INTERNAL_API_KEY','WEBTOR_INTERNAL_API_SECRET','WEBTOR_S3_ACCESS_KEY','WEBTOR_S3_SECRET_KEY'];
+let value = source;
+for (const key of keys) value = value.replace(new RegExp(`^${key}=$`, 'm'), `${key}=${randomBytes(32).toString('hex')}`);
+await writeFile(target, value, { flag: 'wx', mode: 0o600 });
+await mkdir(new URL('../data/torrent-cache', import.meta.url), { recursive: true, mode: 0o700 });
+console.log('Created private .env and cache directory. Existing files are never overwritten. Set ADMIN_EMAIL and configure WEBTOR_API_KEY after private bootstrap.');

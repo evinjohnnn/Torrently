@@ -1,0 +1,902 @@
+{
+  "schemaVersion": 1,
+  "checkedAt": "2026-10-22",
+  "selfHosted": {
+    "repository": "https://github.com/webtor-io/self-hosted",
+    "commit": "dbab88e695660d96073eb16ffd6738c57251d9e0",
+    "latestReleaseObserved": "v2.1.2",
+    "selectionReason": "Pinned HEAD includes verified multiarch video-info fix, optional OpenAI subtitle-launcher fix and newer compatible archiver/proxy pins; no floating latest"
+  },
+  "components": {
+    "torrent-store": {
+      "image": "ghcr.io/webtor-io/torrent-store:master@sha256:d0ef32515426b511b1326a03dc941ce16463e3d1713b607694f02e7ff7b9e67c",
+      "revision": "a3592277070396bf162362f3af14e5b26ef7188d",
+      "source": "https://github.com/webtor-io/torrent-store",
+      "license": "MIT",
+      "platforms": [
+        {
+          "architecture": "arm64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        },
+        {
+          "architecture": "amd64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        }
+      ]
+    },
+    "magnet2torrent": {
+      "image": "ghcr.io/webtor-io/magnet2torrent:master@sha256:589fc38eca16a279f9c51c5567bae02c42f852b6f8f2a53b238c2bada91d3af4",
+      "revision": "232ed8a5be1a292cc2bf254ad67bcfdd7cbf295a",
+      "source": "https://github.com/webtor-io/magnet2torrent",
+      "license": "MIT",
+      "platforms": [
+        {
+          "architecture": "amd64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        },
+        {
+          "architecture": "arm64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        }
+      ]
+    },
+    "external-proxy": {
+      "image": "ghcr.io/webtor-io/external-proxy:master@sha256:7eea435d26f281b717a393e1958d8b01d5378b3470922c20195625d210913e55",
+      "revision": "1fca8d05d183997b245e679b01e78b81f262cd19",
+      "source": "https://github.com/webtor-io/external-proxy",
+      "license": "MIT",
+      "platforms": [
+        {
+          "architecture": "amd64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        },
+        {
+          "architecture": "arm64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        }
+      ]
+    },
+    "torrent-web-seeder": {
+      "image": "ghcr.io/webtor-io/torrent-web-seeder:master@sha256:08c961f706e7a5725189d3bbf97a74100091fc691f0e5b5fd6c11734eed71866",
+      "revision": "4249a29555479d85a28f9d81ffab7369157035e5",
+      "source": "https://github.com/webtor-io/torrent-web-seeder",
+      "license": "MIT",
+      "platforms": [
+        {
+          "architecture": "arm64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        },
+        {
+          "architecture": "amd64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        }
+      ]
+    },
+    "torrent-web-seeder-cleaner": {
+      "image": "ghcr.io/webtor-io/torrent-web-seeder-cleaner:main@sha256:767e017b2adc53c07ebc65f4073cb6341fd460a1c688105edcc3a615e000a8c1",
+      "revision": "c29aa026c8a0d437d79d9777c4ea1fe7c622070a",
+      "source": "https://github.com/webtor-io/torrent-web-seeder-cleaner",
+      "license": "MIT",
+      "platforms": [
+        {
+          "architecture": "amd64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        },
+        {
+          "architecture": "arm64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        }
+      ]
+    },
+    "content-transcoder": {
+      "image": "ghcr.io/webtor-io/content-transcoder:master@sha256:6e68e3d750458addfd030c4a40a195ba763f392a735f6809bf78949d3f54e3ac",
+      "revision": "152f4772fa6b1815bbe2943b9c6ce767c063ea43",
+      "source": "https://github.com/webtor-io/content-transcoder",
+      "license": "MIT",
+      "platforms": [
+        {
+          "architecture": "amd64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        },
+        {
+          "architecture": "arm64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        }
+      ]
+    },
+    "content-prober": {
+      "image": "ghcr.io/webtor-io/content-prober:master@sha256:82df69a08cff5ecb191fa1b59f0cb8178c968e81070f974eebf18f56825b1225",
+      "revision": "030c8eee6d856a6e7980979912d038f6ec53b71c",
+      "source": "https://github.com/webtor-io/content-prober",
+      "license": "MIT",
+      "platforms": [
+        {
+          "architecture": "amd64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        },
+        {
+          "architecture": "arm64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        }
+      ]
+    },
+    "torrent-archiver": {
+      "image": "ghcr.io/webtor-io/torrent-archiver:master@sha256:b788486fd5c011e13599ce74dda8a9aa02e5a99f47ea191a80df84206bd79d27",
+      "revision": "cf1375b7a6a6b29a6676babc83b98f01ef1f7bb0",
+      "source": "https://github.com/webtor-io/torrent-archiver",
+      "license": "MIT",
+      "platforms": [
+        {
+          "architecture": "arm64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        },
+        {
+          "architecture": "amd64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        }
+      ]
+    },
+    "srt2vtt": {
+      "image": "ghcr.io/webtor-io/srt2vtt:master@sha256:abe7faa9b2332e4dead34333d3053a12d86bd5c473264da9c52f140f3c730057",
+      "revision": "844a294c8918300651cd119ca30a5699b256a5a2",
+      "source": "https://github.com/webtor-io/srt2vtt",
+      "license": "MIT",
+      "platforms": [
+        {
+          "architecture": "arm64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        },
+        {
+          "architecture": "amd64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        }
+      ]
+    },
+    "subtitle-translate": {
+      "image": "ghcr.io/webtor-io/subtitle-translate:master@sha256:c2d709692e1cc8d912ba68fb1b78ca17672f27f57abfd23cbaff9f06253413b4",
+      "revision": "4bec97c15fd368474efc80122b9c54a39110292d",
+      "source": "https://github.com/webtor-io/subtitle-translate",
+      "license": "MIT",
+      "platforms": [
+        {
+          "architecture": "amd64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        },
+        {
+          "architecture": "arm64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        }
+      ]
+    },
+    "video-info": {
+      "image": "ghcr.io/webtor-io/video-info:master@sha256:66cef3cfe61a9ae2ebec2d6f8f54d5dc9d3bbb06251b4737fac17b39dc8435c7",
+      "revision": "cd8908fd44b31fee119690a2dd659372d2d1b7fe",
+      "source": "https://github.com/webtor-io/video-info",
+      "license": "MIT",
+      "platforms": [
+        {
+          "architecture": "arm64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        },
+        {
+          "architecture": "amd64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        }
+      ]
+    },
+    "torrent-http-proxy": {
+      "image": "ghcr.io/webtor-io/torrent-http-proxy:master@sha256:b634e9235f57ce1483ed5d71987ba1af8cb29b5e16644982fc6e07d05a93143b",
+      "revision": "69a689317c944d050d5369a80da9c8c7527106f2",
+      "source": "https://github.com/webtor-io/torrent-http-proxy",
+      "license": "MIT",
+      "platforms": [
+        {
+          "architecture": "arm64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        },
+        {
+          "architecture": "amd64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        }
+      ]
+    },
+    "rest-api": {
+      "image": "ghcr.io/webtor-io/rest-api:main@sha256:8f4881cfe5f16f0ff8e49b944af2d0b2c8ad5fe887f7f0665e477e8600e8d354",
+      "revision": "096cb14b70f08dddf39e0a0cc8cf04c537293d06",
+      "source": "https://github.com/webtor-io/rest-api",
+      "license": "MIT",
+      "platforms": [
+        {
+          "architecture": "arm64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        },
+        {
+          "architecture": "amd64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        }
+      ]
+    },
+    "web-ui": {
+      "image": "ghcr.io/webtor-io/web-ui:main@sha256:34bdd9577cc2a8eb08422ba9a5212350092cef2e03dd37424b35ae3e2f9f40f6",
+      "revision": "5dc6629250f6e3a43dfb49aee31a1801d6f9613b",
+      "source": "https://github.com/webtor-io/web-ui",
+      "license": "MIT",
+      "platforms": [
+        {
+          "architecture": "arm64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        },
+        {
+          "architecture": "amd64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        }
+      ]
+    },
+    "nginx-vod": {
+      "image": "ghcr.io/webtor-io/nginx-vod:main@sha256:539a64ad02c0520e585e161b4ff37ad97d399ce274798eaf1a5b24aaa6c8e008",
+      "revision": "bfb9ef8533a3050b4265c801370ed49307a96d53",
+      "source": "https://github.com/webtor-io/nginx-vod",
+      "license": "NOASSERTION",
+      "platforms": [
+        {
+          "architecture": "arm64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        },
+        {
+          "architecture": "amd64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        }
+      ]
+    },
+    "vault": {
+      "image": "ghcr.io/webtor-io/vault:main@sha256:9eeafa430d1df73ddd1f9460f3c34ed46d909df19c413a473a2dfefc0dfc88f1",
+      "revision": "2b30266c09adb4b51c88a8830a0bd10258724a4a",
+      "source": "https://github.com/webtor-io/vault",
+      "license": "MIT",
+      "platforms": [
+        {
+          "architecture": "arm64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        },
+        {
+          "architecture": "amd64",
+          "os": "linux"
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown"
+        }
+      ]
+    }
+  },
+  "organization": [
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/mediaelement-plugins",
+      "license": null,
+      "name": "mediaelement-plugins",
+      "pushed_at": "2018-03-20T21:10:17Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/chrome-ext",
+      "license": "MIT",
+      "name": "chrome-ext",
+      "pushed_at": "2026-09-23T18:30:23Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/torrent-web-seeder",
+      "license": "MIT",
+      "name": "torrent-web-seeder",
+      "pushed_at": "2026-10-13T21:29:06Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/content-transcoder",
+      "license": "MIT",
+      "name": "content-transcoder",
+      "pushed_at": "2026-10-09T05:04:17Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/magnet2torrent",
+      "license": "MIT",
+      "name": "magnet2torrent",
+      "pushed_at": "2026-10-15T18:08:01Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/torrent-store",
+      "license": "MIT",
+      "name": "torrent-store",
+      "pushed_at": "2026-10-15T18:08:50Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/torrent-http-proxy",
+      "license": "MIT",
+      "name": "torrent-http-proxy",
+      "pushed_at": "2026-10-20T21:08:30Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/content-prober",
+      "license": "MIT",
+      "name": "content-prober",
+      "pushed_at": "2026-10-18T11:42:12Z"
+    },
+    {
+      "archived": true,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/helm-charts",
+      "license": "MIT",
+      "name": "helm-charts",
+      "pushed_at": "2025-02-13T22:03:33Z"
+    },
+    {
+      "archived": true,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/platform-sdk-js",
+      "license": "MIT",
+      "name": "platform-sdk-js",
+      "pushed_at": "2025-02-13T22:01:02Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/gracenet",
+      "license": "MIT",
+      "name": "gracenet",
+      "pushed_at": "2020-01-02T12:26:02Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/common-services",
+      "license": "MIT",
+      "name": "common-services",
+      "pushed_at": "2026-10-21T00:28:25Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/srt2vtt",
+      "license": "MIT",
+      "name": "srt2vtt",
+      "pushed_at": "2026-10-09T05:04:44Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/node-dns-syncer",
+      "license": "MIT",
+      "name": "node-dns-syncer",
+      "pushed_at": "2026-09-26T07:24:35Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/embed-sdk-js",
+      "license": "MIT",
+      "name": "embed-sdk-js",
+      "pushed_at": "2026-09-06T08:34:54Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/external-proxy",
+      "license": "MIT",
+      "name": "external-proxy",
+      "pushed_at": "2026-10-09T05:04:34Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/torrent-archiver",
+      "license": "MIT",
+      "name": "torrent-archiver",
+      "pushed_at": "2026-10-20T20:12:43Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/video-info",
+      "license": "MIT",
+      "name": "video-info",
+      "pushed_at": "2026-10-20T20:05:17Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/platform-sdk-php",
+      "license": "MIT",
+      "name": "platform-sdk-php",
+      "pushed_at": "2020-09-12T11:28:16Z"
+    },
+    {
+      "archived": true,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/platform-sdk-php-example",
+      "license": "MIT",
+      "name": "platform-sdk-php-example",
+      "pushed_at": "2025-02-13T22:08:08Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/balancer-excluder",
+      "license": null,
+      "name": "balancer-excluder",
+      "pushed_at": "2020-04-08T18:59:34Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/job-cleaner",
+      "license": null,
+      "name": "job-cleaner",
+      "pushed_at": "2022-04-12T21:05:39Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/torrent-web-cache",
+      "license": "MIT",
+      "name": "torrent-web-cache",
+      "pushed_at": "2022-06-14T21:54:12Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/torrent-cache-cleaner",
+      "license": "MIT",
+      "name": "torrent-cache-cleaner",
+      "pushed_at": "2022-06-01T22:43:15Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/webtorrent-tracker",
+      "license": null,
+      "name": "webtorrent-tracker",
+      "pushed_at": "2020-05-16T21:15:33Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/video-thumbnails-generator",
+      "license": "MIT",
+      "name": "video-thumbnails-generator",
+      "pushed_at": "2026-09-26T07:40:20Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/image-transformer",
+      "license": "MIT",
+      "name": "image-transformer",
+      "pushed_at": "2026-09-26T07:39:37Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/dnslb",
+      "license": "MIT",
+      "name": "dnslb",
+      "pushed_at": "2022-12-24T17:30:37Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/nginx-vod",
+      "license": null,
+      "name": "nginx-vod",
+      "pushed_at": "2026-10-09T05:04:22Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/go-jackett",
+      "license": "MIT",
+      "name": "go-jackett",
+      "pushed_at": "2026-09-26T07:23:44Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/transcode-web-cache",
+      "license": "MIT",
+      "name": "transcode-web-cache",
+      "pushed_at": "2022-06-15T17:25:56Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/webhook",
+      "license": null,
+      "name": "webhook",
+      "pushed_at": "2026-09-27T10:11:00Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/download-progress",
+      "license": null,
+      "name": "download-progress",
+      "pushed_at": "2026-09-26T07:40:33Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/abuse-store",
+      "license": "MIT",
+      "name": "abuse-store",
+      "pushed_at": "2026-10-21T01:11:57Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/url-store",
+      "license": null,
+      "name": "url-store",
+      "pushed_at": "2022-01-16T14:26:28Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/lazymap",
+      "license": "MIT",
+      "name": "lazymap",
+      "pushed_at": "2026-10-21T19:45:06Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/mediaelement",
+      "license": "MIT",
+      "name": "mediaelement",
+      "pushed_at": "2026-10-19T02:34:27Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/p2p-media-loader",
+      "license": "Apache-2.0",
+      "name": "p2p-media-loader",
+      "pushed_at": "2026-10-16T13:29:02Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/job-pooler",
+      "license": "MIT",
+      "name": "job-pooler",
+      "pushed_at": "2026-09-26T07:39:45Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/content-enhancer",
+      "license": "MIT",
+      "name": "content-enhancer",
+      "pushed_at": "2026-09-26T07:39:40Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/retry-proxy",
+      "license": "MIT",
+      "name": "retry-proxy",
+      "pushed_at": "2026-09-26T07:40:06Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/wordpress-plugin",
+      "license": null,
+      "name": "wordpress-plugin",
+      "pushed_at": "2025-09-08T17:44:32Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/node-manager",
+      "license": "MIT",
+      "name": "node-manager",
+      "pushed_at": "2026-09-26T07:40:08Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/blog",
+      "license": null,
+      "name": "blog",
+      "pushed_at": "2026-10-12T10:24:01Z"
+    },
+    {
+      "archived": true,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/web-ui-v1",
+      "license": null,
+      "name": "web-ui-v1",
+      "pushed_at": "2025-01-29T17:39:03Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/rest-api",
+      "license": "MIT",
+      "name": "rest-api",
+      "pushed_at": "2026-10-21T16:14:16Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/rapidapi-gateway",
+      "license": "MIT",
+      "name": "rapidapi-gateway",
+      "pushed_at": "2026-09-26T07:24:10Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/nordvpn-config-fetcher",
+      "license": "MIT",
+      "name": "nordvpn-config-fetcher",
+      "pushed_at": "2026-09-26T07:40:01Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/torrent-web-seeder-cleaner",
+      "license": "MIT",
+      "name": "torrent-web-seeder-cleaner",
+      "pushed_at": "2026-10-21T01:16:29Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/web-ui",
+      "license": "MIT",
+      "name": "web-ui",
+      "pushed_at": "2026-10-21T19:49:29Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/stoplist",
+      "license": "MIT",
+      "name": "stoplist",
+      "pushed_at": "2026-05-12T17:37:31Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/torrent",
+      "license": "MPL-2.0",
+      "name": "torrent",
+      "pushed_at": "2026-10-13T21:17:45Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/claims-provider",
+      "license": "MIT",
+      "name": "claims-provider",
+      "pushed_at": "2026-10-21T00:36:13Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/self-hosted",
+      "license": "MIT",
+      "name": "self-hosted",
+      "pushed_at": "2026-10-21T16:44:57Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/.github",
+      "license": "MIT",
+      "name": ".github",
+      "pushed_at": "2026-09-22T20:28:25Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/community",
+      "license": null,
+      "name": "community",
+      "pushed_at": "2025-01-28T17:29:49Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/vault",
+      "license": "MIT",
+      "name": "vault",
+      "pushed_at": "2026-10-21T02:03:03Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/utp",
+      "license": "MPL-2.0",
+      "name": "utp",
+      "pushed_at": "2026-09-26T07:24:21Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/s3-cache",
+      "license": null,
+      "name": "s3-cache",
+      "pushed_at": "2026-10-21T07:12:11Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/api-sdk-go",
+      "license": "MIT",
+      "name": "api-sdk-go",
+      "pushed_at": "2026-08-12T17:04:03Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/webtor-cli",
+      "license": "MIT",
+      "name": "webtor-cli",
+      "pushed_at": "2026-08-13T21:17:58Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "main",
+      "html_url": "https://github.com/webtor-io/homebrew-tap",
+      "license": null,
+      "name": "homebrew-tap",
+      "pushed_at": "2026-08-13T21:19:24Z"
+    },
+    {
+      "archived": false,
+      "default_branch": "master",
+      "html_url": "https://github.com/webtor-io/subtitle-translate",
+      "license": "MIT",
+      "name": "subtitle-translate",
+      "pushed_at": "2026-10-20T22:07:08Z"
+    }
+  ]
+}

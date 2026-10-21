@@ -1,0 +1,198 @@
+name: torrently
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+services:
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: torrently-app:local
+    restart: unless-stopped
+    init: true
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      DATA_DIR: /app/data
+      DATABASE_URL: postgres://torrently:${POSTGRES_PASSWORD:?Run node scripts/init-env.mjs}@postgres:5432/torrently
+      WEBTOR_URL: http://webtor:8080
+      WEBTOR_API_KEY: ${WEBTOR_API_KEY:-}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@localhost.test}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Run node scripts/init-env.mjs}
+      SESSION_SECRET: ${SESSION_SECRET:?Run node scripts/init-env.mjs}
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-http://localhost:3000}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      MAX_STREAMS: ${MAX_STREAMS:-2}
+      MAX_DOWNLOADS: ${MAX_DOWNLOADS:-2}
+      MAX_TRANSCODES: ${MAX_TRANSCODES:-1}
+      MAX_TORRENTS: ${MAX_TORRENTS:-20}
+      MAX_TORRENT_BYTES: ${MAX_TORRENT_BYTES:-2000000}
+      MAX_RESOURCE_BYTES: ${MAX_RESOURCE_BYTES:-200000000000}
+      MAX_CACHE_BYTES: ${MAX_CACHE_BYTES:-300000000000}
+      MIN_FREE_BYTES: ${MIN_FREE_BYTES:-50000000000}
+      CACHE_DIR: /app/cache
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${APP_PORT:-3000}:3000"
+    volumes:
+      - app_data:/app/data
+      - type: bind
+        source: ${TORRENT_CACHE_PATH:-./data/torrent-cache}
+        target: /app/cache
+        read_only: true
+        bind:
+          create_host_path: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      webtor:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
+    mem_limit: ${APP_MEMORY:-768m}
+    cpus: ${APP_CPUS:-1.0}
+    pids_limit: 128
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging: *logging
+    networks: [frontend, backend]
+  postgres:
+    image: postgres:17.6-bookworm@sha256:f3bd19c606e442c3d7bdfa8002e03fe260a1023351e0ea4598032022b68dd6e3
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: torrently
+      POSTGRES_DB: torrently
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run node scripts/init-env.mjs}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U torrently -d torrently"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    mem_limit: ${POSTGRES_MEMORY:-512m}
+    cpus: "0.5"
+    pids_limit: 128
+    shm_size: 128m
+    security_opt: ["no-new-privileges:true"]
+    logging: *logging
+    networks: [backend]
+  webtor:
+    # Source pinned for multiarch video-info and subtitle-launcher fixes,
+    # plus the compatible archiver/proxy component versions recorded in the lock.
+    # Upstream Dockerfile pins component image digests; see upstream.lock.json.
+    build:
+      context: https://github.com/webtor-io/self-hosted.git#dbab88e695660d96073eb16ffd6738c57251d9e0
+    image: torrently-webtor:dbab88e
+    restart: unless-stopped
+    environment:
+      DOMAIN: http://webtor:8080
+      ADMIN_PASSWORD: ${WEBTOR_ADMIN_PASSWORD:?Run node scripts/init-env.mjs}
+      ONLY_AUTHORIZED: "true"
+      EMBED_ONLY_AUTHORIZED: "true"
+      DISABLE_EMBED: "true"
+      DISABLE_WEBDAV: "true"
+      USE_VAULT: "false"
+      PG_PASSWORD: ${WEBTOR_PG_PASSWORD:?Run node scripts/init-env.mjs}
+      SESSION_SECRET: ${WEBTOR_SESSION_SECRET:?Run node scripts/init-env.mjs}
+      API_KEY: ${WEBTOR_INTERNAL_API_KEY:?Run node scripts/init-env.mjs}
+      API_SECRET: ${WEBTOR_INTERNAL_API_SECRET:?Run node scripts/init-env.mjs}
+      AWS_ACCESS_KEY_ID: ${WEBTOR_S3_ACCESS_KEY:?Run node scripts/init-env.mjs}
+      AWS_SECRET_ACCESS_KEY: ${WEBTOR_S3_SECRET_KEY:?Run node scripts/init-env.mjs}
+      CLEANER_KEEP_FREE: ${CLEANER_KEEP_FREE:-25%}
+      CLEANER_FREE: ${CLEANER_FREE:-35%}
+      DISABLE_VIDEO_TRANSCODING: ${DISABLE_VIDEO_TRANSCODING:-false}
+      DISABLE_WEBSEEDS: "true"
+      TORRENT_PEERS_HIGH_WATER: ${TORRENT_PEERS_HIGH_WATER:-40}
+      TORRENT_PEERS_LOW_WATER: ${TORRENT_PEERS_LOW_WATER:-20}
+      ESTABLISHED_CONNS_PER_TORRENT: ${ESTABLISHED_CONNS_PER_TORRENT:-20}
+      HALF_OPEN_CONNS_PER_TORRENT: ${HALF_OPEN_CONNS_PER_TORRENT:-8}
+      TOTAL_HALF_OPEN_CONNS: ${TOTAL_HALF_OPEN_CONNS:-32}
+      PER_TORRENT_CACHE_BUDGET: ${PER_TORRENT_CACHE_BUDGET:-10GB}
+      MAX_UNVERIFIED_BYTES: ${MAX_UNVERIFIED_BYTES:-32MB}
+      MAX_OPEN_FILES_PER_TORRENT: ${MAX_OPEN_FILES_PER_TORRENT:-128}
+      MMAP_MAX_FILE_SIZE: ${MMAP_MAX_FILE_SIZE:-268435456}
+      MMAP_BUDGET_PER_TORRENT: ${MMAP_BUDGET_PER_TORRENT:-536870912}
+      CLIENT_IDLE_TIMEOUT: ${CLIENT_IDLE_TIMEOUT:-10m}
+      MAX_READAHEAD: ${MAX_READAHEAD:-8MB}
+      STREAM_STALL_TIMEOUT: ${STREAM_STALL_TIMEOUT:-60s}
+      FFMPEG_THREADS: ${FFMPEG_THREADS:-2}
+      AI_ENRICH_ENABLED: "false"
+      AI_RECOMMENDATIONS_ENABLED: "false"
+      SUBTITLE_TRANSLATE_ENABLED: "false"
+    volumes:
+      - type: bind
+        source: ${TORRENT_CACHE_PATH:-./data/torrent-cache}
+        target: /data
+        bind:
+          create_host_path: false
+      - webtor_pgdata:/pgdata
+      # Named volume preserves POSIX xattrs used by embedded S3.
+      - webtor_storage:/storage
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS --max-time 5 http://127.0.0.1:8080/login >/dev/null",
+        ]
+      interval: 30s
+      timeout: 8s
+      start_period: 120s
+      retries: 10
+    mem_limit: ${WEBTOR_MEMORY:-4g}
+    cpus: ${WEBTOR_CPUS:-2.0}
+    pids_limit: 512
+    logging: *logging
+    networks: [backend, torrent]
+  proxy:
+    profiles: [public]
+    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    restart: unless-stopped
+    environment:
+      PUBLIC_HOSTNAME: ${PUBLIC_HOSTNAME:-localhost}
+    ports:
+      - "${PUBLIC_BIND_ADDRESS:-127.0.0.1}:80:80"
+      - "${PUBLIC_BIND_ADDRESS:-127.0.0.1}:443:443"
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [app]
+    mem_limit: 128m
+    cpus: "0.5"
+    logging: *logging
+    networks: [frontend]
+  backup:
+    profiles: [maintenance]
+    image: node:24.10.0-bookworm-slim@sha256:b8d2197aff9129d16c801a3e3e1b2a873c4946480f5a310f38056df2268c38d9
+    network_mode: none
+    entrypoint: [tar]
+    volumes:
+      - webtor_pgdata:/snapshot/webtor-pgdata:ro
+      - webtor_storage:/snapshot/webtor-storage:ro
+      - app_data:/snapshot/app-data:ro
+networks:
+  frontend:
+  backend:
+    internal: true
+  # Outbound Internet is needed for peers, trackers and metadata.
+  torrent:
+volumes:
+  app_data:
+  postgres_data:
+  webtor_pgdata:
+  webtor_storage:
+  caddy_data:
+  caddy_config:

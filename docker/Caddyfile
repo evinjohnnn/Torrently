@@ -1,0 +1,16 @@
+{$PUBLIC_HOSTNAME} {
+  encode zstd gzip
+  header {
+    X-Content-Type-Options nosniff
+    Referrer-Policy same-origin
+    -Server
+  }
+  # No upstream key, admin route or Webtor worker is exposed here.
+  reverse_proxy app:3000 {
+    flush_interval -1
+    transport http {
+      read_timeout 5m
+      write_timeout 5m
+    }
+  }
+}

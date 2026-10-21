@@ -1,0 +1,48 @@
+name: Verify
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_webtor_smoke:
+        description: Build and run real Webtor fixture smoke suite on Linux
+        required: false
+        default: false
+        type: boolean
+permissions:
+  contents: read
+jobs:
+  app:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.10.0
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:browser
+      - name: Validate deployment structure without printing secrets
+        run: |
+          node scripts/init-env.mjs
+          docker compose config --quiet
+          bash -n scripts/*.sh
+      - name: Build Torrently container
+        run: docker compose build app
+  upstream-smoke:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_webtor_smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Assemble pinned upstream source and execute controlled fixtures
+        run: |
+          git clone https://github.com/webtor-io/self-hosted.git /tmp/webtor-self-hosted
+          git -C /tmp/webtor-self-hosted checkout --detach dbab88e695660d96073eb16ffd6738c57251d9e0
+          docker build -t torrently-webtor:dbab88e /tmp/webtor-self-hosted
+          /tmp/webtor-self-hosted/tests/run.sh torrently-webtor:dbab88e

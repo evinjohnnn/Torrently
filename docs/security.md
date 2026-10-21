@@ -1,0 +1,23 @@
+# Security, privacy and retention
+
+The application is intended for an authenticated private server initially. The default deployment exposes only the app on loopback; the upstream UI/admin/Bearer API, workers and both databases remain on Docker networks. A temporary loopback-only bootstrap override is documented separately. Public access requires an explicit hostname, HTTPS, secure cookies and the public reverse-proxy configuration.
+
+Passwords are salted scrypt hashes. Session tokens are random and hashed in the database, last seven days, and are HTTP-only/SameSite=Strict. Production public mode requires secure cookies and PostgreSQL. Mutations use per-session CSRF tokens and exact Origin checking. New accounts/reset are operator CLI actions; no public registration or password recovery is advertised. Environment admin credentials bootstrap once rather than silently changing accounts on every restart.
+
+Resources, saved content, progress and media tickets check account ownership. Tickets additionally verify current resource access and expiry; HLS child URLs are authenticated encrypted references. Engine origins and `/torrent-http-proxy/<hash>/` paths are allowlisted, redirects are refused, and HTML documents cannot become unsandboxed player content. The administrative Bearer key, upstream signed queries, session cookies and provider keys never belong in browser bundles or logs.
+
+Torrent uploads have bounded strict bencode parsing, safe nested filenames, integer/piece/file limits and infohash-preserving sanitation. Magnets accept v1 infohashes only and remove fetch/tracker parameters. Private-tracker and v2-only torrents are deliberately unsupported. Filenames containing `~` are refused because upstream treats that character as a service-chain separator. Seeder webseeds are disabled in Compose. Upstream BitTorrent/DHT tracker/peer egress is still an engine boundary; the adapter cannot guarantee a general private-LAN egress sandbox for upstream workers. Review/implement host egress policy before offering this to untrusted public users.
+
+API requests and expensive submissions have IP/user rate limits. Streams/downloads/conversions have leases and backpressure; active byte transfers renew their leases. Idle sessions are limited and cleaned up. Cache admission uses allocated disk blocks and a free reserve, while the upstream cleaner evicts idle cache. A dedicated bounded cache filesystem/project quota is needed to guarantee a hard ceiling during existing streams. Docker memory/CPU/PID/log caps contain the initial single-laptop deployment. These controls have unit/contract tests; a full independent production security assessment has not been performed.
+
+## Data lifetime and removal
+
+Library/progress/account/report metadata is permanent until removed by its owner/operator. Recent resource metadata/access persists until workspace removal. Shared torrent cache is disposable under upstream's cleaner policy. Removing library metadata does not purge shared content or another user's records. Workspace deletion revokes the caller's tickets and conversion sessions. Admin resource deletion revokes Torrently metadata/access for everyone; it does not promise immediate destruction of engine piece cache. Operator cache cleanup must follow the operations guide and avoid deleting active files.
+
+The database contains sensitive signed media URLs in tickets and requires private backups. Tickets expire after six hours; sessions after seven days. Expired database rows are cleaned every five minutes while the app runs. Stopped processes cannot perform cleanup; upstream has its own session inactivity release/expiry. Browser-uploaded captions and download-launch history live in that browser session only.
+
+Reports submitted through the UI are stored for an administrator at `/api/admin/reports`. Publish an operator contact and jurisdiction-appropriate takedown/retention policy before public service. Review reports, revoke access through admin resource deletion, preserve necessary evidence privately, then perform any required engine/cache removal under operator control. No complaints or outbound contacts were submitted during development.
+
+## Before a public launch
+
+Complete real Linux/media/restart/backup tests, upstream image SBOM/license review, TLS/CGNAT/peer checks, egress controls, hardware measurements, disk quota verification and concurrency/load benchmarks. Keep runtime and source versions pinned in the lock and upgrade through a reviewed maintenance test. This file describes concrete implementation boundaries rather than certifying production readiness.

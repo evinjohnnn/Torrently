@@ -1,0 +1,11 @@
+# Tool and workspace discovery
+
+Inspected before substantial implementation on 2026-10-22. The checkout contained only Git metadata. No existing AGENTS.md or CLAUDE.md file, framework or history was present. The user's supplied transitions-agent workflow applies to explicit motion scan/fix choices; no service-based motion fix was requested or run.
+
+The session skill catalog was reviewed for source analysis, reverse engineering, API documentation, React/design, browser use, testing and deployment. Local Claude skill/agent directories were enumerated; existing agents were SEO-focused, and no local slash-command directory was present. REA instructions explicitly route ordinary complete source repositories to standard repository tools, so no binary reconstruction/readiness installation was needed. Applicable documentation, browser and minimalist-interface guidance was read. Independent agents handled upstream archaeology, deployment, frontend implementation and an additional adapter review.
+
+Available tools used: Git/gh with authenticated repository/API access, paginated GitHub API/source clones, Node v25.9.0/npm, Python, FFmpeg, TypeScript/Vite, Node's test runner, persistent embedded PostgreSQL, Playwright and native browser automation. Current dependency versions are pinned in package-lock.json. Official source/docs were consulted rather than relying on remembered Webtor endpoints.
+
+The bundled in-app browser tool failed loading its classic-level native module on darwin/arm64/Node24. It was attempted before fallback. The native browser fallback successfully inspected public Webtor and the local app; installed Chrome was used for repeatable headless Playwright checks. No hosted torrent service was load tested.
+
+No Docker daemon/CLI, Go compiler, Colima/Lima/Podman/Orb Linux runtime was installed. A standalone official Docker Compose v5.6.1 binary was downloaded to the parent work directory and SHA256-verified for schema/interpolation checks only; no daemon/VM was installed. The Mac had roughly 9 GB available disk and is not the target Acer laptop. The user confirmed the laptop is unavailable. Linux container boot and actual swarm/media tests therefore remain unexecuted, with reproducible scripts and acceptance steps supplied.
