@@ -1,4 +1,4 @@
-/* Torrently — monochrome, dot-matrix, lenticular glass. */
+/* Torrently — monochrome, red accent, lenticular glass. */
 
 @property --ax {
   syntax: "<percentage>";
@@ -33,7 +33,7 @@
 
 :root {
   color-scheme: dark;
-  --font-display: "Doto", "Space Mono", ui-monospace, monospace;
+  --font-display: var(--font-sans);
   --font-sans:
     "Space Grotesk", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial,
     sans-serif;
@@ -382,9 +382,9 @@ footer {
 }
 .brand-word {
   font-family: var(--font-display);
-  font-weight: 900;
-  font-size: 27px;
-  letter-spacing: 0.01em;
+  font-weight: 600;
+  font-size: 26px;
+  letter-spacing: -0.04em;
   line-height: 1;
   display: inline-flex;
   align-items: flex-end;
@@ -519,7 +519,7 @@ footer {
   background: var(--text);
   color: #050505;
   font-family: var(--font-display);
-  font-weight: 900;
+  font-weight: 600;
   font-size: 17px;
   flex-shrink: 0;
 }
@@ -572,9 +572,9 @@ footer {
 }
 .clock {
   font-family: var(--font-display);
-  font-weight: 900;
-  font-size: 24px;
-  letter-spacing: 0.04em;
+  font-weight: 500;
+  font-size: 22px;
+  letter-spacing: -0.02em;
   font-variant-numeric: tabular-nums;
   line-height: 1;
 }
@@ -654,10 +654,10 @@ main {
 }
 .page-heading h1 {
   font-family: var(--font-display);
-  font-weight: 900;
-  font-size: clamp(42px, 5.4vw, 72px);
-  letter-spacing: 0;
-  line-height: 0.98;
+  font-weight: 600;
+  font-size: clamp(40px, 5vw, 66px);
+  letter-spacing: -0.045em;
+  line-height: 1;
   margin: 18px 0 16px;
   text-wrap: balance;
 }
@@ -913,8 +913,9 @@ main {
 }
 .workflow > div > span {
   font-family: var(--font-display);
-  font-weight: 900;
-  font-size: 34px;
+  font-weight: 600;
+  font-size: 32px;
+  letter-spacing: -0.04em;
   line-height: 1;
   color: var(--text);
   margin-bottom: 14px;
@@ -1539,8 +1540,9 @@ th:first-child {
 }
 .storage-summary strong {
   font-family: var(--font-display);
-  font-weight: 900;
+  font-weight: 600;
   font-size: 30px;
+  letter-spacing: -0.03em;
   line-height: 1;
 }
 .storage-meter {
@@ -1637,9 +1639,10 @@ footer > span {
 }
 .login-main h1 {
   font-family: var(--font-display);
-  font-weight: 900;
-  font-size: 50px;
-  line-height: 1;
+  font-weight: 600;
+  font-size: 48px;
+  letter-spacing: -0.045em;
+  line-height: 1.02;
   margin: 20px 0 16px;
 }
 .login-main > p {
