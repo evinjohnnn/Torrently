@@ -24,9 +24,16 @@ import {
   type TorrentFile,
 } from "./api";
 import { Icon, type IconName } from "./icons";
+import { Backdrop } from "./Backdrop";
 const Player = lazy(() =>
   import("./Player").then((module) => ({ default: module.Player })),
 );
+import "@fontsource/doto/latin-900.css";
+import "@fontsource/space-grotesk/latin-400.css";
+import "@fontsource/space-grotesk/latin-500.css";
+import "@fontsource/space-grotesk/latin-600.css";
+import "@fontsource/space-mono/latin-400.css";
+import "@fontsource/space-mono/latin-700.css";
 import "./style.css";
 
 type Page =
@@ -61,10 +68,35 @@ function Logo() {
           />
         </svg>
       </span>
-      <span>
-        Torrently<span className="brand-dot">.</span>
+      <span className="brand-word">
+        Torrently
+        <span className="brand-dot" />
       </span>
     </div>
+  );
+}
+function Clock() {
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(new Date()), 10000);
+    return () => clearInterval(timer);
+  }, []);
+  const [hours, minutes] = [now.getHours(), now.getMinutes()].map((part) =>
+    String(part).padStart(2, "0"),
+  );
+  return (
+    <time
+      className="clock"
+      dateTime={now.toISOString()}
+      aria-label={now.toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      })}
+    >
+      {hours}
+      <span className="clock-colon">:</span>
+      {minutes}
+    </time>
   );
 }
 function App() {
@@ -404,9 +436,12 @@ function App() {
                 ? "Open torrent"
                 : page[0].toUpperCase() + page.slice(1)}
           </span>
-          <span className="private-label">
-            <span className="private-lock" />
-            Private instance
+          <span className="topbar-right">
+            <Clock />
+            <span className="private-label">
+              <span className="private-lock" />
+              Private instance
+            </span>
           </span>
         </header>
         <main id="main-content">
@@ -1347,6 +1382,7 @@ function FileBrowser({
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
+    <Backdrop />
     <App />
   </StrictMode>,
 );
