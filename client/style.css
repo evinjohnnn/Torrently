@@ -32,7 +32,7 @@
 }
 
 :root {
-  color-scheme: dark;
+  color-scheme: light;
   --font-display: var(--font-sans);
   --font-logo: "Doto", "Space Mono", ui-monospace, monospace;
   --font-sans:
@@ -40,25 +40,26 @@
     sans-serif;
   --font-mono: "Space Mono", "SFMono-Regular", Consolas, monospace;
 
-  --bg: #000;
-  --text: #f4f4f2;
-  --text-2: rgba(244, 244, 242, 0.72);
-  --text-3: rgba(244, 244, 242, 0.52);
+  --bg: #f3f1ec;
+  --text: #0e0e0e;
+  --text-2: rgba(14, 14, 14, 0.74);
+  --text-3: rgba(14, 14, 14, 0.58);
+  --on-text: #fff;
   --red: #d71921;
-  --red-text: #ff5a5f;
+  --red-text: #c4141b;
 
   --glass: linear-gradient(
     180deg,
-    rgba(255, 255, 255, 0.075),
-    rgba(255, 255, 255, 0.025)
+    rgba(255, 255, 255, 0.78),
+    rgba(255, 255, 255, 0.52)
   );
-  --glass-fill: rgba(14, 14, 16, 0.5);
-  --glass-line: rgba(255, 255, 255, 0.1);
-  --glass-edge: inset 0 1px 0 rgba(255, 255, 255, 0.12);
-  --glass-drop: 0 30px 60px -32px rgba(0, 0, 0, 0.9);
-  --hairline: rgba(255, 255, 255, 0.08);
-  --hover: rgba(255, 255, 255, 0.07);
-  --well: rgba(0, 0, 0, 0.38);
+  --glass-fill: rgba(255, 255, 255, 0.3);
+  --glass-line: rgba(14, 14, 14, 0.09);
+  --glass-edge: inset 0 1px 0 rgba(255, 255, 255, 0.95);
+  --glass-drop: 0 30px 60px -34px rgba(60, 30, 20, 0.35);
+  --hairline: rgba(14, 14, 14, 0.08);
+  --hover: rgba(14, 14, 14, 0.05);
+  --well: rgba(255, 255, 255, 0.6);
 
   --r-xl: 30px;
   --r-lg: 24px;
@@ -141,7 +142,7 @@ select {
 }
 input::placeholder,
 textarea::placeholder {
-  color: rgba(244, 244, 242, 0.38);
+  color: rgba(14, 14, 14, 0.42);
 }
 ::selection {
   background: var(--red);
@@ -171,18 +172,18 @@ textarea::placeholder {
 .lens {
   --scene-a: radial-gradient(
     34% 44% at var(--ax) var(--ay),
-    rgba(215, 25, 33, 0.9),
-    rgba(215, 25, 33, 0) 70%
+    rgba(255, 40, 40, 0.85),
+    rgba(255, 40, 40, 0) 70%
   );
   --scene-b: radial-gradient(
-    26% 36% at var(--bx) var(--by),
-    rgba(255, 255, 255, 0.5),
-    rgba(255, 255, 255, 0) 70%
+    30% 40% at var(--bx) var(--by),
+    rgba(255, 176, 92, 0.85),
+    rgba(255, 176, 92, 0) 70%
   );
   --scene-c: radial-gradient(
     40% 46% at var(--cx) var(--cy),
-    rgba(150, 150, 165, 0.4),
-    rgba(150, 150, 165, 0) 72%
+    rgba(120, 156, 255, 0.7),
+    rgba(120, 156, 255, 0) 72%
   );
   position: absolute;
   inset: 0;
@@ -196,15 +197,15 @@ textarea::placeholder {
   --scene-pos: calc(var(--w) / 2 - (var(--i) + 0.5) * var(--w) * var(--m)) 0;
   flex: 1 1 0;
   height: 100%;
-  background-color: #040404;
+  background-color: #f6f4ef;
   background-image:
     linear-gradient(
       90deg,
-      rgba(255, 255, 255, 0.11) 0%,
-      rgba(255, 255, 255, 0.025) 16%,
+      rgba(255, 255, 255, 0.7) 0%,
+      rgba(255, 255, 255, 0.18) 16%,
       transparent 42%,
-      rgba(0, 0, 0, 0.28) 86%,
-      rgba(0, 0, 0, 0.55) 100%
+      rgba(70, 40, 30, 0.06) 86%,
+      rgba(70, 40, 30, 0.14) 100%
     ),
     var(--scene-a), var(--scene-b), var(--scene-c);
   background-size:
@@ -250,7 +251,7 @@ textarea::placeholder {
   inset: 0;
   background-image: radial-gradient(
     circle,
-    rgba(255, 255, 255, 0.13) 1px,
+    rgba(14, 14, 14, 0.14) 1px,
     transparent 1.4px
   );
   background-size: 22px 22px;
@@ -259,8 +260,8 @@ textarea::placeholder {
 .backdrop-grain {
   position: absolute;
   inset: 0;
-  opacity: 0.07;
-  mix-blend-mode: overlay;
+  opacity: 0.06;
+  mix-blend-mode: multiply;
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
 }
 .backdrop::after {
@@ -269,8 +270,8 @@ textarea::placeholder {
   inset: 0;
   background: radial-gradient(
     140% 100% at 50% 40%,
-    transparent 40%,
-    rgba(0, 0, 0, 0.72) 100%
+    transparent 45%,
+    rgba(255, 255, 255, 0.55) 100%
   );
 }
 
@@ -305,7 +306,7 @@ textarea::placeholder {
   pointer-events: none;
   background: repeating-linear-gradient(
     90deg,
-    rgba(255, 255, 255, 0.04) 0 1px,
+    rgba(255, 255, 255, 0.5) 0 1px,
     transparent 1px 9px
   );
   mask-image: linear-gradient(180deg, #000, transparent 70%);
@@ -319,7 +320,7 @@ textarea::placeholder {
 footer {
   background-image: radial-gradient(
     circle,
-    rgba(255, 255, 255, 0.3) 0.9px,
+    rgba(14, 14, 14, 0.3) 0.9px,
     transparent 1.3px
   );
   background-size: 7px 3px;
@@ -433,7 +434,7 @@ footer {
 }
 .nav-item.active {
   background: var(--text);
-  color: #050505;
+  color: var(--on-text);
   font-weight: 600;
 }
 .nav-count {
@@ -444,7 +445,7 @@ footer {
   text-align: center;
   padding: 2px 7px;
   border-radius: var(--pill);
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(14, 14, 14, 0.07);
   color: var(--text-2);
 }
 .nav-item.active .nav-count {
@@ -477,15 +478,15 @@ footer {
 }
 .status-dot.online {
   background: var(--text);
-  box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.55);
+  box-shadow: 0 0 0 0 rgba(14, 14, 14, 0.4);
   animation: pulse 2.4s ease-out infinite;
 }
 @keyframes pulse {
   70% {
-    box-shadow: 0 0 0 8px rgba(255, 255, 255, 0);
+    box-shadow: 0 0 0 8px rgba(14, 14, 14, 0);
   }
   100% {
-    box-shadow: 0 0 0 0 rgba(255, 255, 255, 0);
+    box-shadow: 0 0 0 0 rgba(14, 14, 14, 0);
   }
 }
 .server-note strong {
@@ -518,7 +519,7 @@ footer {
   justify-content: center;
   border-radius: 50%;
   background: var(--text);
-  color: #050505;
+  color: var(--on-text);
   font-family: var(--font-display);
   font-weight: 600;
   font-size: 17px;
@@ -704,7 +705,7 @@ main {
   padding: 9px 16px;
   border-radius: var(--pill);
   border: 1px solid var(--glass-line);
-  background: rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.55);
   color: var(--text);
   font-size: 13.5px;
   line-height: 1.2;
@@ -716,13 +717,13 @@ main {
     color 200ms var(--ease);
 }
 .button:hover {
-  background: rgba(255, 255, 255, 0.12);
-  border-color: rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.9);
+  border-color: rgba(14, 14, 14, 0.16);
 }
 .button.primary {
   background: var(--text);
   border-color: var(--text);
-  color: #050505;
+  color: var(--on-text);
   font-weight: 600;
   padding: 11px 20px;
 }
@@ -780,7 +781,7 @@ main {
 .spinner {
   width: 16px;
   height: 16px;
-  border: 2px solid rgba(255, 255, 255, 0.18);
+  border: 2px solid rgba(14, 14, 14, 0.15);
   border-top-color: var(--text);
   border-radius: 50%;
   animation: spin 0.9s linear infinite;
@@ -814,7 +815,7 @@ main {
   color: var(--text);
 }
 .search-field:focus-within {
-  border-color: rgba(255, 255, 255, 0.45);
+  border-color: rgba(14, 14, 14, 0.4);
 }
 
 /* ───────── Open torrent ───────── */
@@ -847,7 +848,7 @@ main {
   width: 50px;
   border-radius: 50%;
   background: var(--text);
-  color: #050505;
+  color: var(--on-text);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -886,7 +887,7 @@ main {
   outline: 0;
 }
 .magnet-field:focus-within {
-  border-color: rgba(255, 255, 255, 0.45);
+  border-color: rgba(14, 14, 14, 0.4);
 }
 .upload-line {
   display: flex;
@@ -1075,11 +1076,11 @@ main {
   appearance: none;
   border: 0;
   border-radius: 3px;
-  background: rgba(255, 255, 255, 0.12);
+  background: rgba(14, 14, 14, 0.1);
   overflow: hidden;
 }
 .library-open progress::-webkit-progress-bar {
-  background: rgba(255, 255, 255, 0.12);
+  background: rgba(14, 14, 14, 0.1);
 }
 .library-open progress::-webkit-progress-value {
   background: var(--red);
@@ -1197,7 +1198,7 @@ th:first-child {
 }
 .play-button:hover {
   background: var(--text) !important;
-  color: #050505;
+  color: var(--on-text);
 }
 .folder-button {
   width: 100%;
@@ -1328,7 +1329,7 @@ th:first-child {
 .player-tools select {
   appearance: none;
   background: var(--well)
-    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='m1 1 4 4 4-4' fill='none' stroke='%23f4f4f2' stroke-opacity='.6' stroke-width='1.5'/%3E%3C/svg%3E")
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='m1 1 4 4 4-4' fill='none' stroke='%230e0e0e' stroke-opacity='.6' stroke-width='1.5'/%3E%3C/svg%3E")
     no-repeat right 14px center;
   color: var(--text);
   border: 1px solid var(--glass-line);
@@ -1435,7 +1436,7 @@ th:first-child {
   white-space: nowrap;
 }
 .remove-resource:hover {
-  color: #fff;
+  color: var(--text);
 }
 
 /* ───────── Messages ───────── */
@@ -1462,11 +1463,15 @@ th:first-child {
   flex-shrink: 0;
 }
 .message.error {
-  border-color: rgba(255, 90, 95, 0.45);
+  border-color: rgba(215, 25, 33, 0.3);
   background:
-    linear-gradient(180deg, rgba(215, 25, 33, 0.22), rgba(215, 25, 33, 0.1)),
+    linear-gradient(
+      180deg,
+      rgba(255, 236, 236, 0.9),
+      rgba(255, 226, 226, 0.75)
+    ),
     var(--glass-fill);
-  color: #ffd5d6;
+  color: #8f0d12;
 }
 .message.success svg {
   color: var(--red-text);
@@ -1554,11 +1559,11 @@ th:first-child {
   appearance: none;
   border: 0;
   border-radius: var(--pill);
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(14, 14, 14, 0.08);
   overflow: hidden;
 }
 .storage-meter::-webkit-meter-bar {
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(14, 14, 14, 0.08);
   border: 0;
   border-radius: var(--pill);
   height: 8px;
@@ -1681,7 +1686,7 @@ footer > span {
 }
 .login-form input:focus {
   outline: 0;
-  border-color: rgba(255, 255, 255, 0.55);
+  border-color: rgba(14, 14, 14, 0.5);
 }
 .login-form .primary {
   justify-content: space-between;
@@ -1794,11 +1799,11 @@ footer > span {
     gap: 2px;
     padding: 6px;
     border-radius: var(--pill);
-    background: var(--glass), rgba(10, 10, 12, 0.72);
+    background: var(--glass), rgba(255, 255, 255, 0.5);
     border: 1px solid var(--glass-line);
     box-shadow:
       var(--glass-edge),
-      0 20px 40px -12px rgba(0, 0, 0, 0.9);
+      0 20px 40px -14px rgba(60, 30, 20, 0.35);
     -webkit-backdrop-filter: blur(28px) saturate(160%);
     backdrop-filter: blur(28px) saturate(160%);
   }
@@ -2062,7 +2067,7 @@ footer > span {
   .login-main,
   .sidebar nav,
   .search-field {
-    background: #121214;
+    background: #fbfaf7;
     -webkit-backdrop-filter: none;
     backdrop-filter: none;
   }
