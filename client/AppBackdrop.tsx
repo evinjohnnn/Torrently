@@ -10,7 +10,7 @@ const Lenticular = lazy(() =>
   })),
 );
 
-/** Bleed on paper by default; `?backdrop=` picks another study or the original. */
+/** Leaves in granola by default; `?backdrop=` picks another study or the original. */
 export function AppBackdrop() {
   const { concept, palette } = useBackdropChoice();
   const tone = concept ? getConcept(concept).palettes[palette].tone : null;

@@ -142,7 +142,11 @@ export function NotepadHero() {
   return (
     <section ref={section} className="np-hero">
       <div className="np-backdrop" aria-hidden="true">
-        <LenticularBackdrop concept="monolith" pointer={section} />
+        <LenticularBackdrop
+          concept="monolith"
+          params={{ palette: 1 }}
+          pointer={section}
+        />
         <div className="np-fade" />
       </div>
 

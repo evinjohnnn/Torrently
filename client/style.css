@@ -40,13 +40,15 @@
     sans-serif;
   --font-mono: "Space Mono", "SFMono-Regular", Consolas, monospace;
 
-  --bg: #f3f1ec;
-  --text: #0e0e0e;
-  --text-2: rgba(14, 14, 14, 0.74);
-  --text-3: rgba(14, 14, 14, 0.58);
-  --on-text: #fff;
-  --red: #d71921;
-  --red-text: #c4141b;
+  --bg: #f4f0e5;
+  --text: #1c1f14;
+  --text-2: rgba(28, 31, 20, 0.76);
+  --text-3: rgba(28, 31, 20, 0.6);
+  --on-text: #fffdf6;
+  /* olive, the colour of the backdrops */
+  --accent: #5f6f2c;
+  --accent-text: #4b5823;
+  --accent-glow: rgba(110, 124, 58, 0.7);
 
   --glass: linear-gradient(
     180deg,
@@ -56,7 +58,7 @@
   --glass-fill: rgba(255, 255, 255, 0.3);
   --glass-line: rgba(14, 14, 14, 0.09);
   --glass-edge: inset 0 1px 0 rgba(255, 255, 255, 0.95);
-  --glass-drop: 0 30px 60px -34px rgba(60, 30, 20, 0.35);
+  --glass-drop: 0 30px 60px -34px rgba(48, 46, 20, 0.35);
   --hairline: rgba(14, 14, 14, 0.08);
   --hover: rgba(14, 14, 14, 0.05);
   --well: rgba(255, 255, 255, 0.6);
@@ -71,7 +73,6 @@
   /* legacy tokens still read by component markup */
   --muted: var(--text-3);
   --line: var(--hairline);
-  --accent: var(--red);
 
   font-family: var(--font-sans);
   font-size: 15px;
@@ -145,7 +146,7 @@ textarea::placeholder {
   color: rgba(14, 14, 14, 0.42);
 }
 ::selection {
-  background: var(--red);
+  background: var(--accent);
   color: #fff;
 }
 .sr-only {
@@ -380,7 +381,7 @@ footer {
   height: 30px;
 }
 .brand-mark svg path:last-child {
-  stroke: var(--red);
+  stroke: var(--accent);
 }
 .brand-word {
   font-family: var(--font-logo);
@@ -397,9 +398,9 @@ footer {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: var(--red);
+  background: var(--accent);
   margin-bottom: 3px;
-  box-shadow: 0 0 12px rgba(215, 25, 33, 0.9);
+  box-shadow: 0 0 12px var(--accent-glow);
 }
 .workspace-label {
   font-family: var(--font-mono);
@@ -449,7 +450,7 @@ footer {
   color: var(--text-2);
 }
 .nav-item.active .nav-count {
-  background: var(--red);
+  background: var(--accent);
   color: #fff;
 }
 .sidebar-bottom {
@@ -473,8 +474,8 @@ footer {
   border-radius: 50%;
   margin-top: 5px;
   flex-shrink: 0;
-  background: var(--red);
-  box-shadow: 0 0 10px rgba(215, 25, 33, 0.9);
+  background: var(--accent);
+  box-shadow: 0 0 10px var(--accent-glow);
 }
 .status-dot.online {
   background: var(--text);
@@ -565,7 +566,7 @@ footer {
 }
 .breadcrumb > span {
   margin: 0 10px;
-  color: var(--red);
+  color: var(--accent);
 }
 .topbar-right {
   display: flex;
@@ -581,7 +582,7 @@ footer {
   line-height: 1;
 }
 .clock-colon {
-  color: var(--red);
+  color: var(--accent);
   animation: blink 2s steps(1) infinite;
 }
 @keyframes blink {
@@ -651,8 +652,8 @@ main {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: var(--red);
-  box-shadow: 0 0 10px rgba(215, 25, 33, 0.9);
+  background: var(--accent);
+  box-shadow: 0 0 10px var(--accent-glow);
 }
 .page-heading h1 {
   font-family: var(--font-display);
@@ -677,7 +678,7 @@ main {
 }
 .dot-divider {
   padding: 0 8px;
-  color: var(--red);
+  color: var(--accent);
 }
 .muted {
   color: var(--text-3);
@@ -689,7 +690,7 @@ main {
   margin-top: 18px;
 }
 .error-text {
-  color: var(--red-text);
+  color: var(--accent-text);
   font-size: 13px;
   line-height: 1.6;
 }
@@ -728,8 +729,8 @@ main {
   padding: 11px 20px;
 }
 .button.primary:hover {
-  background: var(--red);
-  border-color: var(--red);
+  background: var(--accent);
+  border-color: var(--accent);
   color: #fff;
 }
 .button.quiet {
@@ -752,7 +753,7 @@ main {
   color: var(--text);
 }
 .text-button:hover svg {
-  color: var(--red);
+  color: var(--accent);
 }
 .icon-button {
   display: inline-flex;
@@ -772,11 +773,11 @@ main {
   color: var(--text);
 }
 .icon-button.favorite {
-  color: var(--red-text);
+  color: var(--accent-text);
 }
 .icon-button.favorite svg {
-  fill: var(--red);
-  stroke: var(--red);
+  fill: var(--accent);
+  stroke: var(--accent);
 }
 .spinner {
   width: 16px;
@@ -832,9 +833,9 @@ main {
   position: relative;
 }
 .torrent-input.dragging {
-  border: 1px dashed var(--red-text);
+  border: 1px dashed var(--accent-text);
   background:
-    linear-gradient(180deg, rgba(215, 25, 33, 0.16), rgba(215, 25, 33, 0.04)),
+    linear-gradient(180deg, rgba(110, 124, 58, 0.16), rgba(110, 124, 58, 0.04)),
     var(--glass-fill);
 }
 .input-heading {
@@ -923,7 +924,7 @@ main {
   margin-bottom: 14px;
 }
 .workflow > div:first-child > span {
-  color: var(--red-text);
+  color: var(--accent-text);
 }
 .workflow strong {
   font-size: 15px;
@@ -961,7 +962,7 @@ main {
   line-height: 1.6;
 }
 .privacy-note svg {
-  color: var(--red-text);
+  color: var(--accent-text);
 }
 
 /* ───────── Lists ───────── */
@@ -1083,10 +1084,10 @@ main {
   background: rgba(14, 14, 14, 0.1);
 }
 .library-open progress::-webkit-progress-value {
-  background: var(--red);
+  background: var(--accent);
 }
 .library-open progress::-moz-progress-bar {
-  background: var(--red);
+  background: var(--accent);
 }
 .list-toolbar {
   display: flex;
@@ -1192,9 +1193,9 @@ th:first-child {
   padding: 7px 14px;
 }
 .play-button svg {
-  color: var(--red-text);
-  fill: var(--red);
-  stroke: var(--red);
+  color: var(--accent-text);
+  fill: var(--accent);
+  stroke: var(--accent);
 }
 .play-button:hover {
   background: var(--text) !important;
@@ -1216,7 +1217,7 @@ th:first-child {
   background: var(--hover);
 }
 .selected-file td:first-child {
-  box-shadow: inset 2px 0 0 var(--red);
+  box-shadow: inset 2px 0 0 var(--accent);
 }
 .folder-breadcrumbs {
   display: flex;
@@ -1228,7 +1229,7 @@ th:first-child {
   display: flex;
   align-items: center;
   gap: 8px;
-  color: var(--red);
+  color: var(--accent);
   font-size: 13px;
 }
 .load-more {
@@ -1379,7 +1380,7 @@ th:first-child {
 }
 .session-seek input {
   width: 100%;
-  accent-color: var(--red);
+  accent-color: var(--accent);
   cursor: pointer;
 }
 .resource-management {
@@ -1432,7 +1433,7 @@ th:first-child {
   font-size: 11.5px;
   letter-spacing: 0.14em;
   text-transform: uppercase;
-  color: var(--red-text);
+  color: var(--accent-text);
   white-space: nowrap;
 }
 .remove-resource:hover {
@@ -1474,7 +1475,7 @@ th:first-child {
   color: #8f0d12;
 }
 .message.success svg {
-  color: var(--red-text);
+  color: var(--accent-text);
 }
 .message.working small {
   display: block;
@@ -1571,11 +1572,11 @@ th:first-child {
 .storage-meter::-webkit-meter-optimum-value,
 .storage-meter::-webkit-meter-suboptimum-value,
 .storage-meter::-webkit-meter-even-less-good-value {
-  background: var(--red);
+  background: var(--accent);
   border-radius: var(--pill);
 }
 .storage-meter::-moz-meter-bar {
-  background: var(--red);
+  background: var(--accent);
   border-radius: var(--pill);
 }
 
@@ -2097,7 +2098,7 @@ footer > span {
   --text: #f7f2f0;
   --text-2: rgba(247, 242, 240, 0.8);
   --text-3: rgba(247, 242, 240, 0.64);
-  --red-text: #ff6b70;
+  --accent-text: #c9d48f;
   color: var(--text);
 }
 :root[data-surface="dark"] .report-form textarea,

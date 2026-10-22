@@ -43,20 +43,43 @@ export interface Concept {
   scene: string;
 }
 
-const red: Palette = {
-  name: "Red",
-  tone: "dark",
-  colors: ["#1a1213", "#3a0507", "#e3121b", "#fff4ee"],
-};
-const paper: Palette = {
-  name: "Red on paper",
+// Olive and oat, after granola: four colours for the light scenes (upper
+// field, lower field, glow, core) and five for the object scenes (upper
+// field, lower field, then three objects).
+const granola: Palette = {
+  name: "Granola",
   tone: "light",
-  colors: ["#fffaf6", "#eee4dc", "#e3121b", "#5a0a0e"],
+  colors: ["#F5F1E6", "#E6DDC4", "#76843E", "#33401C"],
 };
-const graphite: Palette = {
-  name: "Graphite",
+const moss: Palette = {
+  name: "Moss",
   tone: "dark",
-  colors: ["#18191b", "#0b0b0c", "#c9d4e6", "#ffffff"],
+  colors: ["#252A17", "#13160B", "#8C9C4C", "#F3E9C8"],
+};
+const sage: Palette = {
+  name: "Sage",
+  tone: "light",
+  colors: ["#F3F4EC", "#DDE2CB", "#A9B57E", "#55642A"],
+};
+const honey: Palette = {
+  name: "Honey",
+  tone: "light",
+  colors: ["#F7F2E4", "#E9DEC1", "#C79F4A", "#5F4B19"],
+};
+const granolaObjects: Palette = {
+  name: "Granola",
+  tone: "light",
+  colors: ["#F5F1E6", "#E5DBC1", "#6E7C3A", "#FFFDF5", "#B7C18D"],
+};
+const mossObjects: Palette = {
+  name: "Moss",
+  tone: "dark",
+  colors: ["#2B3020", "#171A0F", "#8E9D4F", "#E9E2CB", "#5D6B35"],
+};
+const oatObjects: Palette = {
+  name: "Oat and honey",
+  tone: "light",
+  colors: ["#F7F3EA", "#EAE2CE", "#C9A55A", "#FFFDF7", "#98A56B"],
 };
 
 const glass = {
@@ -176,7 +199,6 @@ vec4 scene(vec2 p) {
 // The Natively notepad hero: a slab, an arc and a disc in lavender, with
 // shadows tinted violet rather than grey. Scene units here span -1..1.
 const monolith = `
-const vec3 SHADE = vec3(0.95, 1.08, 0.62);
 float softEdge(float d, float e) { return 1.0 - smoothstep(0.0, e, d); }
 float sdCircle(vec2 p, vec2 c, float r) { return length(p - c) - r; }
 float sdBox(vec2 p, vec2 c, vec2 b, float r) {
@@ -187,6 +209,8 @@ float shadow(float d, float r) { return softEdge(d, r) * 0.22; }
 vec4 scene(vec2 sp) {
   vec2 p = sp * 2.0;
   float t = uTime;
+  // shadows take a tint from the main object instead of going grey
+  vec3 SHADE = 1.2 - uPal[2] * 0.6;
   vec3 col = mix(uPal[1], uPal[0], smoothstep(-1.0, 1.0, p.y + 0.1 * p.x));
   vec2 pd = p - vec2(0.03 * sin(t * 0.2), 0.0);
   float disc = sdCircle(pd, vec2(1.38, -0.5), 0.6);
@@ -205,78 +229,163 @@ vec4 scene(vec2 sp) {
   return vec4(col, 1.0);
 }`;
 
+const objectHelpers = `
+mat2 rot2(float a) { float c = cos(a), s = sin(a); return mat2(c, s, -s, c); }
+float softEdge(float d, float e) { return 1.0 - smoothstep(0.0, e, d); }
+`;
+
+// A cairn of polished river stones, lit from the upper left.
+const pebbles = `${objectHelpers}
+float stone(vec2 p, vec2 c, vec2 r, float a) {
+  vec2 q = rot2(-a) * (p - c);
+  q.y *= q.y < 0.0 ? 1.2 : 1.0;
+  return (length(q / r) - 1.0) * min(r.x, r.y);
+}
+vec3 stoneColor(vec2 p, vec2 c, vec2 r, float a, vec3 base) {
+  vec2 q = rot2(-a) * (p - c);
+  float u = clamp(q.x / r.x, -1.0, 1.0), v = clamp(q.y / r.y, -1.0, 1.0);
+  vec3 col = base * (0.76 + 0.32 * smoothstep(-1.0, 0.9, v));
+  col += vec3(1.0, 0.98, 0.92) * 0.16 * exp(-pow((u + 0.35) / 0.42, 2.0) - pow((v - 0.45) / 0.3, 2.0));
+  col *= 1.0 - 0.1 * smoothstep(0.55, 1.0, abs(u));
+  return col * (1.0 - 0.14 * smoothstep(-0.2, -1.0, v));
+}
+vec3 place(vec3 col, vec2 p, vec2 c, vec2 r, float a, vec3 base, vec3 shade) {
+  // a broad cast shadow, and a tight one where the stone meets what is below
+  col *= 1.0 - shade * softEdge(stone(p - vec2(0.08, -0.1), c, r, a), 0.24) * 0.22;
+  col *= 1.0 - shade * softEdge(stone(p - vec2(0.0, -0.025), c, r * vec2(0.92, 0.9), a), 0.05) * 0.3;
+  return mix(col, stoneColor(p, c, r, a, base), softEdge(stone(p, c, r, a), 0.006));
+}
+vec4 scene(vec2 sp) {
+  vec2 p = sp * 2.0;
+  vec3 shade = 1.2 - uPal[2] * 0.6;
+  vec3 col = mix(uPal[1], uPal[0], smoothstep(-1.0, 1.0, p.y + 0.1 * p.x));
+  // cream reads warmer when it borrows a little of the ground colour
+  vec3 cream = mix(uPal[3], uPal[1], 0.3);
+  col = place(col, p, vec2(-1.05, -0.86), vec2(0.24, 0.12), 0.06, uPal[4], shade);
+  col = place(col, p, vec2(0.82, -0.7), vec2(0.7, 0.33), -0.04, uPal[2], shade);
+  col = place(col, p, vec2(0.7, -0.13), vec2(0.45, 0.22), 0.08, cream, shade);
+  col = place(col, p, vec2(0.8, 0.22), vec2(0.24, 0.14), -0.12, uPal[4], shade);
+  return vec4(col, 1.0);
+}`;
+
+// Long olive blades crossing in from the right, each with a pale midrib.
+const leaves = `${objectHelpers}
+float leaf(vec2 p, vec2 c, float len, float w, float a) {
+  vec2 q = rot2(-a) * (p - c);
+  float r = (len * len * 0.25 + w * w) / (2.0 * w);
+  float o = r - w;
+  return max(length(q - vec2(0.0, o)), length(q + vec2(0.0, o))) - r;
+}
+vec3 leafColor(vec2 p, vec2 c, float len, float w, float a, vec3 base) {
+  vec2 q = rot2(-a) * (p - c);
+  float u = q.x / (len * 0.5), v = clamp(q.y / w, -1.0, 1.0);
+  vec3 col = base * (0.84 + 0.22 * smoothstep(-1.0, 1.0, v));
+  float rib = exp(-pow(q.y / 0.007, 2.0)) * smoothstep(1.0, 0.55, abs(u));
+  col = mix(col, min(base * 1.25 + 0.06, vec3(1.0)), rib * 0.55);
+  return col;
+}
+vec3 place(vec3 col, vec2 p, vec2 c, float len, float w, float a, vec3 base, vec3 shade) {
+  col *= 1.0 - shade * softEdge(leaf(p - vec2(0.06, -0.1), c, len, w, a), 0.2) * 0.22;
+  return mix(col, leafColor(p, c, len, w, a, base), softEdge(leaf(p, c, len, w, a), 0.006) * 0.96);
+}
+vec4 scene(vec2 sp) {
+  vec2 p = sp * 2.0;
+  vec3 shade = 1.2 - uPal[2] * 0.6;
+  vec3 col = mix(uPal[1], uPal[0], smoothstep(-1.0, 1.0, p.y + 0.15 * p.x));
+  col = place(col, p, vec2(-1.08, 0.72), 0.8, 0.12, -0.45, uPal[4], shade);
+  col = place(col, p, vec2(0.48, -0.6), 1.7, 0.27, 0.2, uPal[4], shade);
+  col = place(col, p, vec2(1.02, 0.1), 2.3, 0.36, 0.62, uPal[2], shade);
+  col = place(col, p, vec2(1.38, -0.62), 0.95, 0.16, 1.1, uPal[2] * 0.8, shade);
+  return vec4(col, 1.0);
+}`;
+
 export const concepts: Concept[] = [
+  {
+    id: "pebbles",
+    name: "Pebbles",
+    note: "A cairn of polished river stones in olive, cream and sage, softly shadowed.",
+    defaults: { ...glass },
+    glow: [78, 75],
+    palettes: [granolaObjects, oatObjects, mossObjects],
+    scene: pebbles,
+  },
+  {
+    id: "leaves",
+    name: "Leaves",
+    note: "Long olive blades crossing in from the right, each with a pale midrib.",
+    defaults: { ...glass, ribWidth: 26 },
+    glow: [80, 40],
+    palettes: [granolaObjects, oatObjects, mossObjects],
+    scene: leaves,
+  },
   {
     id: "signal",
     name: "Signal",
-    note: "A single red tube light, its glow repeated across the flutes and down a dark floor.",
+    note: "A single tube of light, its glow repeated across the flutes and down a dark floor.",
     defaults: { ...glass },
     glow: [61, 45],
-    palettes: [red, paper, graphite],
+    palettes: [moss, granola, sage],
     scene: signal,
   },
   {
     id: "horizon",
     name: "Horizon",
-    note: "A low band of red light under a graphite sky, mirrored in the ground below.",
+    note: "A low band of light along the horizon, mirrored in the ground below.",
     defaults: { ...glass, ribWidth: 22, blur: 0.3 },
     glow: [40, 58],
-    palettes: [red, paper, graphite],
+    palettes: [granola, moss, sage],
     scene: horizon,
   },
   {
     id: "ember",
     name: "Ember",
-    note: "Two lights far out of focus: one large and red, one small and warm white.",
+    note: "Two lights far out of focus: one large and olive, one small and warm.",
     defaults: { ...glass, ribWidth: 34, distortion: 1 },
     glow: [32, 58],
-    palettes: [red, paper, graphite],
+    palettes: [moss, granola, sage],
     scene: ember,
   },
   {
     id: "bleed",
     name: "Bleed",
-    note: "Red light spilling across warm paper from outside the frame, crossed by one soft shadow.",
+    note: "Light spilling across warm paper from outside the frame, crossed by one soft shadow.",
     defaults: { ...glass, ribWidth: 26, blur: 0.28 },
     glow: [100, 62],
-    palettes: [paper, red, graphite],
+    palettes: [honey, granola, moss],
     scene: bleed,
   },
   {
     id: "doorway",
     name: "Doorway",
-    note: "An arched opening of warm light in a red room, spilling out across the floor.",
+    note: "An arched opening of warm light in a dark room, spilling out across the floor.",
     defaults: { ...glass, ribWidth: 30 },
     glow: [42, 55],
-    palettes: [red, paper, graphite],
+    palettes: [moss, granola, sage],
     scene: doorway,
   },
   {
     id: "halo",
     name: "Halo",
-    note: "A ring of red light, brightest along its upper arc, broken into slivers by the glass.",
+    note: "A ring of light, brightest along its upper arc, broken into slivers by the glass.",
     defaults: { ...glass, ribWidth: 24 },
     glow: [64, 47],
-    palettes: [red, paper, graphite],
+    palettes: [moss, granola, sage],
     scene: halo,
   },
   {
     id: "monolith",
     name: "Monolith",
-    note: "A slab, an arc and a violet disc behind fluted glass, from the Natively notepad hero.",
+    note: "A slab, an arc and a disc with soft tinted shadows; in lavender it is the Natively notepad hero.",
     defaults: { ...glass },
     glow: [90, 75],
     palettes: [
+      granolaObjects,
       {
         name: "Lavender",
         tone: "light",
         colors: ["#F4EFFD", "#E2D6F9", "#9C6FF3", "#FFFFFF", "#CDBBFB"],
       },
-      {
-        name: "Red on paper",
-        tone: "light",
-        colors: ["#fffaf6", "#eee4dc", "#e3121b", "#ffffff", "#f2b8b2"],
-      },
+      mossObjects,
     ],
     scene: monolith,
   },

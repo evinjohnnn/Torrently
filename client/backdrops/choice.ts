@@ -10,7 +10,7 @@ export interface BackdropChoice {
 const EVENT = "torrently:backdrop";
 
 /** The app's background unless the address bar asks for another. */
-export const DEFAULT_CHOICE: BackdropChoice = { concept: "bleed", palette: 0 };
+export const DEFAULT_CHOICE: BackdropChoice = { concept: "leaves", palette: 0 };
 
 /**
  * Reads `?backdrop=<id>&palette=<n>` from the address bar;

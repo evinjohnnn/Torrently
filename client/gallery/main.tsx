@@ -37,11 +37,12 @@ function Gallery() {
   return (
     <div className="page">
       <header className="masthead">
-        <h1>Light through reeded glass</h1>
+        <h1>Olive, oat and fluted glass</h1>
         <p>
-          Six backdrops for Torrently, each a single light source seen out of
-          focus through vertical fluted glass. They render live in your browser;
-          open one to adjust the glass, check text over it and export a still.
+          Backdrops for Torrently, seen through vertical fluted glass. The scene
+          sits on its own layer and drifts behind the ribs as you move the
+          pointer. Open one to adjust the glass, check text over it and export a
+          still.
         </p>
       </header>
       <ul className="grid">
