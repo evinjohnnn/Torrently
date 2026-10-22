@@ -2072,3 +2072,66 @@ footer > span {
     backdrop-filter: none;
   }
 }
+
+/* ───────── Lenticular backdrops (opt-in via ?backdrop=) ───────── */
+
+.backdrop-gl {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  overflow: hidden;
+  pointer-events: none;
+  background: var(--bg);
+}
+/* On a dark backdrop, copy that sits on it directly switches to light ink;
+   everything inside the glass panels keeps the light theme. */
+:root[data-surface="dark"] .page-heading,
+:root[data-surface="dark"] .section-heading,
+:root[data-surface="dark"] .privacy-note,
+:root[data-surface="dark"] .list-toolbar,
+:root[data-surface="dark"] .file-browser > .fine-print,
+:root[data-surface="dark"] .resource-management,
+:root[data-surface="dark"] main > .muted,
+:root[data-surface="dark"] footer,
+:root[data-surface="dark"] .boot {
+  --text: #f7f2f0;
+  --text-2: rgba(247, 242, 240, 0.8);
+  --text-3: rgba(247, 242, 240, 0.64);
+  --red-text: #ff6b70;
+  color: var(--text);
+}
+:root[data-surface="dark"] .report-form textarea,
+:root[data-surface="dark"] .list-toolbar .search-field {
+  --text: #0e0e0e;
+  --text-3: rgba(14, 14, 14, 0.58);
+  color: var(--text-3);
+}
+:root[data-surface="dark"] .section-heading,
+:root[data-surface="dark"] .resource-management,
+:root[data-surface="dark"] footer {
+  background-image: radial-gradient(
+    circle,
+    rgba(247, 242, 240, 0.4) 0.9px,
+    transparent 1.3px
+  );
+}
+/* headings stay legible where a light sits directly behind them */
+:root[data-surface="dark"] .page-heading h1,
+:root[data-surface="dark"] .page-heading p {
+  text-shadow: 0 1px 28px rgba(0, 0, 0, 0.55);
+}
+:root[data-backdrop] .page-heading h1 {
+  text-shadow: 0 1px 28px rgba(255, 255, 255, 0.6);
+}
+:root[data-backdrop][data-surface="dark"] .page-heading h1 {
+  text-shadow: 0 1px 28px rgba(0, 0, 0, 0.55);
+}
+@media (max-width: 760px) {
+  /* on phones the logo and settings button sit on the backdrop itself */
+  :root[data-surface="dark"] .sidebar > .brand,
+  :root[data-surface="dark"] .sidebar-bottom > .nav-item:not(.active) {
+    --text: #f7f2f0;
+    --text-2: rgba(247, 242, 240, 0.8);
+    color: var(--text);
+  }
+}

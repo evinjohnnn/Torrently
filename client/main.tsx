@@ -24,7 +24,7 @@ import {
   type TorrentFile,
 } from "./api";
 import { Icon, type IconName } from "./icons";
-import { Backdrop } from "./Backdrop";
+import { AppBackdrop } from "./AppBackdrop";
 const Player = lazy(() =>
   import("./Player").then((module) => ({ default: module.Player })),
 );
@@ -1382,7 +1382,7 @@ function FileBrowser({
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <Backdrop />
+    <AppBackdrop />
     <App />
   </StrictMode>,
 );
