@@ -1,7 +1,12 @@
 /* ───────── Hero ───────── */
 
+/* the hero fills the first screen below the nav; the sheet starts at the fold */
 .hero {
-  padding: clamp(48px, 9vh, 104px) 0 72px;
+  display: flex;
+  align-items: center;
+  min-height: calc(100vh - var(--nav-h) - 24px);
+  min-height: calc(100svh - var(--nav-h) - 24px);
+  padding: 32px 0 56px;
 }
 .hero-grid {
   display: flex;
@@ -12,6 +17,22 @@
 }
 .hero-copy {
   max-width: 900px;
+}
+/* depth on scroll: the leaves rise at 0.3x (the backdrop), the hero at
+   0.75x, and the sheet slides over both at full speed */
+@supports (animation-timeline: scroll()) {
+  @media (prefers-reduced-motion: no-preference) {
+    .hero-grid {
+      animation: hero-depth linear both;
+      animation-timeline: scroll(root);
+      animation-range: 0 100vh;
+    }
+  }
+}
+@keyframes hero-depth {
+  to {
+    transform: translateY(25vh);
+  }
 }
 .hero h1 {
   font-size: var(--step-5);
@@ -28,11 +49,16 @@
   font-weight: 500;
   letter-spacing: -0.02em;
 }
+/* hero text over the leaves: darker and heavier than body copy, still
+   lighter, smaller and thinner than the h1 */
+.hero {
+  --hero-ink: rgba(28, 31, 20, 0.7);
+}
 .hero .lede {
   margin: 22px auto 0;
   max-width: 62ch;
-  color: var(--ink-2);
-  text-shadow: 0 1px 18px rgba(255, 255, 255, 0.7);
+  color: var(--hero-ink);
+  font-weight: 500;
 }
 
 /* the slab: one pane of liquid glass holding the product's main job */
@@ -49,6 +75,10 @@
 .open-slab > :not(.liquid-glass) {
   position: relative;
   z-index: 1;
+}
+/* thick like the scrolled nav: the leaves behind it must not compete with the text */
+.open-slab .liquid-glass {
+  background-color: rgba(248, 245, 236, 0.88);
 }
 .open-slab.dragging {
   transform: scale(1.01);
@@ -70,6 +100,21 @@
 }
 .magnet-form:focus-within {
   border-color: rgba(28, 31, 20, 0.45);
+}
+/* concentric with the bar: its radius less its 6px padding */
+.magnet-form .button {
+  border-radius: calc(var(--r-xl) - 14px);
+}
+/* empty field: a quiet tint of the bar; it turns solid once there is a link to open */
+.magnet-form .button.paste {
+  background: var(--olive-wash);
+  border-color: transparent;
+  color: var(--olive-ink);
+  font-weight: 600;
+}
+.magnet-form .button.paste:hover {
+  background: rgba(95, 111, 44, 0.2);
+  color: var(--olive-ink);
 }
 .magnet-icon {
   flex: none;
@@ -143,8 +188,43 @@
   color: var(--ink);
   background: var(--hover);
 }
-.open-slab > .notice {
-  margin-bottom: 10px;
+/* a form error: one compact line under the bar, closable */
+.form-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 4px 4px 4px 12px;
+  border-radius: var(--r-sm);
+  background: var(--brick-wash);
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.45;
+}
+.form-error > svg {
+  flex: none;
+  color: var(--brick);
+}
+.form-error > span {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 0;
+}
+.form-error-close {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  color: var(--ink-2);
+  transition:
+    background-color 200ms var(--ease),
+    color 200ms var(--ease);
+}
+.form-error-close:hover {
+  background: var(--brick-wash);
+  color: var(--ink);
 }
 .load-card {
   display: flex;
@@ -160,35 +240,6 @@
   flex-wrap: wrap;
   justify-content: flex-end;
   gap: 8px;
-}
-
-/* facts under the slab: small, quiet, centred under it */
-.facts {
-  max-width: 820px;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: center;
-  gap: 16px 40px;
-}
-.promises {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  gap: 6px 18px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  font-size: 14px;
-  color: var(--ink-2);
-}
-.promises li {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-.promises svg {
-  color: var(--olive);
 }
 
 /* ───────── Sheet ───────── */
@@ -359,32 +410,65 @@ main:has(.sheet) + .footer {
 
 /* ───────── Sections ───────── */
 
+/* how it works: dot-matrix numerals in the wordmark's face, columns split by
+   hairlines, and the next step as an editorial row under a heavy rule */
+#how .section-head {
+  max-width: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px 48px;
+  margin-bottom: 56px;
+}
+#how .section-head h2 {
+  max-width: 9ch;
+  font-size: clamp(42px, 6vw, 72px);
+  letter-spacing: -0.045em;
+  line-height: 0.95;
+}
+#how .section-head p {
+  max-width: 34ch;
+  margin: 0 0 8px;
+  font-size: 18px;
+}
 .steps {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 16px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   margin: 0;
   padding: 0;
   list-style: none;
-  counter-reset: none;
 }
 .step {
-  position: relative;
-  padding: 26px 24px 24px;
-  border-top: 2px solid var(--ink);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 0 40px;
+}
+.step:first-child {
+  padding-left: 0;
+}
+.step:last-child {
+  padding-right: 0;
+}
+.step + .step {
+  border-left: 1px solid var(--hairline);
 }
 .step-number {
   display: block;
-  margin-bottom: 26px;
-  font-size: var(--step-3);
-  font-weight: 600;
-  letter-spacing: -0.04em;
-  line-height: 1;
-  color: var(--olive-ink);
+  padding-bottom: 24px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid var(--hairline);
+  font-family: var(--font-logo);
+  font-weight: 900;
+  font-size: clamp(96px, 13vw, 168px);
+  line-height: 0.8;
+  letter-spacing: -0.02em;
+  color: var(--olive);
 }
 .step h3 {
-  font-size: var(--step-1);
-  margin-bottom: 8px;
+  font-size: 24px;
+  letter-spacing: -0.02em;
 }
 .step p {
   color: var(--ink-2);
@@ -392,28 +476,39 @@ main:has(.sheet) + .footer {
 @media (max-width: 860px) {
   .steps {
     grid-template-columns: 1fr;
+    gap: 40px;
+  }
+  .step,
+  .step:first-child,
+  .step:last-child {
+    padding: 0;
+  }
+  .step + .step {
+    border-left: 0;
   }
 }
 .next-step {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) auto;
   align-items: center;
-  justify-content: space-between;
-  gap: 16px 32px;
-  margin-top: 40px;
-  padding: 22px 24px;
+  gap: 16px 40px;
+  margin-top: 64px;
+  padding-top: 28px;
+  border-top: 2px solid var(--ink);
 }
 .next-step h3 {
-  font-size: var(--step-1);
-  margin-bottom: 4px;
+  font-size: var(--step-3);
+  letter-spacing: -0.03em;
+  line-height: 1.05;
 }
 .next-step p {
   color: var(--ink-2);
-  max-width: 62ch;
+  font-size: 15px;
 }
-@media (max-width: 760px) {
+@media (max-width: 860px) {
   .next-step {
-    flex-direction: column;
-    align-items: flex-start;
+    grid-template-columns: 1fr;
+    justify-items: start;
   }
 }
 
@@ -660,7 +755,7 @@ a.feature:hover {
 
 @media (max-width: 640px) {
   .hero {
-    padding-top: 28px;
+    padding-top: 16px;
   }
   .magnet-form {
     flex-wrap: wrap;

@@ -20,6 +20,11 @@ export interface LenticularBackdropProps {
   pointer?: "window" | "parent" | "none" | RefObject<HTMLElement | null>;
   /** slow drift; ignored when the viewer prefers reduced motion */
   motion?: boolean;
+  /**
+   * Scroll parallax: the scene rises this fraction of the page's scroll,
+   * over the first screen only. 0 turns it off; so does reduced motion.
+   */
+  scrollRate?: number;
   /** caps the backing-store resolution, in device pixels per CSS pixel */
   maxDpr?: number;
   /**
@@ -51,6 +56,7 @@ export function LenticularBackdrop({
   params,
   pointer = "window",
   motion = false,
+  scrollRate = 0,
   maxDpr = 2,
   referenceWidth,
   scrim = "none",
@@ -83,6 +89,7 @@ export function LenticularBackdrop({
     let frame = 0;
     let disposed = false;
     let time = 0;
+    const rate = still ? 0 : scrollRate;
 
     const draw = () => {
       if (disposed) return;
@@ -93,6 +100,8 @@ export function LenticularBackdrop({
           dpr: ref ? dpr * Math.min(1, element.clientWidth / ref) : dpr,
           time,
           pointer: eased,
+          // past the first screen the sheet covers the backdrop
+          scroll: rate * Math.min(scrollY, innerHeight),
         });
       } catch (error) {
         console.error(error);
@@ -151,6 +160,7 @@ export function LenticularBackdrop({
     area?.addEventListener("pointermove", onMove as EventListener);
     const leaveTarget = area === window ? document.documentElement : area;
     leaveTarget?.addEventListener("pointerleave", onLeave);
+    if (rate) addEventListener("scroll", wake, { passive: true });
 
     // optional slow drift of the scene itself
     let drift = 0;
@@ -179,11 +189,12 @@ export function LenticularBackdrop({
       observer.disconnect();
       area?.removeEventListener("pointermove", onMove as EventListener);
       leaveTarget?.removeEventListener("pointerleave", onLeave);
+      removeEventListener("scroll", wake);
       element.removeEventListener("webglcontextlost", lost);
       redraw.current = () => {};
       renderer.dispose();
     };
-  }, [failed, maxDpr, motion, pointer]);
+  }, [failed, maxDpr, motion, pointer, scrollRate]);
 
   // Redraw on parameter changes without rebuilding the renderer.
   useEffect(() => redraw.current(), [concept, key, referenceWidth]);

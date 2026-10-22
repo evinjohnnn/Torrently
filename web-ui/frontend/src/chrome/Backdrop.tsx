@@ -12,7 +12,7 @@ export function Backdrop() {
   return (
     <div className="backdrop" aria-hidden="true">
       <Suspense fallback={null}>
-        <Lenticular concept="leaves" params={{ palette: 0 }} />
+        <Lenticular concept="leaves" params={{ palette: 0 }} scrollRate={0.3} />
       </Suspense>
     </div>
   );

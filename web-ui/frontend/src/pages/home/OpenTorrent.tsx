@@ -102,7 +102,21 @@ export function OpenTorrent() {
   const { submit, busy } = useNavigation();
   const [query, setQuery] = useState(data.query ?? "");
   const [dragging, setDragging] = useState(false);
+  // a closed error stays closed until the next submit brings a new one
+  const [dismissed, setDismissed] = useState<typeof error>();
   const file = useRef<HTMLInputElement>(null);
+  const input = useRef<HTMLInputElement>(null);
+  // clipboard reads need a secure context; without one the button only opens
+  const canPaste = typeof navigator.clipboard?.readText === "function";
+  const paste = async () => {
+    try {
+      const text = (await navigator.clipboard.readText()).trim();
+      if (text) setQuery(text);
+    } catch {
+      /* refused: the field is focused for Ctrl+V instead */
+    }
+    input.current?.focus();
+  };
   const instruction = data.instruction;
 
   const send = (fd: FormData) => {
@@ -165,22 +179,13 @@ export function OpenTorrent() {
         <Loading url={data.jobLogUrl!} tool={tool?.url} onRetry={send} />
       ) : (
         <>
-          {error && (
-            <div className="notice error" role="alert">
-              <Icon name="alert" />
-              <span>
-                {error.args
-                  ? tn(error.key, error.args.Count, { Full: error.args.Full })
-                  : t(error.key)}
-              </span>
-            </div>
-          )}
           <form className="magnet-form" onSubmit={onSubmit}>
             <label className="visually-hidden" htmlFor="resource">
               {t("home.placeholder")}
             </label>
-            <Icon name={tool ? "arrow" : "search"} className="magnet-icon" />
+            <Icon name={tool ? "arrow" : "link"} className="magnet-icon" />
             <input
+              ref={input}
               id="resource"
               name="resource"
               className="magnet-input"
@@ -191,11 +196,35 @@ export function OpenTorrent() {
               spellCheck={false}
               required
             />
-            <button type="submit" className="button accent large" disabled={busy}>
-              {busy ? <span className="spinner" /> : null}
-              {t(tool ? "home.open" : "home.search")}
-            </button>
+            {canPaste && !query.trim() ? (
+              <button type="button" className="button large paste" onClick={paste}>
+                {t("home.paste")}
+              </button>
+            ) : (
+              <button type="submit" className="button accent large" disabled={busy}>
+                {busy ? <span className="spinner" /> : null}
+                {t("home.open")}
+              </button>
+            )}
           </form>
+          {error && error !== dismissed && (
+            <div className="form-error" role="alert">
+              <Icon name="alert" size={16} />
+              <span>
+                {error.args
+                  ? tn(error.key, error.args.Count, { Full: error.args.Full })
+                  : t(error.key)}
+              </span>
+              <button
+                type="button"
+                className="form-error-close"
+                aria-label={t("onboarding.close")}
+                onClick={() => setDismissed(error)}
+              >
+                <Icon name="close" size={14} />
+              </button>
+            </div>
+          )}
           <div className="slab-foot">
             <button type="button" className="drop-target" onClick={() => file.current?.click()}>
               <Icon name="upload" size={18} />

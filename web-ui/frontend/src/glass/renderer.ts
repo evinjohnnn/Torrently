@@ -8,6 +8,8 @@ export interface RenderOptions {
   time?: number;
   /** pointer position over the backdrop, 0..1 on each axis; 0.5 is centred */
   pointer?: [number, number];
+  /** how far the scene has risen behind the glass, in CSS pixels */
+  scroll?: number;
 }
 
 function hexToRgb(hex: string): [number, number, number] {
@@ -196,8 +198,9 @@ export class LenticularRenderer {
       key[2] / len,
     );
     gl.uniform1f(this.loc(scene, "uKeyI"), params.light);
-    // screen y runs down, scene y runs up
-    gl.uniform2f(this.loc(scene, "uPar"), (mx - 0.5) * 0.14, (0.5 - my) * 0.07);
+    // screen y runs down, scene y runs up; a scene unit is min(w * 1.6, h) device pixels
+    const rise = ((options.scroll ?? 0) * dpr) / Math.min(w * 1.6, h);
+    gl.uniform2f(this.loc(scene, "uPar"), (mx - 0.5) * 0.14, (0.5 - my) * 0.07 - rise);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
     // layer 2: the glass, refracting whatever the scene drew

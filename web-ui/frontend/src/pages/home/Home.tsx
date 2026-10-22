@@ -1,7 +1,6 @@
 import { usePage } from "../../app/router";
 import type { PageState } from "../../app/state";
 import { useI18n } from "../../i18n";
-import { Icon } from "../../ui/Icon";
 import { OpenTorrent } from "./OpenTorrent";
 import {
   Faq,
@@ -46,32 +45,8 @@ function Hero() {
           <p className="lede">{t(tool ? tool.description : "home.subtitle")}</p>
         </div>
         <OpenTorrent />
-        <Facts />
       </div>
     </section>
-  );
-}
-
-/** What the service promises. */
-function Facts() {
-  const { t } = useI18n();
-  return (
-    <div className="facts">
-      <ul className="promises">
-        <li>
-          <Icon name="check" size={16} />
-          {t("about.trust.noInstall")}
-        </li>
-        <li>
-          <Icon name="shield" size={16} />
-          {t("about.trust.ipPrivate")}
-        </li>
-        <li>
-          <Icon name="lock" size={16} />
-          {t("about.trust.https")}
-        </li>
-      </ul>
-    </div>
   );
 }
 

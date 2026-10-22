@@ -22,7 +22,7 @@ function Steps({ steps, rich }: { steps: Step[]; rich?: boolean }) {
       {steps.map((step, index) => (
         <li key={step.title} className="step">
           <span className="step-number" aria-hidden="true">
-            {index + 1}
+            {String(index + 1).padStart(2, "0")}
           </span>
           <h3>{i18n.t(step.title)}</h3>
           <p>{rich ? i18n.rich(step.text) : i18n.t(step.text)}</p>
@@ -38,20 +38,18 @@ function NextStep({ kind }: { kind: "discover" | "stremio" }) {
   const key = kind === "stremio" ? "tool.stremioCta" : "tool.discoverCta";
   const href = kind === "stremio" ? path("/stremio/configure") : path("/discover");
   return (
-    <div className="next-step glass">
-      <div>
-        <h3>{t(`${key}.title`)}</h3>
-        <p>{t(`${key}.text`)}</p>
-      </div>
+    <div className="next-step">
+      <h3>{t(`${key}.title`)}</h3>
+      <p>{t(`${key}.text`)}</p>
       {kind === "stremio" ? (
-        <a className="button primary" href={href}>
-          <Icon name="tv" size={18} />
+        <a className="button primary large" href={href}>
           {t(`${key}.button`)}
+          <Icon name="arrow" size={18} />
         </a>
       ) : (
-        <Link className="button primary" href={href}>
-          <Icon name="compass" size={18} />
+        <Link className="button primary large" href={href}>
           {t(`${key}.button`)}
+          <Icon name="arrow" size={18} />
         </Link>
       )}
     </div>
