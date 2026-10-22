@@ -257,7 +257,7 @@ func (s *Manager[K]) getFiles(pattern string) ([]string, error) {
 		if f.IsDir() {
 			continue
 		}
-		res = append(res, l)
+		res = append(res, filepath.ToSlash(l))
 	}
 	return res, nil
 }

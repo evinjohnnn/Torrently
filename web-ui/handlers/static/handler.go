@@ -56,8 +56,9 @@ func RegisterHandler(c *cli.Context, r *gin.Engine) error {
 		if err != nil {
 			return err
 		}
-		if !info.IsDir() && strings.TrimPrefix(path, pubPath) != llmsTxt {
-			r.StaticFile(strings.TrimPrefix(path, pubPath), path)
+		route := filepath.ToSlash(strings.TrimPrefix(path, pubPath))
+		if !info.IsDir() && route != llmsTxt {
+			r.StaticFile(route, path)
 		}
 		return nil
 	})
