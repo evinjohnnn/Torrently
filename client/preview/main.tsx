@@ -14,7 +14,7 @@ function Switcher() {
   const current = concepts.find((item) => item.id === concept);
   const summary = current
     ? `${current.name}, ${current.palettes[palette].name}`
-    : "Current background";
+    : "Original background";
   const signedOut =
     new URLSearchParams(location.search).get("signedout") === "1";
 
@@ -49,7 +49,7 @@ function Switcher() {
               aria-checked={!concept}
               onClick={() => setChoice({ concept: null, palette: 0 })}
             >
-              Current background
+              Original background
             </button>
             {concepts.map((item) => (
               <button
