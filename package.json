@@ -15,6 +15,7 @@
     "test": "tsx --test tests/*.test.ts",
     "test:engine": "tsx tests/engine.ts",
     "test:browser": "playwright test",
+    "backdrops:render": "vite build && node scripts/render-backdrops.mjs",
     "format": "prettier --write server shared client tests *.ts *.json *.yaml *.html"
   },
   "dependencies": {
