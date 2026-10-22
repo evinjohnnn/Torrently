@@ -2136,3 +2136,47 @@ footer > span {
     color: var(--text);
   }
 }
+
+/* ───────── Fluid glass navbar (React Bits) ───────── */
+
+.topbar,
+.login-top {
+  isolation: isolate;
+}
+.login-top {
+  position: relative;
+}
+.nav-glass {
+  position: absolute;
+  inset: -12px;
+  z-index: 0;
+  pointer-events: none;
+}
+.topbar > :not(.nav-glass),
+.login-top > :not(.nav-glass) {
+  position: relative;
+  z-index: 1;
+}
+/* the fluid glass replaces the CSS glass when it can render */
+:root[data-nav-glass] .topbar,
+:root[data-nav-glass] .login-top {
+  background: none;
+  border-color: transparent;
+  box-shadow: none;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+/* on a dark backdrop the clear glass needs light ink */
+:root[data-nav-glass][data-surface="dark"] .topbar,
+:root[data-nav-glass][data-surface="dark"] .login-top {
+  --text: #f7f2f0;
+  --text-2: rgba(247, 242, 240, 0.8);
+  --text-3: rgba(247, 242, 240, 0.66);
+  color: var(--text);
+}
+:root[data-nav-glass][data-surface="dark"] .topbar .private-label,
+:root[data-nav-glass][data-surface="dark"] .login-top .private-label {
+  --text: #1c1f14;
+  --text-2: rgba(28, 31, 20, 0.76);
+  color: var(--text-2);
+}

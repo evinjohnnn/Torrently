@@ -25,6 +25,7 @@ import {
 } from "./api";
 import { Icon, type IconName } from "./icons";
 import { AppBackdrop } from "./AppBackdrop";
+import { NavGlass } from "./NavGlass";
 const Player = lazy(() =>
   import("./Player").then((module) => ({ default: module.Player })),
 );
@@ -428,6 +429,7 @@ function App() {
       </aside>
       <div className="main-shell">
         <header className="topbar">
+          <NavGlass />
           <span className="breadcrumb">
             Workspace <span>/</span>{" "}
             {page === "resource"
@@ -820,6 +822,7 @@ function Login({
   return (
     <div className="login-layout">
       <div className="login-top">
+        <NavGlass />
         <Logo />
         <span className="private-label">Private instance</span>
       </div>
