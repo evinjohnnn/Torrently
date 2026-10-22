@@ -58,21 +58,7 @@ function message(error: unknown) {
 function Logo() {
   return (
     <div className="brand">
-      <span className="brand-mark" aria-hidden="true">
-        <svg viewBox="0 0 28 28">
-          <path d="M4 5h20v5h-7v13h-6V10H4Z" fill="currentColor" />
-          <path
-            d="m20 15 4 4-4 4"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2.5"
-          />
-        </svg>
-      </span>
-      <span className="brand-word">
-        Torrently
-        <span className="brand-dot" />
-      </span>
+      <span className="brand-word">Torrently</span>
     </div>
   );
 }

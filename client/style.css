@@ -362,26 +362,10 @@ footer {
 .brand {
   display: flex;
   align-items: center;
-  gap: 10px;
   white-space: nowrap;
 }
 .sidebar .brand {
   padding: 0 10px;
-}
-.brand-mark {
-  width: 30px;
-  height: 30px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--text);
-}
-.brand-mark svg {
-  width: 30px;
-  height: 30px;
-}
-.brand-mark svg path:last-child {
-  stroke: var(--accent);
 }
 .brand-word {
   font-family: var(--font-logo);
@@ -389,18 +373,6 @@ footer {
   font-size: 27px;
   letter-spacing: 0.01em;
   line-height: 1;
-  display: inline-flex;
-  align-items: flex-end;
-  gap: 3px;
-}
-.brand-dot {
-  display: inline-block;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--accent);
-  margin-bottom: 3px;
-  box-shadow: 0 0 12px var(--accent-glow);
 }
 .workspace-label {
   font-family: var(--font-mono);
