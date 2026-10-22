@@ -1,0 +1,13 @@
+{
+  "input": "[Cleo]Dies_Irae_-_OVA_03_(BD1080p_x265).mkv",
+  "want": {
+    "title": "Dies Irae",
+    "episode": 3,
+    "resolution": "1080p",
+    "quality": "BluRay",
+    "codec": "x265",
+    "container": "mkv",
+    "website": "Cleo",
+    "kind": "OVA"
+  }
+}

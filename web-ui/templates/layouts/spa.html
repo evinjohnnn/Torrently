@@ -1,0 +1,37 @@
+<!doctype html>
+{{/* The React app's document (services/spa). The head is the view's own:
+     title, description, canonical, hreflang, og and structured data come from
+     the same blocks main.html renders, so search engines see what they saw
+     before. The body is only the mount point and the state the app boots
+     from; the view's "main" block is not rendered. */}}
+<html lang="{{ $.Lang }}">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>{{ template "title" . }} | Torrently</title>
+        {{ block "description" . }}{{ end }}
+        {{ block "canonical" . }}{{ end }}
+        {{ range hrefLangs $.Path }}<link rel="alternate" hreflang="{{ .Lang }}" href="{{ .URL }}">
+        {{ end }}
+        {{ block "og" . }}
+        <meta property="og:type" content="website">
+        <meta property="og:site_name" content="Torrently">
+        <meta property="og:title" content="{{ template "title" . }} | Torrently">
+        {{ template "og_card" . }}
+        {{ end }}
+        <link rel="shortcut icon" href="/favicon.ico">
+        <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+        <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+        <meta name="theme-color" content="#f4f0e5">
+        <link rel="manifest" href="/manifest.webmanifest">
+        {{ spaAssets }}
+        {{- template "head_extra" . }}
+    </head>
+    <body>
+        <div id="app"></div>
+        <script type="application/json" id="torrently-state">{{ spaState . }}</script>
+        <noscript>
+            <p style="font-family: system-ui, sans-serif; padding: 24px">{{ t $.Lang "meta.noscript" }}</p>
+        </noscript>
+    </body>
+</html>

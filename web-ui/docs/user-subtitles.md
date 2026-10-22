@@ -1,0 +1,222 @@
+# User Subtitles
+
+User-uploaded subtitle tracks for video files inside a torrent. Available on
+the main site (not embed), authenticated users only.
+
+## Flow
+
+1. While streaming video, the user opens the track picker and clicks the
+   dashed **`+ My Subtitles`** chip (`#my-uploads-toggle`) at the end of the
+   subtitle chip row. There is no separate tab any more: the chip is a
+   disclosure that opens `#my-uploads-panel` inline, on its own flex line
+   below the chips.
+2. If unauthenticated: a sign-in CTA is shown inside the panel, with
+   `return-url` pointing at the current page.
+3. If authenticated: drag-and-drop or file-picker submits a standard POST
+   multipart form to `/user-subtitle`.
+4. The server hashes the file (SHA-256), stores the raw blob in S3 under
+   the hash, and inserts a binding row.
+5. The next player render picks up the new track. The track appears as an
+   `MY` chip in the same subtitle chip row as every other origin, under
+   its original filename via the `UserSubtitle` provider, and is wrapped
+   through `torrent-http-proxy`'s `/ext/` → `~vtt/` chain so SRT/ASS/SSA
+   content is converted to VTT on the fly (same path used for
+   OpenSubtitles). ASS/SSA styling, positioning and karaoke tags are
+   dropped in conversion — cues come back as plain text.
+
+## UI: chips in the picker, deletion in the panel
+
+The uploads partial (`templates/partials/action/user_subtitles.html`) emits
+two things into the picker, and both come from the same template because it
+is also the async reload target:
+
+- **The `MY` chips**, rendered into `#subtitle-tracks` through the
+  `#my-subtitles` wrapper (`class="contents"`, i.e. `display:contents`), so
+  they join the flat chip row alongside `EM`/`IN`/`OS`/`AI` tracks instead of
+  living on a screen of their own.
+- **The `+ My Subtitles` disclosure and its panel** — the upload form plus one
+  row per file, each row carrying **its own delete `<form>`** posting to
+  `POST /user-subtitle/delete/:id`.
+
+Selection and deletion are deliberately different elements. A chip is a
+`role="radio"` that only switches the track; a file can only be destroyed
+from its row in the panel, so an accidental tap on a chip cannot delete an
+upload.
+
+Both forms (upload and delete) still carry
+`data-async-target="#my-subtitles"` and `data-async-push-state="false"` — the
+swap target and the routes are unchanged by the redesign. After the swap
+`Player.jsx` re-runs `refresh()` from
+`assets/src/js/lib/player/track-picker.js`, so the chip row, the language
+counts and the expanded language resync; the panel is re-opened from
+`data-upload-open` on `#my-subtitles`, because the wrapper survives the swap
+while the toggle and panel inside it are replaced.
+
+See `docs/subtitle_translate.md` ("Template attributes", "Picker behaviour")
+and `docs/uikit.html` §19 for the full chip contract.
+
+## Storage
+
+- **Blob:** S3, key = SHA-256 hex of the file content. Upload is
+  idempotent — re-uploading the same content is a no-op. Bucket is
+  configured via `AWS_USER_SUBTITLE_BUCKET` (separate from the poster
+  cache bucket).
+- **Binding:** PostgreSQL table `public.user_subtitle`. One row per
+  `(user_id, resource_id, path, hash)`; that composite is the uniqueness
+  constraint. The binding carries the original filename, format, size and
+  timestamps.
+
+Dedup is shared across users: if two users upload the same file, there is
+one S3 object and two binding rows. No separate refcount table — deletion
+serialises on a `pg_advisory_xact_lock(hash)` and removes the S3 object
+only after confirming no remaining rows reference the hash.
+
+## Limits
+
+- `10` subtitles per `(user_id, resource_id, path)`. Exceeded uploads
+  return `error.user_subtitle.limit_reached`.
+- `5 MB` max file size.
+- Formats: `srt`, `vtt`, `ass`, `ssa`. Detection uses the file extension first
+  with a `WEBVTT` magic-bytes sniff fallback.
+
+## Schema
+
+```sql
+CREATE TABLE public.user_subtitle (
+    user_subtitle_id    uuid        NOT NULL DEFAULT uuid_generate_v4(),
+    user_id             uuid        NOT NULL,
+    resource_id         text        NOT NULL,
+    path                text        NOT NULL,
+    hash                text        NOT NULL,
+    original_name       text        NOT NULL,
+    format              text        NOT NULL,
+    size                bigint      NOT NULL,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    updated_at          timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT user_subtitle_pk PRIMARY KEY (user_subtitle_id),
+    CONSTRAINT user_subtitle_unique UNIQUE (user_id, resource_id, path, hash),
+    CONSTRAINT user_subtitle_user_fk FOREIGN KEY (user_id)
+        REFERENCES public."user"(user_id) ON DELETE CASCADE
+);
+
+CREATE INDEX user_subtitle_lookup_idx ON public.user_subtitle (user_id, resource_id, path);
+CREATE INDEX user_subtitle_hash_idx   ON public.user_subtitle (hash);
+```
+
+Migration: `48_create_user_subtitle.up.sql`.
+
+## Endpoints
+
+| Method | URL                                  | Auth       | Notes                                                                                           |
+|--------|--------------------------------------|------------|-------------------------------------------------------------------------------------------------|
+| POST   | `/user-subtitle`                     | required   | multipart: `file`, `resource_id`, `path`, hidden `return_url`. Redirects on success/error.      |
+| POST   | `/user-subtitle/delete/:id`          | required   | Decrements the hash refcount and drops the S3 object when the count falls to zero.              |
+| GET    | `/user-subtitle/file/:hash/*name`    | **public** | Streams the raw blob. Reached from `torrent-http-proxy` via `/ext/` when the player fetches.    |
+
+The file endpoint must be public because `torrent-http-proxy` (and the
+external-proxy service) fetch it anonymously from outside the user's
+browser session; the hash makes the URL unguessable — same trust model as
+OpenSubtitles URLs.
+
+## Concurrency
+
+Upload and Delete serialise on `pg_advisory_xact_lock(fnv64(hash))` inside
+a single `RunInTransaction`. Combined with the always-idempotent
+`PutObject`, this eliminates the classic race: if a Delete decides to
+purge the object right when an Upload for the same content is starting,
+one waits on the lock and the other re-uploads on its next pass, so the
+blob is never missing for a live binding.
+
+## Configuration
+
+- `AWS_USER_SUBTITLE_BUCKET` — required. When empty the service is
+  disabled: handlers skip registration and the picker renders neither `MY`
+  chips nor the `+ My Subtitles` chip and panel.
+- Reuses the shared `AWS_*` credentials + endpoint + region from the
+  common S3 client.
+
+Chart plumbing: `values.aws.buckets.userSubtitle` → helper `_helpers.tpl`
+injects the env var. The production bucket is set in
+`web-ui.yaml.gotmpl`.
+
+## Code pointers
+
+- Migration: `migrations/48_create_user_subtitle.up.sql`
+- Model: `models/user_subtitle.go`
+- Service: `services/user_subtitle/service.go`
+- Handler: `handlers/user_subtitle/handler.go`
+- Player wiring: `jobs/scripts/action.go` (loads `UserSubtitles` into
+  `StreamContent` for the template)
+- Template helper: `handlers/action/helper.go` — `GetSubtitles` includes
+  the `UserSubtitle` provider in the list that produces `<track>` tags
+- UI partial: `templates/partials/action/user_subtitles.html`
+- Client JS (drag-and-drop): `assets/src/js/app/action/stream.js`
+- Session-timeline cue shift: `assets/src/js/lib/player/cue-offset.js`
+  (see below)
+
+## Transcoder sessions and the cue timeline
+
+Side-loaded `<track>`s (user uploads, OpenSubtitles, external) carry cue
+times in **absolute movie time**, but a transcoder session that starts
+mid-movie (resume from watch history, any seek) exposes a media timeline
+that begins at zero — `usePlayerState` displays `seekOffset + rawTime`.
+Without compensation those cues can never become active, which is exactly
+"the subtitle is listed but never shows" (support case, Aug 2026).
+
+Two client-side mechanisms fix this (`cue-offset.js`):
+
+1. `applyCueOffset(track, offset)` — stashes each cue's authored times on
+   first touch and re-computes `startTime/endTime = authored − offset`
+   from them on every call, so repeated seeks never accumulate drift.
+   Wired in `Player.jsx` as an effect on `seekOffset` plus a capturing
+   `load` listener on the `<video>` (covers lazily-loaded tracks and
+   tracks added mid-session from the uploads panel).
+   A cue that ends before the session start is **parked at
+   `PARKED_AT` (−1)**, never at `[0,0]`. Every session starts at media
+   time 0 and Chrome's cue interval test is inclusive at both ends, so a
+   zero-length cue at 0 is active on the first frame and stays drawn until
+   the next cue boundary: after any seek, every line from the start of the
+   film up to the seek point sat on screen at once (reproduced on stage
+   2026-09-17, in production since e3d1e7d). A cue straddling the session
+   start is clipped to begin at 0, which is correct.
+2. `captureTrackState` / `restoreTrackState` around a session seek
+   (`session-seek.js`) — hls.js flips element-backed tracks to
+   `disabled` **and clears their cue lists** on `loadSource()` (all text
+   tracks on the element, `TimelineController._cleanTracks`), so the
+   seeker snapshots mode + cue objects before the reload, re-adds them on
+   `playing`, then re-applies the new offset.
+3. The snapshot only holds cues of tracks that were **on**: a disabled
+   track reports `cues === null`. Every other `<track>` is left loaded and
+   empty, and the browser never refetches a `src` it already loaded, so a
+   track picked after a seek used to show nothing. The **initial**
+   `loadSource()` wipes the same way (`createHls` in `hls-manager.js`), and
+   a saved side-loaded selection is restored *before* the HLS instance
+   exists — its track could be loaded, showing and empty for the whole
+   session with no seek anywhere. Both call sites therefore
+   mark the tracks right before `loadSource()`
+   (`markUnsnapshottedTracksStale`, `subtitle-track-reload.js`), and
+   `applySubtitleSelection` calls `refreshStaleTrack` for the track it
+   switches on: stale, loaded (`readyState` 2), still empty, and no
+   revision swap in flight → the `src` gets a `wt-rf=<n>` parameter and
+   the file is fetched again (the capturing `load` listener applies the
+   current offset). The mark is spent on the first look, so a file that is
+   legitimately empty costs one request, not one per re-assertion. Marked
+   from the elements present right before `loadSource()`, not at snapshot
+   time: a `<track>` added while the seek POST was in flight is wiped too. A
+   track that was **still loading** when it was wiped lost the cues parsed so
+   far and gets only the rest, so it is refetched regardless of its cue count
+   — at once if it has loaded by the time it is picked, otherwise when its
+   `load` lands (a failed load drops that wait). A track still loading is
+   marked even when the snapshot holds some of its cues, and the seeker does
+   not restore the snapshot into a marked track: the loader adds the rest
+   after the wipe, and restoring into a list that a refetch is filling would
+   show the snapshot's cues twice. `reloadSubtitleTrack` compares sources
+   without `wt-rf`, so an AI track refetched this way is not swapped again for
+   the same revision. Not
+   done by snapshotting disabled tracks too: reading their cues means
+   flipping them to `hidden` and back, a `change` event per track for
+   hls.js to react to, and a first download for every track never loaded.
+
+HLS-manifest tracks (MediaProbe, created by hls.js itself) are already
+session-relative and must never be passed to `applyCueOffset`.

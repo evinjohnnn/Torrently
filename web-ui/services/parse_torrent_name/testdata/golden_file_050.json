@@ -1,0 +1,11 @@
+{
+  "input": "The Shaukeens 2014 Hindi (1CD) DvDScr x264 AAC...Hon3y",
+  "want": {
+    "title": "The Shaukeens",
+    "year": 2014,
+    "quality": "DVDScr",
+    "codec": "x264",
+    "audio": "AAC",
+    "extra": "Hindi 1CD Hon3y"
+  }
+}

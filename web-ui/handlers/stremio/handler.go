@@ -1,0 +1,352 @@
+package stremio
+
+import (
+	"context"
+	"net/http"
+	"net/url"
+	"strings"
+
+	"github.com/gin-contrib/cors"
+	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/pkg/errors"
+	uuid "github.com/satori/go.uuid"
+	log "github.com/sirupsen/logrus"
+	"github.com/urfave/cli"
+	cs "github.com/webtor-io/common-services"
+	at "github.com/webtor-io/web-ui/services/access_token"
+	"github.com/webtor-io/web-ui/services/api"
+	"github.com/webtor-io/web-ui/services/auth"
+	"github.com/webtor-io/web-ui/services/claims"
+	sv "github.com/webtor-io/web-ui/services/common"
+	lr "github.com/webtor-io/web-ui/services/link_resolver"
+	co "github.com/webtor-io/web-ui/services/link_resolver/common"
+	"github.com/webtor-io/web-ui/services/metrics"
+	"github.com/webtor-io/web-ui/services/offer"
+	"github.com/webtor-io/web-ui/services/stremio"
+	"github.com/webtor-io/web-ui/services/web"
+)
+
+type Handler struct {
+	at     *at.AccessToken
+	b      *stremio.Builder
+	pg     *cs.PG
+	lr     *lr.LinkResolver
+	secret string
+	// res is lr as the resolve handler sees it — narrowed so the paywall
+	// branch is testable without a database behind it. The stream handler
+	// keeps the concrete type the stream builder takes.
+	res    resolver
+	offers promoSource
+	clips  *paywallClips
+}
+
+// resolver is what /resolve needs from the LinkResolver.
+type resolver interface {
+	ResolveLink(ctx context.Context, userID uuid.UUID, apiClaims *api.Claims, userClaims *claims.Data, hash string, fileIdx int, requiresPayment bool) (*co.LinkResult, error)
+	PickEpisodeFileIdx(ctx context.Context, apiClaims *api.Claims, hash string, season, episode int) (int, error)
+	PickPrimaryFileIdx(ctx context.Context, apiClaims *api.Claims, hash string) (int, error)
+}
+
+func RegisterHandler(c *cli.Context, r *gin.Engine, at *at.AccessToken, b *stremio.Builder, pg *cs.PG, lr *lr.LinkResolver, offers *offer.Service) error {
+	clips, err := loadPaywallClips(paywallDir, c.String(sv.DomainFlag))
+	if err != nil {
+		return err
+	}
+	log.WithField("langs", strings.Join(clips.Langs(), ",")).Info("stremio paywall clips loaded")
+	h := &Handler{
+		at:     at,
+		b:      b,
+		pg:     pg,
+		lr:     lr,
+		res:    lr,
+		secret: c.String(sv.SessionSecretFlag),
+		offers: offers,
+		clips:  clips,
+	}
+
+	gr := r.Group("/stremio")
+	gr.Use(cors.New(cors.Config{
+		AllowOrigins: []string{"*"},
+		AllowMethods: []string{"GET", "HEAD", "POST"},
+	}))
+	gr.GET("/manifest.json", h.manifest)
+	// Public configure endpoint to satisfy stremio-addons directory requirements
+	gr.GET("/configure", h.configure)
+	gra := gr.Group("")
+	gra.Use(auth.HasAuth)
+	gra.POST("/url/generate", h.generateUrl)
+	gra.POST("/url/regenerate", h.regenerateUrl)
+	grapi := gra.Group("")
+	grapi.Use(at.HasScope("stremio:read"))
+	grapi.GET("/catalog/:type/*id", h.catalog)
+	grapi.GET("/stream/:type/*id", h.stream)
+	grapi.GET("/meta/:type/*id", h.meta)
+	// Stremio validates a binge stream's playback URL with a HEAD request
+	// before auto-playing the next episode (see stremio-core player binge
+	// logic). Gin does not auto-register HEAD for a GET route, so without
+	// this the probe 404s, Stremio treats the next episode's stream as dead
+	// and falls back to the source-selection screen instead of binge-playing.
+	grapi.Match([]string{http.MethodGet, http.MethodHead}, "/resolve/*data", h.resolve)
+	return nil
+}
+
+func (s *Handler) generateUrl(c *gin.Context) {
+	_, err := s.at.Generate(c, "stremio", []string{"stremio:read"})
+	if err != nil {
+		_ = c.AbortWithError(http.StatusInternalServerError, errors.Wrap(err, "failed to generate stremio addon url"))
+		return
+	}
+	web.RedirectWithSuccessAndMessage(c, "toast.addonUrlGenerated")
+}
+
+// regenerateUrl rotates the addon token. Invalidates the URL already installed
+// in the user's Stremio — the UI gates it behind an expanded warning.
+func (s *Handler) regenerateUrl(c *gin.Context) {
+	_, err := s.at.Regenerate(c, "stremio", []string{"stremio:read"})
+	if err != nil {
+		_ = c.AbortWithError(http.StatusInternalServerError, errors.Wrap(err, "failed to regenerate stremio addon url"))
+		return
+	}
+	web.RedirectWithSuccessAndMessage(c, "toast.addonUrlRegenerated")
+}
+
+func (s *Handler) manifest(c *gin.Context) {
+	user := auth.GetUserFromContext(c)
+	hasToken := c.Query(sv.AccessTokenParamName) != ""
+	mas, err := s.b.BuildManifestService(user, hasToken)
+	if err != nil {
+		_ = c.AbortWithError(http.StatusInternalServerError, errors.Wrap(err, "failed to build manifest service"))
+		return
+	}
+	resp, err := mas.GetManifest(c.Request.Context())
+	if err != nil {
+		_ = c.AbortWithError(http.StatusInternalServerError, errors.Wrap(err, "failed to get manifest response"))
+		return
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+func (s *Handler) catalog(c *gin.Context) {
+	ct := c.Param("type")
+	user := auth.GetUserFromContext(c)
+	cas, err := s.b.BuildCatalogService(user)
+	if err != nil {
+		_ = c.AbortWithError(http.StatusInternalServerError, errors.Wrap(err, "failed to build catalog service"))
+		return
+	}
+	resp, err := cas.GetCatalog(c.Request.Context(), ct)
+	if err != nil {
+		_ = c.AbortWithError(http.StatusInternalServerError, errors.Wrap(err, "failed to get catalog response"))
+		return
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+func (s *Handler) meta(c *gin.Context) {
+	ct := c.Param("type")
+	id := s.cleanResourceID(c.Param("id"))
+	user := auth.GetUserFromContext(c)
+	mes, err := s.b.BuildMetaService(user)
+	if err != nil {
+		_ = c.AbortWithError(http.StatusInternalServerError, errors.Wrap(err, "failed to build meta service"))
+		return
+	}
+	resp, err := mes.GetMeta(c.Request.Context(), ct, id)
+	if err != nil {
+		_ = c.AbortWithError(http.StatusInternalServerError, errors.Wrap(err, "failed to get meta response"))
+		return
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+func (s *Handler) stream(c *gin.Context) {
+	ct := c.Param("type")
+	id := s.cleanResourceID(c.Param("id"))
+	user := auth.GetUserFromContext(c)
+	apiClaims := api.GetClaimsFromContext(c)
+	cla := claims.GetFromContext(c)
+	sts, err := s.b.BuildStreamsService(c.Request.Context(), user, s.lr, apiClaims, cla, c.Query(sv.AccessTokenParamName))
+	if err != nil {
+		_ = c.AbortWithError(http.StatusInternalServerError, errors.Wrap(err, "failed to build streams service"))
+		return
+	}
+	resp, err := sts.GetStreams(c.Request.Context(), ct, id)
+	if err != nil {
+		_ = c.AbortWithError(http.StatusInternalServerError, errors.Wrap(err, "failed to get streams response"))
+		return
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+func (s *Handler) cleanResourceID(rawID string) string {
+	return strings.TrimPrefix(strings.TrimSuffix(rawID, ".json"), "/")
+}
+
+func (s *Handler) configure(c *gin.Context) {
+	u := auth.GetUserFromContext(c)
+	if !u.HasAuth() {
+		v := url.Values{
+			"from":       []string{"stremio-configure"},
+			"return-url": []string{"/stremio/configure"},
+		}
+		c.Redirect(http.StatusFound, "/login?"+v.Encode())
+		return
+	}
+	// Redirect authenticated users straight to the Stremio section of their
+	// profile, where the personalized addon URL and install link are shown.
+	// The fragment rides in the Location header on purpose: it is the only
+	// way an anchor survives a login round-trip, since browsers never send
+	// fragments to the server and return-url can therefore not carry one.
+	// Links that want to land on #stremio for possibly-anonymous visitors
+	// should point here, not at /profile#stremio.
+	c.Redirect(http.StatusFound, "/profile#stremio")
+}
+
+// episodeClaims reads the season/episode a playback token was minted for.
+// Only tokens for sources that named no file carry them — see
+// StreamItem.FileIdxUnknown.
+func episodeClaims(claims jwt.MapClaims) (int, int, bool) {
+	sf, sok := claims["s"].(float64)
+	ef, eok := claims["e"].(float64)
+	if !sok || !eok {
+		return 0, 0, false
+	}
+	return int(sf), int(ef), true
+}
+
+func (s *Handler) resolve(c *gin.Context) {
+	// Step 1: Extract JWT token from URL path
+	data := strings.TrimPrefix(c.Param("data"), "/")
+	if data == "" {
+		c.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	// Step 2: Parse and validate JWT token
+	token, err := jwt.Parse(data, func(token *jwt.Token) (interface{}, error) {
+		// Validate signing method
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, errors.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return []byte(s.secret), nil
+	})
+
+	if err != nil {
+		log.WithError(err).Warn("failed to parse JWT token")
+		c.AbortWithStatus(http.StatusUnauthorized)
+		return
+	}
+
+	// Step 3: Extract claims
+	jwtClaims, ok := token.Claims.(jwt.MapClaims)
+	if !ok || !token.Valid {
+		log.Warn("invalid JWT token claims")
+		c.AbortWithStatus(http.StatusUnauthorized)
+		return
+	}
+
+	// Step 4: Extract claims. JWT shape: {hash, idx, exp}. Path resolution
+	// (when needed by user backends) and resource registration are handled
+	// inside LinkResolver / Webtor backend.
+	hash, ok := jwtClaims["hash"].(string)
+	if !ok || hash == "" {
+		log.Warn("missing or invalid hash in JWT claims")
+		c.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+	user := auth.GetUserFromContext(c)
+	apiClaims := api.GetClaimsFromContext(c)
+	userClaims := claims.GetFromContext(c)
+
+	// An absent idx claim means the stream's source named a torrent but not
+	// a file in it (Torznab indexers — see StreamItem.FileIdxUnknown). The
+	// file is picked here, at click time, rather than for all 30 results of
+	// a search that the user will never open.
+	var fileIdx int
+	if raw, ok := jwtClaims["idx"]; ok {
+		f, _ := raw.(float64)
+		fileIdx = int(f)
+	} else if season, episode, ok := episodeClaims(jwtClaims); ok {
+		// The token names the episode the user picked, so the file is
+		// chosen by name inside the torrent — the alternative, "the
+		// biggest video", plays episode one of every season pack.
+		fileIdx, err = s.res.PickEpisodeFileIdx(c.Request.Context(), apiClaims, hash, season, episode)
+		if err != nil {
+			log.WithError(err).
+				WithField("hash", hash).
+				Warn("failed to pick an episode file to play")
+			c.AbortWithStatus(http.StatusNotFound)
+			return
+		}
+	} else {
+		fileIdx, err = s.res.PickPrimaryFileIdx(c.Request.Context(), apiClaims, hash)
+		if err != nil {
+			log.WithError(err).
+				WithField("hash", hash).
+				Warn("failed to pick a file to play")
+			c.AbortWithStatus(http.StatusNotFound)
+			return
+		}
+	}
+
+	// Step 5: Resolve link using LinkResolver
+	linkResult, err := s.res.ResolveLink(c.Request.Context(), user.ID, apiClaims, userClaims, hash, fileIdx, true)
+	if errors.Is(err, lr.ErrPlanRequired) {
+		// Step 6: Webtor would have to serve this, and the tier does not
+		// include that.
+		s.paywall(c, user, hash, fileIdx)
+		return
+	}
+	if err != nil {
+		log.WithError(err).
+			WithField("hash", hash).
+			WithField("file_idx", fileIdx).
+			Error("failed to resolve link")
+		c.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+
+	// Step 7: Check if URL was generated
+	if linkResult == nil || linkResult.URL == "" {
+		log.WithField("hash", hash).
+			WithField("file_idx", fileIdx).
+			Warn("no URL generated for resolve")
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+
+	// Step 8: Redirect to destination URL
+	c.Redirect(http.StatusFound, linkResult.URL)
+}
+
+// paywall answers a free viewer's click on a stream only Webtor can serve.
+// With something on sale it redirects to the paywall clip, which the player
+// plays like any other stream: Stremio shows the video instead of an error.
+// HEAD — Stremio's probe before auto-playing the next episode — gets the
+// same redirect, so binge lands on the clip too rather than on the
+// source-selection screen. Without an offer or a clip it is the 404 the
+// addon has always answered.
+func (s *Handler) paywall(c *gin.Context, user *auth.User, hash string, fileIdx int) {
+	var o *offer.Offer
+	if s.offers != nil {
+		o = s.offers.Promo()
+	}
+	target, lang, ok := s.clips.pick(o, web.GetUserSettings(c).GetLang())
+	if !ok {
+		log.WithField("hash", hash).
+			WithField("file_idx", fileIdx).
+			Warn("no URL generated for resolve")
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+	log.WithFields(log.Fields{
+		"hash":      hash,
+		"file_idx":  fileIdx,
+		"lang":      lang,
+		"user_hash": auth.LogHash(user.ID),
+		"method":    c.Request.Method,
+	}).Info("stremio paywall video")
+	metrics.StremioPaywallVideo(lang, c.Request.Method)
+	c.Redirect(http.StatusFound, target)
+}

@@ -1,0 +1,126 @@
+/* Shared pieces: job progress, dialogs, posters. */
+
+.job-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.job-step {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 40px;
+  padding: 6px 8px;
+  font-size: 15px;
+}
+.job-mark {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  color: var(--olive-ink);
+}
+.job-step.done .job-mark,
+.job-step.skip .job-mark {
+  background: var(--olive-wash);
+}
+.job-step.done .job-text,
+.job-step.skip .job-text {
+  color: var(--ink-2);
+}
+.job-step.error .job-mark {
+  background: var(--brick-wash);
+  color: var(--brick);
+}
+.job-step.warn .job-mark {
+  background: var(--honey-wash);
+  color: var(--honey);
+}
+.job-text {
+  flex: 1;
+  min-width: 0;
+}
+.job-status {
+  color: var(--ink-3);
+  font-size: 13px;
+}
+.job-note {
+  padding: 4px 8px 4px 44px;
+  font-size: 14px;
+  color: var(--ink-2);
+}
+
+/* ───────── Dialog ───────── */
+
+.dialog {
+  width: min(560px, calc(100vw - 32px));
+  max-height: calc(100vh - 64px);
+  padding: 0;
+  border-radius: var(--r-xl);
+  background: rgba(252, 250, 244, 0.96);
+  color: var(--ink);
+}
+.dialog::backdrop {
+  background: rgba(28, 31, 20, 0.35);
+  backdrop-filter: blur(4px);
+}
+.dialog-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 20px 16px 8px 24px;
+}
+.dialog-head h2 {
+  font-size: var(--step-1);
+}
+.dialog-sub {
+  margin-top: 4px;
+  font-size: 14px;
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
+}
+.dialog-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 8px 24px 24px;
+}
+.dialog-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.dialog-actions .text-link {
+  margin-right: auto;
+}
+
+/* ───────── Posters ───────── */
+
+.poster-fallback {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 12px;
+  text-align: center;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink-2);
+}
+.adult-mark {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  padding: 2px 8px;
+  border-radius: var(--pill);
+  border: 1.5px solid rgba(255, 255, 255, 0.85);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  backdrop-filter: blur(6px);
+}

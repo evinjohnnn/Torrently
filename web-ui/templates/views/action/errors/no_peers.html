@@ -1,0 +1,96 @@
+{{ define "main" }}
+{{ $isFree := eq .Data.TierName "free" }}
+{{/* Three different situations used to share one screen. Reason (see
+     NoPeersError) picks the words: a dead swarm asks for Vault/another
+     torrent; a slow swarm says the pace is the swarm's, not the plan's; a
+     hard timeout says nothing is known yet. All three can be retried. */}}
+{{ $slow := eq .Data.Reason "slow" }}
+{{ $timeout := eq .Data.Reason "timeout" }}
+{{/* A dead swarm is not a speed problem, so a faster plan is not the pitch —
+     Vault is: it keeps the torrent and fetches it when a seeder returns. Sold
+     only when the promo plan includes Vault; no catalog, no pitch. */}}
+{{ $offer := promoOffer }}
+{{ $pitch := and $isFree (not $slow) (not $timeout) $offer }}
+{{ if $pitch }}{{ $pitch = $offer.HasVault }}{{ end }}
+{{ $body := or $slow $timeout $pitch (not $isFree) }}
+<div class="mx-5 mt-1 p-4 rounded-xl bg-base-300/20 border border-w-line/40">
+    <div class="flex items-start gap-3 flex-wrap">
+        <div class="flex items-start gap-3 flex-1 min-w-[200px]">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" class="size-5 shrink-0 mt-0.5 text-w-pinkL">
+                <circle cx="12" cy="12" r="10"></circle>
+                <polyline points="12 6 12 12 16 14"></polyline>
+            </svg>
+            <h3 class="font-semibold text-base text-base-content leading-snug">
+                {{- if $slow }}{{ t $.Lang "action.noPeers.slowTitle" }}
+                {{- else if $timeout }}{{ t $.Lang "action.noPeers.timeoutTitle" }}
+                {{- else }}{{ t $.Lang "action.noPeers.title" }}{{ end -}}
+            </h3>
+        </div>
+        {{- if $pitch }}
+        <div class="flex flex-col items-center gap-1 shrink-0">
+            <a class="btn btn-sm btn-soft" data-umami-event="donate-no-peers" data-umami-event-tier="{{ .Data.TierName }}" data-umami-event-reason="{{ .Data.Reason }}" data-umami-event-target="{{ if $offer.TrialDays }}trial{{ else if $offer.URL }}checkout{{ else }}donate{{ end }}" href="{{ or (trialURL $.Lang "no-peers" $offer) $offer.URL (langPath $.Lang "/donate") }}" target="_blank" rel="noopener">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="size-4">
+                    <path d="M21 8v13H3V8M1 3h22v5H1zM10 12h4"/>
+                </svg>
+                {{ t $.Lang "offer.saveToVault" }}
+            </a>
+            {{- if $offer.TrialDays }}
+            <span class="text-[11px] text-w-sub leading-tight text-center">{{ tn $.Lang "offer.trialNote" $offer.TrialDays }}</span>
+            {{- end }}
+        </div>
+        {{- end }}
+    </div>
+
+    {{- if $body }}
+    <p class="text-sm text-w-sub mt-3 leading-relaxed">
+        {{- if $slow }}{{ t $.Lang "action.noPeers.slowBody" }}
+        {{- else if $timeout }}{{ t $.Lang "action.noPeers.timeoutBody" }}
+        {{- else if $pitch }}{{ t $.Lang "action.noPeers.vaultPitch" }}
+        {{- else }}{{ t $.Lang "action.noPeers.vaultUse" }}{{ end -}}
+    </p>
+    {{- end }}
+
+    {{- if or (gt .Data.Peers 0) (gt .Data.BytesRaw 0) }}
+    <p class="text-xs text-w-muted mt-3 tabular-nums">{{ tn $.Lang "action.noPeers.stats" .Data.Peers "Bytes" .Data.Bytes "Peers" .Data.Peers "Sec" .Data.ElapsedSec }}</p>
+    {{- else if not $timeout }}
+    {{- /* "or try another..." needs something to be an alternative TO: with no
+         body sentence above (a free viewer and nothing to sell) it stands on
+         its own. */}}
+    <p class="text-xs text-w-muted mt-3">{{ if $body }}{{ t $.Lang "action.noPeers.altSearch" }}{{ else }}{{ t $.Lang "action.noPeers.altSearchAlone" }}{{ end }}</p>
+    {{- end }}
+</div>
+
+<div class="pt-3 px-5 flex flex-wrap gap-2 justify-end items-center">
+    <button type="button" class="close closeable-close">{{ t $.Lang "action.noPeers.gotIt" }}</button>
+    {{- if .Data.Endpoint }}
+    {{/* Same resubmit shape as slow_download.html, without force-slow: a
+         retry is a fresh warm-up, and the seeder pod is usually still warm. */}}
+    <form action="{{ langPath $.Lang .Data.Endpoint }}" method="post" enctype="multipart/form-data"
+          data-async-target="#log-{{ .Data.LogTargetID }}" data-async-push-state="false">
+        <input type="hidden" name="resource-id" value="{{ .Data.ResourceID }}" />
+        <input type="hidden" name="item-id" value="{{ .Data.ItemID }}" />
+        {{- if .Data.ArchiveFormat }}
+        <input type="hidden" name="archive-format" value="{{ .Data.ArchiveFormat }}" />
+        {{- end }}
+        {{- range .Data.SelectedPaths }}
+        <input type="hidden" name="paths" value="{{ . }}" />
+        {{- end }}
+        <button type="submit" class="btn btn-sm btn-soft-cyan" data-umami-event="no-peers-retry" data-umami-event-reason="{{ .Data.Reason }}" data-umami-event-tier="{{ .Data.TierName }}">{{ t $.Lang "action.noPeers.retry" }}</button>
+    </form>
+    {{- end }}
+</div>
+<script>
+(function () {
+    if (!window.umami) return;
+    window.umami.track('no-peers-shown', {
+        tier: '{{ .Data.TierName }}',
+        reason: '{{ .Data.Reason }}',
+        peers: {{ .Data.Peers }},
+        seeders: {{ .Data.Seeders }},
+        leechers: {{ .Data.Leechers }},
+        bytes: {{ .Data.BytesRaw }},
+        elapsed_s: {{ .Data.ElapsedSec }}
+    });
+})();
+</script>
+{{ end }}

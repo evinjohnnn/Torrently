@@ -1,0 +1,10 @@
+{
+  "input": "The Shaukeens (2014) 1CD DvDScr Rip x264 [DDR]",
+  "want": {
+    "title": "The Shaukeens",
+    "year": 2014,
+    "quality": "DVDScr",
+    "codec": "x264",
+    "extra": "1CD Rip DDR"
+  }
+}

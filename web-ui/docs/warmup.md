@@ -1,0 +1,390 @@
+# Torrent warmup & seeder fast-path
+
+Warmup is the pre-flight step that runs between the user clicking *Stream* /
+*Download* and the actual playback / file delivery. Two motivations:
+
+1. **Prioritise head + tail pieces** on the seeder pod so the transcoder /
+   HTTP server can answer the first segment / range request without stalling.
+2. **Measure download throughput** so we can compare against the required
+   video bitrate (BT-slow modal) before the player starts.
+
+Implemented in `jobs/scripts/action.go` (`warmUp`, `piecesCoverRange`).
+Bandwidth-check is `checkCachedRateLimit` / `buildSlowDownloadData` in the
+same file.
+
+The two branches hold their speed against different rates (2026-09-26):
+
+- **The swarm** (BT-slow: `needsFullMeasure`, `swarmTooSlow`, `buildSlowDownloadData`)
+  against the **file's own rate** (`getVideoBitrate`: the container's, every dub and
+  commentary track included). The warm-up measures file bytes the seeder fetched from its
+  peers, and to play the file the seeder has to fetch all of it: the transcoder's ffmpeg
+  reads every interleaved Matroska block whatever it maps, and nginx-vod's ranges land
+  inside whole pieces. Held against the played stream, a 4.8 Mbps swarm would start a
+  3.5 Mbps H.264 with two 1.5 Mbps DTS dubs — a 6.6 Mbps file, 3.6 played — with no full
+  measure, and the viewer would stall on a swarm that cannot keep up with the file; under
+  grace (free viewers) the swarm is the only gate left. The status has no "file needs" line for a swarm stall, so there is nothing for this
+  number to disagree with.
+- **The plan's cap** (`checkCachedRateLimit`, the cached branch and the late `hit` one)
+  against **what the player pulls** (`capGateBitrate` → `playedBitrate`,
+  `jobs/scripts/status_bitrate.go`: the video and one audio track, as the transcoder or
+  nginx-vod serve them — the track the player starts on, its audio as the start's declaration
+  has it made, docs/player.md), because that is what thp caps — the same number the transfer
+  status's "…and this file needs N" and its over-the-cap mark are made of, so the cap
+  modal and the status say one thing. The file's rate is the fallback only where the
+  played stream is not known (re-encoded video, stale tags, no per-track numbers). Before,
+  the cap was held against the file's rate too: the two-dub file above "needed 6.6" and
+  got the cap modal at a 5 Mbps cap for a transcoded stream of 3.6.
+
+`TestGateBitrate_WhichRateEachBranchReads` holds this wiring (streamContent itself has no
+test harness). The modal's title says which gate fired: the plan's cap (`IsRateLimited`,
+`action.slow.title.rateLimited`, "Not enough speed for smooth playback") or the swarm
+(`action.slow.title.bandwidth`).
+
+Units: every Mbps in the modal is `statusview.mbit`, 2^20 bits — the megabit thp's
+limiter reads a rate claim in (`"5M"` is 5,242,880 b/s, 655,360 B/s), and the one the
+transfer status prints. `buildSlowDownloadData` converts with `statusview.BytesToMbps` /
+`BitsToMbps`, the cap comes from `statusview.RateMbps`, and the two numbers are printed by
+the status's formatter (`SlowDownloadData.MeasuredLabel`/`RequiredLabel`: `Quantize` +
+`FormatNumber`, the language's separator). The cap modal fires only where the status marks
+the stream over the cap (`statusview.OverCap`, as the labels say them), so it never reads
+"5 → 5". Until 2026-09-29 the modal counted 10^6 bits (`parseRateLimit`): the owner's 1080p
+file read "5.0 → 9.1" in the modal and "5 → 8,7" in the status, and at a 5M cap the modal
+fired from 5,000,001 b/s, 0.954 of what the limiter delivers ("5.0 → 5.0" to "5.0 → 5.3");
+it now starts at 5,295,309 b/s, where the label turns 5,1. The Umami fields
+`measured_mbps`/`required_mbps` of `slow-download-shown` are in the same unit since then:
+4.6% below the old numbers for the same stream. `TestCapModal_SaysWhatTheStatusSays` and
+`TestCheckCachedRateLimit_TheLimitersMegabit` hold this. The speedtest page is the one place
+that stays 10^6: it measures the viewer's line against Ookla, not a cap.
+
+The new start is a behaviour change, not only a unit fix. The streams between those two
+numbers are in `statusview.FitsMargin`'s band — at the cap as the labels say them, or under
+it by less than 1.2 — which the status calls unknown: no upfront stream box, the box once
+the player really stalls. They are not carried in full: the player pulls more than the
+`playedBitrate` estimate the gate reads (1.16 times it on the file `FitsMargin` records —
+MPEG-TS overhead, a heavier-than-average scene, the transcoder's AAC at ~236 kbit/s against
+139.6 — and that file stalled four times in 180 s at 0.869 of the cap). At 1.16 every
+stream from 0.862 of the cap up pulls over it; with the structural overhead alone (TS
+packets ~2.5%, AAC in TS +96 kbit/s) the slice the old modal covered, 0.954–1.01 of the
+cap, pulls about 0.995–1.05 of it. So a stream in the band can stall with no modal. The
+modal stays out because its claim, "the file needs more than you have", would read
+"5 → 4,9" there. The old gate did not cover the band either: it warned its top slice by the
+unit error and nothing below 0.954 (the 0.869 file got no modal then too). An upfront
+warning for the whole band, with wording that does not say the file needs more than the
+cap, is an open choice for the owner; `TestCheckCachedRateLimit_TheLimitersMegabit` pins
+the current one (no modal where the status is not over the cap, swept from cap/1.2 up).
+
+## Three paths
+
+| Path | Trigger | Behaviour |
+|---|---|---|
+| **Long-term cache** | `se.Meta.Cache=true` (rest-api S3 promotion) | Skip `warmUp` entirely. Bandwidth check runs cap-modal branch (plan-cap vs bitrate). |
+| **Seeder fast-path** | `se.Meta.Cache=false` AND (stats first event shows head+tail pieces complete OR seeder vault/cache short-circuits `?warmup` with an empty SSE) | Silent skip — no `j.Skip` line, the job log goes straight to probe/render. Bandwidth check joins the cap-modal branch (same rationale: bottleneck has moved to plan-cap, not peers). |
+| **Full warmup** | Everything else | Open `?warmup` SSE for the head range (`bandwidthTestSize` — 10MB since 2026-09-19, see below — for stream, 1MB for download) and tail range (500KB on stream only) in parallel. Seeder bumps `PiecePriorityHigh` on covered pieces and streams a cumulative downloaded counter; web-ui derives throughput from that. Bandwidth check runs BT-slow branch against the measured speed. |
+
+## Fast-path probe — inlined in `warmUp`
+
+Common share-flow case: the sharer's torrent-web-seeder pod just served them,
+the pieces are still resident, but the rest-api `Cache` flag is `false`
+(promotion to S3 hasn't happened yet). The viewer arrives moments later and
+otherwise pays the full warmup cost for nothing.
+
+The probe lives **inside `warmUp` itself**, not as a separate function. It
+reuses the **stats SSE** subscription that `warmUp` was already opening for
+the UI peer-counter:
+
+1. `warmUp` opens `api.Stats(warmupCtx, statsURL)` once.
+2. It reads the **first** `statupdate` event synchronously, with a
+   `SeederProbeTimeoutSec` deadline (default 3s).
+3. That first event always carries the full pieces array (see
+   `torrent-web-seeder/server/services/stat.go:218-226` — the diff machinery
+   only kicks in from the second event onward). For each piece covering
+   `[0..head) ∪ [size-tail..size)` we check `Complete=true`. All present
+   → return early with `cached=true`; no `j.InProgress` line is ever
+   emitted. Anything missing → fall through to the full warmup; the consumed
+   first event is also surfaced to the UI so the peer-counter starts
+   immediately instead of waiting for event #2.
+4. If the probe deadline expires before any event arrives, the full warmup
+   runs normally and the same Stats channel is handed off to the UI goroutine.
+
+This single-subscription design is **load-bearing**: an earlier version that
+opened a separate `Stats()` call from a standalone `seederHasContent` helper
+doubled the per-session SSE subscriber rate. Each `Stats()` call allocates a
+1MB `bufio.Scanner` buffer (needed for high-piece-count torrent manifests),
+and `Stats.func1` rose to **~24 % of the heap** under prod traffic, pushing
+the 2Gi-limited pods into OOMKilled cycles within hours of deploy. Folding
+the probe into `warmUp` cuts the per-session Stats opens back to one. Do not
+revert to a separate probe-side `Stats()` call without solving the memory
+amplification first.
+
+Piece size is approximated as `ceil(fileSize / len(Pieces))` because the
+seeder proto only carries `position/complete/priority` (no per-piece byte
+count). Rounding up means we sometimes require one extra piece at the edge —
+fine, because we only short-circuit when *every* covering piece is complete,
+so the worst case is a false negative that just falls through to full warmup.
+
+## `?warmup` SSE — bandwidth-free byte priming
+
+Before sha-3fa59da (torrent-web-seeder) the "full warmup" path issued two
+`Range` GETs (head + tail) over the proxy chain and discarded the body —
+purely to make anacrolix pull those bytes from peers. That wasted bandwidth
+end-to-end (peers → seeder → THP → web-ui, all to feed `io.Discard`) and
+told anacrolix about the head range only after it was already most of the
+way downloaded.
+
+The seeder now exposes a `?warmup` SSE endpoint on the same URL path as
+`?stats`. It parses the `Range` header, calls `Piece.SetPriority(High)` on
+every piece overlapping the range, and emits `data: <downloaded>\n\n` once
+per second where `downloaded` is the count of bytes-within-range that
+anacrolix has already verified. Stream close = warmup complete. The bytes
+themselves are never transferred. `web-ui`:
+
+- Derives the warmup URL by swapping `stats=true` → `warmup=true` on the
+  rest-api-signed stats URL (same path, same auth tokens, same pinned
+  non-premium domain — see `api.Warmup` in `services/api/api.go`).
+- Opens head and tail SSE streams in parallel so both priority bumps land
+  up front and anacrolix can dispatch peer requests for both ranges
+  concurrently. The tail stream is best-effort; a failure there just logs
+  and continues. Head failure surfaces as `failed to warmup`.
+- Computes `downloadSpeed` from the combined head+tail counter: latches a
+  `(timestamp, bytes)` measurement window once total downloaded crosses
+  `skipBytes` (slow-start skip, same threshold the old `speedReader` used),
+  then divides `(final - measureStartBytes) / elapsed` at SSE close
+  (`speedLatch`).
+
+### `have:` and `span:` (2026-10)
+
+The seeder's frame is `have: H\nspan: S\ndata: D\n\n` since
+torrent-web-seeder's branch feat/warmup-have-span. `data` is unchanged: the verified
+bytes inside the range, and the stream still closes when it covers the range,
+so "warm-up done" still means the pieces passed the hash check. `span` is the
+length of the pieces covering the range (a piece shared by two files of a
+directory counted once), `have` what has arrived of them chunk by chunk —
+unverified chunks and the boundary pieces' bytes outside the range included;
+it can drop (a failed hash, an eviction). `api.Warmup` sends
+`WarmupEvent{Verified, Have, Span}`; a seeder before the two lines gives -1
+for both, and everything below falls back to `data`.
+
+What reads `have` (`warmUp`, once every range opened has sent it):
+
+- the status line's percent: have of span (below);
+- the no-peers card's "N received" (`NoPeersError.Bytes`), so a "70%" is not
+  followed by "0 B received". The `bytes` of the `no-peers-shown` Umami
+  event and of the "no peers / warmup deadline" log line are have from this
+  release on, not comparable with the verified bytes before it;
+- the `warmup measured` log line (below).
+
+What does not, on purpose: the dead and slow watchdogs, the hard-timeout
+threshold, the empty-SSE cache detection and the speed the BT-slow gate
+reads — every verdict stays on `data`. Moving the slow watchdog to `have` is
+an open question, not a fix: on big pieces it would turn part of today's
+120 s cards into the same card at the hard deadline (an estimate from the
+design, not measured).
+
+**`warmup measured`** (Info, one per warm-up that opened its streams,
+whatever the verdict): `phase` (`quick`, `full`, `download`), `bitrate` and
+`lower_bound` on the full measure, `job`, `outcome` (`done`, `cut` — the
+hard deadline or the caller gone —, `dead`, `slow`, `timeout`), `target`,
+`span`, `data`, `have`, `data0`/`have0` (where each speed window opened, -1
+if it did not), `speed_verified` (what the gate read), `speed_have` (the same
+window on `have`), `hash_wait` (from the moment every covering piece had
+arrived to the close: the hash checks' queue; absent when it never got
+there). Speeds are bytes a second, `bitrate` bits. It exists to decide
+whether the gate should read `have`: if full measures where the gate fired on
+`speed_verified` but `speed_have` clears the bitrate (each against
+`lower_bound`, the gate takes the larger) come to about ten a day over 2–3
+days, the gate moves to `have` (phase 2b); until then it reads what it always
+read. `TestWarmUp_HaveDrivesTheLineNotTheGate`,
+`TestWarmUp_VerdictsStayOnVerified`.
+
+**Throughput semantics shifted slightly.** The old path measured the
+end-to-end byte rate (peers → seeder → THP → web-ui). The new SSE counter
+measures peer → seeder throughput only. For the BT-slow gate this is
+strictly more correct — that gate exists to catch "the swarm can't feed
+this bitrate", and seeder-side throughput is the closest signal. In
+practice the two are equivalent today because the warmup `?download=true`
+URL was unmoderated (no THP rate-limit on the warmup path).
+
+**Vault/cache short-circuit.** The seeder responds with `200 OK` and an
+empty SSE body when `availableWithoutTorrent(...)` is true (file fully
+served from local file-cache or vault), then closes. `web-ui` detects this
+as "head SSE closed with zero `data:` events" and treats the result as
+`cached=true`, routing the bandwidth check through the cap-modal branch —
+same outcome as a stats-probe hit, just for the broader vault/cache case
+the piece-array probe can't see.
+
+**Why not drop the stats-probe now that `?warmup` reports completion?**
+The probe completes in one round-trip on a single, already-open SSE; the
+`?warmup` path needs two new TCP sessions plus their HTTP/2 stream
+windups before it can report the same "all pieces present" verdict. Keep
+both: probe first (cheapest hit), `?warmup` for the broader case.
+
+## Why the fast-path goes through the cap-modal branch
+
+When `warmUp` returns `cached=true`, we have **no measured downloadSpeed**, so
+the BT-slow gate (`downloadSpeed*8 < bitrate`) can't fire. That's fine — once
+the pod has the bytes, the user's effective throughput is no longer
+torrent-peer-limited, it's whatever plan-cap THP enforces (or the user's own
+connection). That's *exactly* the existing `Cache=true` model: route to
+`checkCachedRateLimit` which compares plan-cap vs bitrate. The `effectiveCache`
+local in `streamContent` makes this collapse cleanly:
+
+```go
+effectiveCache := se.Meta.Cache
+if !effectiveCache {
+    if s.forceSlow {
+        j.Skip(...)
+    } else {
+        var hit bool
+        downloadSpeed, hit, err = s.warmUp(...)
+        if err != nil { return }
+        if hit { effectiveCache = true }
+    }
+}
+// ...later:
+} else if effectiveCache && !graceMode {
+    // cap-modal
+} else if !effectiveCache && downloadSpeed > 0 {
+    // BT-slow
+}
+```
+
+## What the user sees while waiting
+
+The job status line is `formatWarmupLine` (`jobs/scripts/action.go`) and it
+is deliberately minimal, the same shape as buffering's "37%": while nothing
+has arrived, the seconds left before the no-peers verdict
+(`job.warmupCountdown`, "43 s"), so a silent swarm shows a moving countdown
+rather than a frozen spinner; once bytes flow, the percent received: have of
+span from a seeder that sends them (a range inside one 16 MiB piece used to
+count down to "no peers" while its chunks arrived), else the verified bytes
+of the warm-up range; never over 99% (the next step says it is done: have
+reaches span while the hash checks still run, and "100%" stood that long). Seeders, leechers and throughput are not repeated in the
+line — the resource page's transfer chain and piece bar carry them (docs/transfer_status.md), and
+the no-peers card gets the counts when they matter. An earlier version spelt
+out "6 seeders · 0 leechers · waiting for data, 43 s left" and wrapped onto
+three lines on phones. The line is rewritten on every stats event and on
+every 1 s watchdog tick; the seeder's own stats cadence is the other half of
+the latency (`torrent-web-seeder` StatStream ticker and Stat cache TTL, both
+3 s before 2026-09; 1 s since).
+
+That cadence is for the browser, not for Loki: `services/job` logs
+`StatusUpdate` items at Debug (every other job item stays Info) and drops a
+redraw whose tag and text equal the previous one, so a static line costs no
+Redis publish, log line or observer push per tick. Before that (2026-09-02,
+`44382e9`) the same lines were Info and made web-ui's log volume grow fivefold
+at the same number of jobs.
+
+## Three no-peers reasons
+
+`NoPeersError` carries `Reason` and the counters at decision time:
+
+| Reason | Trigger | Modal |
+|---|---|---|
+| `dead` | `WARMUP_NO_PEERS_TIMEOUT_SEC` with 0 bytes and 0 peers (stats seen) | "no active seeders" + Vault / another torrent |
+| `slow` | `WARMUP_SLOW_PEERS_TIMEOUT_SEC` with &lt; 1 MiB | "peers are there, but crawling" — the swarm sets the pace, not the plan |
+| `timeout` | hard `WARMUP_TIMEOUT_MIN` before the measurement window, or a bare context deadline | "still not enough data" |
+
+All three render `action/errors/no_peers.html` with a "Try again" resubmit
+(same shape as slow_download's continue form, without `force-slow`) and report
+`no-peers-shown` with `reason`, `peers`, `seeders`, `leechers`, `bytes`,
+`elapsed_s` — the props that let the 35K/month impressions be split into
+classes before deciding what else to change. Review each variant with
+`#action=stream&debug=no_peers|no_peers_slow|no_peers_timeout`, and the status
+line with `debug=swarm_demo` (see CLAUDE.md, Debugging).
+
+## Tuning
+
+| Env / flag | Default | Notes |
+|---|---|---|
+| `WARMUP_TIMEOUT_MIN` / `--warmup-timeout-min` | 3 | Hard ceiling on full warmup. |
+| `WARMUP_NO_PEERS_TIMEOUT_SEC` / `--warmup-no-peers-timeout-sec` | 60 | Surface `no_peers` early when zero bytes & zero peers. Gated on stats-ever-seen so a cold-start SSE doesn't mis-fire. |
+| `WARMUP_SLOW_PEERS_TIMEOUT_SEC` / `--warmup-slow-peers-timeout-sec` | 120 | Surface `no_peers` when bytes < 1MB after this window. |
+| `WARMUP_SEEDER_PROBE_TIMEOUT_SEC` / `--warmup-seeder-probe-timeout-sec` | 3 | Fast-path probe budget. 0 disables the probe entirely (kill-switch). False negatives are safe — caller falls through to full warmup. |
+
+## Edge cases
+
+- **Probe timeout = 0** — disables the fast-path. Restores pre-2026-05-25 behaviour.
+- **404 on stats URL** — `api.Stats` wraps as `errors.New("cached")`. The
+  probe treats it as a cache hit; in practice this shouldn't fire because
+  `se.Meta.Cache=true` short-circuits the branch before we get there.
+- **Pieces complete but pod evicts between probe and stream-start** — race
+  is possible but unlikely (no aggressive eviction during active sessions);
+  the player would just see slow first byte and recover.
+- **`forceSlow=true`** — skip the probe; the user already accepted slow
+  playback, no need to optimise.
+- **Very small files** — head+tail can overlap; `piecesCoverRange` clamps the
+  tail start at `headPieces` so overlapping ranges still validate correctly.
+- **`?warmup` empty SSE response** — seeder vault/local-cache hit; web-ui
+  treats this identically to a probe hit (`cached=true`, cap-modal branch).
+- **`?warmup` tail failure** — best-effort; logged and ignored. The head
+  range still drives the throughput measurement and the watchdog.
+- **`?warmup` head failure (404 / 500 / network)** — logged and downgraded
+  to "no warmup performed". The transcoder/HTTP path pulls the head cold;
+  the watchdog still surfaces `no_peers` if the swarm is actually dead.
+  Unlike `Stats`, the seeder's `?warmup` handler never uses 404 as a
+  cache signal — 404 means `findFile` couldn't resolve the path on this
+  pod, not "content is cached". `api.Warmup` therefore treats all non-200
+  responses as a single transient error.
+- **A passthrough session's master** (HEVC passthrough, `jobs/scripts/hls.go`
+  `bufferSessionHLS`) exists only once the transcoder has written the
+  session's first init segment; content-transcoder waits for it up to 5 min.
+  web-ui reads it with `http.DefaultClient` (no timeout of its own) inside the
+  buffering deadline, `WARMUP_TIMEOUT_MIN` (3 in production), like every other
+  step of the session: a first GOP slower than that ends the way a buffer
+  timeout always has, as the no-peers card. Not changed; how often it happens
+  on passthrough is not measured.
+
+## Why the stream warm-up is 10MB
+
+It was 50MB until 2026-09-19. Measured over six hours of production stream jobs (the
+`live batch` / stage timings in the web-ui job log): the warm-up stage is a median 21 s
+and p90 81 s, a third of all the time a viewer spends waiting, and the whole wait from
+the click to the first frame has a median of 58 s with only 4.8% of viewers playing
+within 10 s. On a cold swarm at ~2MB/s, 50MB *is* those 25 seconds.
+
+Playback does not need 50MB: it needs the first segment, and the rest arrives while the
+film plays.
+
+### The bandwidth gate still measures over 50MB — but only when it has to
+
+The size also bought the speed estimate behind the BT-slow modal, and that estimate
+cannot shrink with the warm-up. The seeder's warm-up counter (`torrent-web-seeder`
+`warmupBytes`) moves only when a **whole piece is verified**, once a second, and counts
+only the bytes **inside the requested range**. Over a 10MB range:
+
+| piece size | what the counter shows | effect on the gate |
+|---|---|---|
+| 4MB | 4 → 8 → 10MB | usable, last step under-counted |
+| 8MB | 8 → 10MB: "2MB" in the time 8MB took | **4× too slow → false slow-download modal** |
+| 16MB | 0 → 10MB in one step, nothing measured | speed 0 → **gate silently off** |
+
+The gate is not noise: 1362 BT-slow firings in 7 days (3.5% of stream starts,
+2026-09-20), 99% of them under 5 Mbit/s, a quarter within 2× of the bitrate.
+
+So the warm-up is two-phase (`streamContent`, helpers `lowerBoundSpeed` /
+`needsFullMeasure`):
+
+1. **Quick warm-up, 10MB** (`streamWarmupSize`). Its speed is a *lower bound*: the range
+   over everything the call took, peer discovery included. Piece granularity cannot
+   inflate it. If even that clears the bitrate, the film plays — this is the saving.
+2. **Full measure, 50MB / skip 10MB** (`bandwidthTestSize`, `bandwidthSkipSize`), only
+   when the lower bound does not clear the bitrate. "Slow swarm" and "fast swarm that took
+   15 s to find peers" look the same at that point, so it is measured the way it always
+   was. Runs under the "checking bandwidth" line, on what is left of `WARMUP_TIMEOUT_MIN`
+   (at least 30 s), so a crawl does not get the deadline twice. These viewers wait what
+   everyone waited before 2026-09-19.
+
+The quick phase passes its whole range as `skipBytes`: there it is only warmUp's "hard
+timeout with less than this = dead torrent → `no_peers`" threshold, the same 10MB that
+rule has always used. If the pod turns out to hold the full range when phase 2 starts
+(someone else's stream filled it), the verdict falls back to the plan-cap check of the
+cached branch.
+
+The chunk-level counter exists since 2026-10 (`have`/`span`, above), but the gate does
+not read it yet: `warmup measured` logs both speeds until the numbers say it should.
+Until the gate reads `have`, do not shrink the measuring constants (`TestWarmupSizes`
+guards it); after that, whether the two phases and the 10/50/10 MB constants are still
+needed is a question for the same log, not a given.
+
+The head/tail piece prioritisation, the other half of warm-up, is unaffected: it is the
+range that matters there, not its length.

@@ -1,0 +1,6 @@
+<p>{{ tp "email.expiring.heading" "Days" .Days }}</p>
+<ul>
+    {{ range .Resources }}
+    <li><a href="{{ .URL }}">{{ .Name }}</a></li>
+    {{ end }}
+</ul>

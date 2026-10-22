@@ -1,0 +1,371 @@
+# Tool pages (SEO landings)
+
+Каждый URL из `handlers/common.Tools` — отдельная посадочная страница
+(`/torrent-to-mp4`, `/open-torrent-file`, …). Роут, sitemap, футер и
+перелинковка подхватываются из этого списка автоматически.
+
+## Тело страницы — данные, не шаблон
+
+До 2026-08-15 тело каждой страницы было отдельным партиалом на ~130 строк в
+`templates/partials/about/`. Их было 19 (2537 строк), и они отличались только
+префиксом i18n-ключей: все страницы — один и тот же набор из пяти секций.
+Новая страница означала копирование чужого файла и замену префикса — самый
+дешёвый способ случайно отрендерить чужой текст.
+
+Теперь страница описывается списком секций в `handlers/common/tools.go`:
+
+```go
+{Url: "torrent-to-mp4", Title: "tool.torrentToMp4.title", …, Sections: []AboutSection{
+    {Kind: AboutSteps,     Key: "steps",     Badge: "howItWorks", Accent: "pink",   CTA: "discover"},
+    {Kind: AboutProse,     Key: "explained", Badge: "explained",  Accent: "purple", Alt: true, Paras: []string{"p1", "p2"}},
+    {Kind: AboutChecklist, Key: "benefits",  Badge: "benefits",   Accent: "pink",   Items: 4},
+    {Kind: AboutProse,     Key: "safety",    Badge: "safety",     Accent: "purple", Alt: true, Paras: []string{"text"}},
+    {Kind: AboutChecklist, Key: "devices",   Badge: "devices",    Accent: "pink",   Items: 4},
+}},
+```
+
+Разметку рендерит `templates/partials/about/sections.html`. Типы секций:
+
+| Kind | Что это | Обязательные поля |
+|---|---|---|
+| `AboutSteps` | три пронумерованные карточки, несёт якорь `#how` | `CTA` (`discover`/`stremio`) |
+| `AboutProse` | заголовок + 1–3 абзаца | `Paras` (`p1`,`p2`,`p3` или `text`) |
+| `AboutChecklist` | заголовок, подзаголовок, сетка пунктов с галочками | `Items` |
+| `AboutCompare` | две подписанные колонки буллетов | `Cols` (ровно две) |
+
+Дополнительные флаги: `Alt` (тёмный фон, секции чередуются), `Footer`/`Note`
+(закрывающий абзац), `Extra` (врезка под чеклистом), `Link` (кросс-ссылка на
+другой лендинг), `Icon` (глиф, если он не совпадает с именем бейджа), `Cap`
+(строка с лимитом бесплатного тарифа под сравнением — число из каталога,
+рендерится только при `hasPlans` и ненулевом `freeRateMbps`).
+
+Шестой тип секции — сигнал, что странице нужен свой партиал, а не ещё один
+флаг.
+
+## Ключи
+
+Префикс не пишется в литералах: `Tool.AboutKey()` выводит его из URL
+(`torrent-to-mp4` → `tool.torrentToMp4.about`) и штампуется в каждую секцию
+в `init()`. Секция сама собирает полные ключи (`FieldKey`, `ItemKeys`,
+`ColItemKeys`), поэтому страница физически не может отрендерить копирайт
+другой страницы.
+
+Соглашение kebab-URL → camel-ключ проверяется тестом
+`TestAboutKeyFollowsTheURL`.
+
+## Title, Benefit и H1
+
+`Title` и `Benefit` — не поля одной страницы: каждый ключ рендерится в
+нескольких местах, и правка перевода меняет их все.
+
+| Ключ | Где виден |
+|---|---|
+| `Title` | начало `<title>` и `og:title` (`Title – Benefit`), `name` в JSON-LD `WebApplication`, анкор ссылки в футере (у гайдов — в отдельной колонке); у гайда ещё и H1 |
+| `Benefit` | хвост `<title>`, заголовок карточки в «related tools» на всех остальных tool-страницах; у не-гайда — H1, у гайда — строка под H1 |
+| `Description` | `<meta name="description">`, абзац под hero, текст карточки «related tools» |
+
+H1 рендерит `tool_heading` (`templates/partials/about/heading.html`), его
+вызывает hero в `templates/views/index.html`. У обычной tool-страницы H1 —
+`Benefit`. У гайда (`Tool.Guide`) H1 — `Title`, то есть вопрос («How to Open
+a .torrent File»), а `Benefit` уходит строкой под него. Причина: на этих
+страницах Google показывает в выдаче H1 вместо нашего `<title>`, и с
+`Benefit` в H1 там стоял обрывок («Without Installing a Torrent Client») без
+вопроса. Главная рендерит свой hero и `tool_heading` не использует.
+
+`Title` гайда в локали — формулировка местного запроса, а не перевод
+английского: DE «Torrent-Datei öffnen: So geht's», RU «Как открыть
+торрент-файл», PT «Como baixar torrent», ES «¿Cómo descargar un torrent?»,
+FR «Comment télécharger des torrents ?», PL «Jak pobierać torrenty» (сверено
+с GSC за 90 дней до 2026-09-21). Небрендовые запросы, по которым эти страницы
+стоят на позиции ≤3, — PL «torrenty», ES «descargar torrents», по 2–3 показа
+за 90 дней — новые Title тоже содержат; у снятых формулировок таких запросов
+не было. ES `/open-torrent-file` оставлен
+«¿Cómo abrir un archivo .torrent?»: он и есть главный местный запрос, а
+«abrir archivo torrent online» держит `/es/online-torrent-downloader` на
+позиции 1 — второй страницы под ту же фразу не нужно.
+
+## Общий FAQ и гайды
+
+FAQ в `templates/partials/about.html` один на главную и все tool-страницы.
+Четыре ответа ведут на гайды через `about_faq_guide_link`
+(`templates/partials/about/faq_guide_link.html`, вызов
+`withContext $ "<url гайда>"`). На самом гайде ссылка на него же не
+рендерится — это была ссылка на страницу, где читатель уже находится;
+ссылки на остальные гайды остаются. Новая ссылка из FAQ на гайд —
+только через этот шаблон.
+
+На гайде общий how-to пункт, полный ответ на который живёт на этом гайде,
+не рендерится вовсе — ни в списке, ни в схеме: собственный FAQ гайда задаёт
+тот же вопрос, а две `Question` с одним `name` в FAQPage позволяют Google
+взять короткий ответ. В `about.html` пара ключей каждого из четырёх пунктов
+лежит в переменной (`$openTorrent`, `$openTorrentApp` → /open-torrent-file,
+`$downloadTorrented` → /how-to-download-torrent-files, `$unzipTorrent` →
+/open-torrents-on-pc); на своём гайде она обнуляется, и одна переменная
+гасит и collapse, и пару в `faqSchema` (пустую пару он пропускает). Новый
+общий вопрос, дублирующий вопрос гайда, — по тому же образцу.
+
+Ссылка под `openTorrentApp` («What can I use to open a torrent file?») с
+2026-10-17 ведёт на /open-torrent-file, а не на /open-torrents-on-pc: тот же
+вопрос задаёт q1 этого гайда, а ответ не привязан к ПК. Это меняет главную и
+все tool-страницы, не только четыре how-to ответа.
+
+Четыре how-to ответа общего FAQ (`about.faq.openTorrent.a`,
+`openTorrentApp.a`, `downloadTorrented.a`, `unzipTorrent.a`) — **одно
+предложение плюс ссылка на гайд, намеренно** (2026-10-17). GSC за 28 дней
+до 2026-10-13: общий FAQ отвечал на вопрос целиком на главной, и Google
+отдавал под эти запросы ГЛАВНУЮ на позиции ~8 с CTR 1–2% («how to download
+torrented files» 1602 показа / 36 кликов / поз. 7.9, «how to open torrent
+files» 719, «how to open a torrent file» 718, «how to open torrented files
+on pc» 375 / поз. 8.0), а гайды получали ~35 показов каждый (ранжировался
+только /open-torrent-file, 184 клика). Полный ответ живёт только на гайде —
+в его собственном FAQ (ниже). Исключение: «how to open torrented files
+online» (130 показов, поз. 1.4, CTR 53%) главная выигрывает сама, её
+короткий ответ остаётся. Проверить расклад страниц по запросам в GSC через
+4 недели после выката.
+
+## FAQ страницы (Tool.FAQ)
+
+Страница добавляет свои вопросы под общими через `FAQ: N` в `Tools`
+(2026-10-17; до этого пять вопросов /torrent-to-ddl были захардкожены
+в `about.html` веткой `torrent_to_ddl`). Ключи —
+`<AboutKey>.faq.qN.question` / `.answer`, N = 1..FAQ (`Tool.FaqPairs`).
+Рендерятся **после** общих, одинаково в списке и в JSON-LD FAQPage:
+`toolFaq $.Data.Tool` отдаёт пары и в `faqSchema` (параметр `more`), и в
+`range` разметки — один источник, расходиться нечему. Ответ идёт через
+`tHTML`: допустим только `<strong>`, в схеме теги вырезаются. Ссылок в
+ответах не ставить: `about_faq_guide_link` и его тест считают href в
+секции FAQ. Вопрос — формулировка реального запроса из GSC, ответ — 2–3
+предложения по делу. Сейчас FAQ: 5 у /torrent-to-ddl и трёх гайдов, 4 у /debrid-alternative.
+
+## /watch-torrents-ios: сравнение с uTorrent Lite
+
+Секция `utorrent` отвечает на «utorrent for iphone»: приложения uTorrent в
+App Store нет, у его авторов есть браузерная uTorrent Lite. Колонка Lite
+говорит только то, что написано на utorrent.com/lite и в справке BitTorrent
+(проверено 2026-09-23: Safari/Chrome, бесплатно и без рекламы, играет из
+памяти браузера, файлы в папку на устройстве не сохраняет, куски берёт у
+пиров сам браузер). Про iPhone их справка прямо говорит только об iPad —
+поэтому в тексте «для Safari и Chrome», без обещаний за них. Перед правкой
+колонки — перепроверить их страницу.
+
+Под сравнением — строка про лимит бесплатного тарифа (`utorrent.cap`, флаг
+секции `Cap`). Число в копирайт не вписано: это `{{.Rate}}` из каталога
+тарифов (`freeRateMbps`, `services/offer`), как у всех апселлов после
+39c417e. Строка рендерится, только когда есть что сказать: каталог
+загружен, в нём есть планы (`hasPlans`) и у free-тарифа конечный лимит. На
+деплое без каталога её нет вовсе — ни числа, ни «платного плана», которого
+там не купить.
+
+## /utorrent-web-alternative: сравнение с uTorrent Web
+
+Страница отвечает на «utorrent web» / «utorrent online» / «bittorrent web»:
+человек хочет торрент-клиент, который работает в браузере, и спрашивает,
+что ещё так умеет. Ответ Webtor — ставить нечего ни на одной ОС: рой
+держат серверы, браузер получает видеопоток или файл по HTTPS, одинаково на
+Windows, Mac, Linux, Chromebook, Android и iPhone. Запрос «utorrent for
+iphone» остаётся за `/watch-torrents-ios`. Цифры GSC и объёмы — в
+комментарии над записью в `tools.go`.
+
+Колонка uTorrent Web в секции `compare` и абзац `explained.p1` говорят
+только то, что написано на utorrent.com и в его справке (проверено
+2026-10-16): это устанавливаемая программа для Windows и Mac, интерфейс
+открывается во вкладке Chrome, Firefox или Opera, работает из трея,
+сохраняет файлы в папку на компьютере, раздаёт пирам, играет видео во время
+закачки; бесплатный тариф BASIC плюс платные. Про рекламу в бесплатном
+тарифе их сайт прямо не говорит — поэтому в тексте этого нет. uTorrent
+Lite — другой продукт, он разобран на iOS-странице, здесь только упомянут в
+футере. **Перед правкой колонки — перепроверить utorrent.com.**
+
+Строка `compare.cap` — тот же `{{.Rate}}` из каталога тарифов, что и на
+iOS-странице (см. выше).
+
+## /debrid-alternative: Webtor вместо дебрида или рядом с ним
+
+Страница для пользователей Stremio, которые пользуются дебрид-сервисом
+(кэш торрентов, отдаваемый по HTTP, чтобы устройство само не качало) и
+ищут другой вариант. Спрос, SERP и причина одного общего слага (а не
+`/real-debrid-alternative` + `/torbox-alternative`) — в комментарии над
+записью в `tools.go`. Сравнение «TorBox vs Real-Debrid» остаётся за постом
+в блоге (`real-debrid-and-torbox-integration`, позиция ~10); эта страница —
+«Webtor вместо или вместе с дебридом», а шаги установки — на
+`/webtor-stremio-addon`, куда ведёт `Link` из `explained`. Поэтому блок
+`steps` здесь — свои три шага (добавить свои торренты в Webtor →
+подключить дебрид или обойтись без него → поставить аддон), а не копия
+шагов установки с `/webtor-stremio-addon`: одинаковые шаги на первом
+экране были главным сигналом каннибализации. По той же причине у страницы
+нет секции `devices` (была бы дословной копией с аддон-страницы) и в
+`safety` нет фразы про личный URL аддона — всё это живёт на
+`/webtor-stremio-addon`, куда ведёт `Link`. Строки, которые повторяют
+аддон-страницу слово в слово, сюда не копировать.
+
+**Модель доступа аддона** (решение владельца 2026-09-23, проверено в
+`services/link_resolver/link_resolver.go`, `ResolveLink` — единственный
+вызов из `handlers/stremio/handler.go`, `requiresPayment=true`):
+
+1. Сначала бэкенды пользователя (Real-Debrid, TorBox) в порядке из
+   профиля, **без проверки тарифа**: файл, который сервис отдал как
+   закэшированный, играет через него, Webtor ничего не берёт — и на
+   бесплатном аккаунте тоже. Ошибка бэкенда или «не в кэше» — `continue`.
+2. Иначе серверы Webtor — только платный тариф (`ErrPlanRequired`, клип
+   пейволла).
+
+Бэкенды работают **только в аддоне**: веб-плеер, Discover и скачивание их
+не смотрят. Три утверждения на странице должны быть верны одновременно:
+свой TorBox/Real-Debrid подключён → его кэш играет бесплатно; «Playing
+through Webtor's servers needs a paid Webtor plan.» дословно
+(`explained.p2`, `faq.q2`); ни длины триала, ни скоростей, ни цен. Лимит
+скорости бесплатного тарифа к аддону не относится — поэтому у `compare`
+**нет `Cap`**, и добавлять его нельзя.
+
+Колонка `debrid` описывает дебрид вообще, а не Real-Debrid или TorBox
+(футер говорит это явно). Real-Debrid и TorBox называются только как
+сервисы, с которыми сравнивают или которые подключают; никаких их цен,
+скоростей и фич; обещание «faster playback, more streams» из поста в
+блоге не повторять. Написание — «TorBox» и «Real-Debrid» (в селекте
+профиля пока «Torbox» — косметика). Webtor — не дебрид: разрешает только
+infohash + индекс файла, каталога не ведёт, hoster-ссылки не разбирает,
+ничего не «ищет». Про проверку Real-Debrid не писать «Webtor не трогает
+ваш аккаунт»: для торрента вне библиотеки RD Webtor добавляет магнет,
+выбирает файл и удаляет его, если RD не отдал `downloaded`
+(`backends/realdebrid.go`); безопасная формулировка — «спрашивает у
+сервиса, есть ли у него файл». Vault — платный и условный (пока пледж
+обеспечен); без чисел.
+
+CTA — `stremio` (вторая страница после `/webtor-stremio-addon`; комментарий
+в `templates/partials/stremio_cta.html` и `docs/onboarding_empty_states.md`
+обновлены). Своих вопросов четыре (`FAQ: 4`). Через 4 недели после выката
+смотреть в GSC запросы «real debrid alternative», «stremio debrid»,
+«stremio without debrid» и не отобрала ли страница «torbox vs real debrid»
+у блога.
+
+## Как добавить страницу
+
+1. Запись в `Tools` с `Sections`.
+2. Ключи `tool.<camelUrl>.*` во **всех** локалях (`locales/*.json`):
+   `title`, `benefit`, `description` плюс всё, что просят секции, и
+   `about.faq.qN.question/.answer`, если задан `FAQ: N`.
+3. `go test ./handlers/common/ ./services/template/` — тесты скажут, чего не
+   хватает, поимённо и по каждому языку.
+4. `-update` снапшотов не требуется: новая страница добавляет свой файл сама.
+
+## Что защищает изменения
+
+| Тест | Что ловит |
+|---|---|
+| `handlers/common.TestEveryToolDeclaresItsBody` | зарегистрированный URL без тела — пустая страница между hero и футером |
+| `services/template.TestAboutSnapshots` | правка `sections.html` тихо меняет разметку всех 18 страниц. Снапшоты в `services/template/testdata/about/`; `go test ./services/template/ -run TestAbout -update` перезаписывает их — **читать диф, а не обновлять вслепую** |
+| `services/template.TestAboutCopyExistsInEveryLocale` | ключ, который страница реально рендерит, отсутствует в каком-то языке (на SEO-странице это выводит сырой ключ). Список ключей берётся из отрендеренной разметки, а не из догадки о том, что просит шаблон |
+| `services/template.TestAboutPartialsUseTheirOwnKeys` | страница рендерит чужой префикс |
+| `services/template.TestIndexFormSaysOpenOnToolPagesOnly` | поле ввода в hero: на tool-страницах кнопка `home.open` («Open»), стрелка вместо лупы и `data-umami-event-page=<url>`; на главной — прежние `home.search` и лупа. Событие Umami на обеих — `search`. Почему — `docs/user_errors.md`, «What the form accepts» |
+| `services/template.TestGuideHeadingIsTheQuestion` | у гайда H1 снова не вопрос (`Title`) или `Benefit` пропал из-под него |
+| `services/template.TestToolHeadingIsUnchangedOutsideGuides` | H1 обычной tool-страницы отличается от прежней разметки (`Benefit`, байт в байт) |
+| `services/template.TestFreeCapLineFollowsTheCatalog` | строка `Cap` рендерится без каталога, без планов или без лимита у free-тарифа, либо цитирует не число из каталога |
+| `services/template.TestFAQDoesNotLinkAGuideToItself` | FAQ на гайде ссылается на сам гайд, или пропала ссылка на другой гайд. Рендерит весь `about.html`, а не только секции |
+| `services/template.TestFAQSectionSnapshots` | секция FAQ (разметка и пары JSON-LD) главной и каждой страницы отличается от снапшота в `services/template/testdata/faq/`. Снапшоты сняты **после** перехода на `Tool.FAQ` (2026-10-17) и пинят текущее состояние; сверка с рендером `about.html` из main сделана вручную: главная, /torrent-to-ddl и 17 страниц без своего FAQ отличаются от прежнего вывода только href под `openTorrentApp` (см. выше), три гайда — ещё снятыми с них how-to пунктами и своими вопросами. `-update` — только для файлов, которые тест назвал, и **читать диф** |
+| `services/template.TestFAQAsksEachQuestionOnce` | на какой-то странице два вопроса FAQ дают один и тот же текст в `en.json` (общий how-to пункт не снят с гайда, который на него отвечает), или список вопросов в схеме разошёлся с разметкой |
+| `services/template.TestToolFAQItemsFollowTheTool` | вопросы страницы не совпадают с `Tool.FaqPairs` в схеме или в списке, стоят не после общих, либо страница с `FAQ: 0` (главная в том числе) рендерит лишние |
+| `handlers/common.TestEveryToolHasItsCopyInEveryLocale` | ключ `title`/`benefit`/`description` или пары FAQ нет в какой-то локали — `FaqSchema` молча выкинет такой вопрос из схемы |
+
+Снапшоты, которыми обложен рефакторинг 2026-08-15, сняты **до** него: все 18
+страниц после перехода на секции рендерятся байт-в-байт (с точностью до
+пробелов) так же, как рендерились постраничные партиалы.
+
+## t против tHTML
+
+Прозаические поля (`stepN.text`, `subtitle`, `explained.p*`, `safety.text`,
+`compare.footer`, `video.subtitle`) рендерятся через `tHTML`: примерно треть
+их значений содержит `<strong>` хотя бы в одном языке. Короткие подписи
+(`title`, `label`, `itemN`) — через `t`; разметки в них нет ни в одной локали,
+и это проверено по всем 11 файлам.
+
+## Намерение tool-страницы после сабмита
+
+С 2026-09-23 страница, на которой человек отправил торрент, не теряется по
+дороге до страницы ресурса.
+
+**Прогресс.** Все три формы tool-страницы (поиск, дропзона, демо) шлют скрытое
+`instruction` — путь страницы. `resource.newPostData` ищет его через
+`common.ToolByURL` и кладёт `Tool` в `PostData`, поэтому ответ на сабмит
+рендерит hero, H1 и `<title>` той же tool-страницы. Раньше `Tool` не
+заполнялся, и под адресом `/magnet-to-torrent` (POST отвечает 202, `async.js`
+адрес не меняет) показывались H1 и `<title>` главной. Неизвестное значение
+`instruction` сбрасывается в пустое — это главная; раньше такая страница не
+рендерила ни тело главной, ни тело tool-страницы.
+
+**Слаг до страницы ресурса — `?tool=<slug>`.** Хост лога
+(`partials/load/progress.html`) при наличии `Tool` несёт
+`<input type="hidden" name="tool">`, а `progressLog.js` на редиректе div-хоста
+превращает скрытые инпуты хоста в query-параметры (тот же путь, которым
+Discover передаёт `file-idx`). Итог: `/<hash>?tool=magnet-to-torrent`.
+
+- **Не в `jobs/load.go`.** Load-джоба ключуется `sha1(hash + "/" + lang)`, её
+  лог хранится и реплеится каждому, кто грузит тот же торрент на том же языке.
+  Слаг, зашитый в сохранённый редирект, уезжал бы от первого посетителя ко
+  всем остальным.
+- **Query, а не сессия.** Без состояния; виден в URL pageview Umami
+  (`exclude_search` не включён), так что сегмент «пришёл с tool-страницы»
+  меряется без нового события; не нужно писать в сессию на каждый сабмит и
+  решать, когда значение гасить; перезагрузки async-layout
+  (`window.location.href`) сохраняют параметр сами.
+- **`tool`, а не `from`.** `from` уже занят: `RedirectWithError/Success`
+  пишут туда путь запроса, страница ресурса читает `from=/vault/add` и
+  `from=/vault/remove`.
+- **Whitelist — одно место:** `common.ToolByURL`. Неизвестный слаг ничего не
+  выбирает и в страницу не попадает.
+
+**Что параметр не трогает.** Страница ресурса — `X-Robots-Tag: noindex,
+follow` и без canonical (проверено на живом проде 2026-09-23); hreflang и
+языковые ссылки в навигации строятся из `URL.Path`; sitemap — из
+`common.Tools`; ссылки внутри страницы ресурса собирает сервер из ID, `tool`
+в них нет. «Поделиться» (`lib/share/share.js`) вырезает `tool` из ссылки: это
+намерение того, кто делится, не получателя. Edge (проверено 2026-09-23)
+HTML страниц ресурса не кэширует, а его правила для этих страниц смотрят на
+путь, не на query; referer запросов `/status` с такой страницы по-прежнему
+содержит домен.
+
+**Что видно на странице ресурса.**
+
+| Откуда | Что | Где |
+|---|---|---|
+| `/magnet-to-torrent` | строка `resource.toolIntent.magnetToTorrent` («Or download the files directly — no torrent client needed») и кнопка `resource.download` под парой `.torrent`/magnet | `partials/resource/tool_intent.html` |
+| `/torrent-to-magnet` | кнопка magnet показывает подпись `resource.copyMagnet` и зелёная (цвет, который она иначе получает на hover) | `resource/torrent_magnet_split` в `views/resource/get.html` |
+| любая tool-страница | `tool` как prop события `download-torrent` и `copy-magnet` | там же, `lib/share/share.js` |
+
+Кнопка строки — ссылка на `#content`: без JS браузер прокручивает к карточке
+файла и списку. С JS `lib/toolIntent.js` нажимает кнопку самой страницы:
+архив каталога (TAR, `#list form.download-dir`), если есть список, иначе
+«Скачать» файла (`#file form.download`) — с Turnstile, busy-состоянием,
+модалкой архива и событием этой кнопки. Своей копии этих форм у строки нет,
+кнопка ищется в момент нажатия (выбор файла или каталога подменяет
+`#content`/`#list`). О скорости строка молчит: время скачивания называет
+карточка самой джобы (`downloadPitch`).
+
+Почему именно magnet-to-torrent (Umami, SEO-разбор 2026-09): 38.7% её
+сессий качают только `.torrent`, 23.5% — файлы; у «только `.torrent`»
+платных переходов 0, у качающих файлы — 8.1 на 1000.
+
+**Umami.** `tool-intent-direct` (+ `tool`) — нажатия строки. Следом стреляет
+событие нажатой кнопки — `download-dir` (`format: tar`) или `download`, так
+что эти счётчики включают нажатия через строку. Pageview —
+`/<hash>?tool=<slug>`. Эффект: доля сессий с pageview `?tool=magnet-to-torrent`,
+которые качают файлы, против тех, что жмут только `download-torrent`.
+
+**Известные дыры.**
+
+- Ретрай мёртвого магнета («ждать 10 минут», `load/errors/magnet`) — форма
+  карточки, отрисованной джобой; `instruction` в ней нет и быть не может (лог
+  общий), поэтому после удачного ретрая редирект уходит без `?tool=`. Hero
+  страницы остаётся tool-страницы: ретрай меняет только `#log-load`.
+- Поиск и дропзона в навигации шлют без `instruction` — они глобальные.
+- `/torrent-to-zip`, `/torrent-to-ddl`, `/magnet-to-ddl` пока ничего не
+  подсвечивают: сначала замер по magnet-to-torrent и по pageview остальных.
+
+| Тест | Что ловит |
+|---|---|
+| `handlers/common.TestToolByURL` | whitelist пропускает что-то кроме зарегистрированных URL |
+| `handlers/resource.TestNewPostDataResolvesTheTool`, `TestProgressPageKeepsTheToolPage` | прогресс после сабмита с tool-страницы рендерит главную; хост лога не несёт `tool` |
+| `jobs.TestLoadProgressPartialCarriesTheTool` | `tool` не внутри хоста (progressLog.js читает только его инпуты) |
+| `handlers/resource.TestBindGetArgsReadsTheTool` | `?tool=` не читается, читается неизвестный, параметр попадает в путь контекста |
+| `handlers/resource.TestToolIntentLine`, `TestTorrentMagnetSplitCarriesTheTool` | строка не там, где нужно, или без перевода; пара `.torrent`/magnet меняется для обычного визита |
+| `handlers/resource.TestToolIntentFixturesAreCurrent` + `assets/src/js/lib/toolIntent.test.js` | строка нажимает не ту кнопку; фикстура — реальная разметка из шаблонов, перегенерация — команда в тексте падения |
+| `assets/src/js/lib/share/share.test.js` | «Поделиться» уносит `?tool=` получателю; `copy-magnet` теряет prop `tool` |

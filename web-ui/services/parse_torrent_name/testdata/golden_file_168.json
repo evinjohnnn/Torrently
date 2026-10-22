@@ -1,0 +1,7 @@
+{
+  "input": "Bakemonogatari - NCOP",
+  "want": {
+    "title": "Bakemonogatari",
+    "kind": "NCOP"
+  }
+}

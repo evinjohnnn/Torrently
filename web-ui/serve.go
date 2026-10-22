@@ -1,0 +1,775 @@
+package main
+
+import (
+	"context"
+	"net/http"
+	"strings"
+
+	"github.com/pkg/errors"
+
+	"github.com/webtor-io/web-ui/handlers/about"
+	wa "github.com/webtor-io/web-ui/handlers/action"
+	japi "github.com/webtor-io/web-ui/handlers/api"
+	wau "github.com/webtor-io/web-ui/handlers/auth"
+	wdev "github.com/webtor-io/web-ui/handlers/device"
+	"github.com/webtor-io/web-ui/handlers/discover"
+	"github.com/webtor-io/web-ui/handlers/discover_ai"
+	"github.com/webtor-io/web-ui/handlers/discover_watchlist"
+	"github.com/webtor-io/web-ui/handlers/donate"
+	we "github.com/webtor-io/web-ui/handlers/embed"
+	wee "github.com/webtor-io/web-ui/handlers/embed/example"
+	"github.com/webtor-io/web-ui/handlers/embed_domain"
+	"github.com/webtor-io/web-ui/handlers/event"
+	"github.com/webtor-io/web-ui/handlers/ext"
+	hi18n "github.com/webtor-io/web-ui/handlers/i18n"
+	wi "github.com/webtor-io/web-ui/handlers/index"
+	wspa "github.com/webtor-io/web-ui/handlers/spa"
+	"github.com/webtor-io/web-ui/handlers/instructions"
+	wj "github.com/webtor-io/web-ui/handlers/job"
+	"github.com/webtor-io/web-ui/handlers/legal"
+	"github.com/webtor-io/web-ui/handlers/library"
+	wm "github.com/webtor-io/web-ui/handlers/migration"
+	"github.com/webtor-io/web-ui/handlers/notifications"
+	p "github.com/webtor-io/web-ui/handlers/profile"
+	"github.com/webtor-io/web-ui/handlers/release_subscription"
+	wr "github.com/webtor-io/web-ui/handlers/resource"
+	s3 "github.com/webtor-io/web-ui/handlers/s3"
+	sess "github.com/webtor-io/web-ui/handlers/session"
+	"github.com/webtor-io/web-ui/handlers/sitemap"
+	"github.com/webtor-io/web-ui/handlers/speedtest"
+	sta "github.com/webtor-io/web-ui/handlers/static"
+	"github.com/webtor-io/web-ui/handlers/streaming/backends"
+	"github.com/webtor-io/web-ui/handlers/stremio"
+	"github.com/webtor-io/web-ui/handlers/stremio/settings"
+	"github.com/webtor-io/web-ui/handlers/stremio/stremio_addon_url"
+	"github.com/webtor-io/web-ui/handlers/support"
+	"github.com/webtor-io/web-ui/handlers/tests"
+	"github.com/webtor-io/web-ui/handlers/torznab_indexer"
+	"github.com/webtor-io/web-ui/handlers/trial"
+	ush "github.com/webtor-io/web-ui/handlers/user_subtitle"
+	uvsh "github.com/webtor-io/web-ui/handlers/user_video_status"
+	vh "github.com/webtor-io/web-ui/handlers/vault"
+	wh "github.com/webtor-io/web-ui/handlers/watch_history"
+	"github.com/webtor-io/web-ui/handlers/webdav"
+	jj "github.com/webtor-io/web-ui/jobs"
+	as "github.com/webtor-io/web-ui/services/abuse_store"
+	at "github.com/webtor-io/web-ui/services/access_token"
+	ac "github.com/webtor-io/web-ui/services/ai_client"
+	ci "github.com/webtor-io/web-ui/services/cache_index"
+	"github.com/webtor-io/web-ui/services/common"
+	si18n "github.com/webtor-io/web-ui/services/i18n"
+	"github.com/webtor-io/web-ui/services/libapi"
+	lr "github.com/webtor-io/web-ui/services/link_resolver"
+	"github.com/webtor-io/web-ui/services/memwatch"
+	"github.com/webtor-io/web-ui/services/metrics"
+	"github.com/webtor-io/web-ui/services/notification"
+	"github.com/webtor-io/web-ui/services/offer"
+	"github.com/webtor-io/web-ui/services/onboarding"
+	npg "github.com/webtor-io/web-ui/services/payments"
+	rec "github.com/webtor-io/web-ui/services/recommendations"
+	rss "github.com/webtor-io/web-ui/services/release_subscription"
+	rum "github.com/webtor-io/web-ui/services/request_url_mapper"
+	s3svc "github.com/webtor-io/web-ui/services/s3"
+	"github.com/webtor-io/web-ui/services/streamprefs"
+	thumb "github.com/webtor-io/web-ui/services/thumbnail"
+	"github.com/webtor-io/web-ui/services/transcodercaps"
+	"github.com/webtor-io/web-ui/services/turnstile"
+	"github.com/webtor-io/web-ui/services/umami"
+	"github.com/webtor-io/web-ui/services/spa"
+	ua "github.com/webtor-io/web-ui/services/url_alias"
+	usettings "github.com/webtor-io/web-ui/services/user_settings"
+	usv "github.com/webtor-io/web-ui/services/user_subtitle"
+	uvss "github.com/webtor-io/web-ui/services/user_video_status"
+	"github.com/webtor-io/web-ui/services/vault"
+
+	"github.com/gin-contrib/multitemplate"
+	"github.com/gin-gonic/gin"
+	"github.com/webtor-io/web-ui/services/api"
+	"github.com/webtor-io/web-ui/services/auth"
+	"github.com/webtor-io/web-ui/services/embed"
+
+	log "github.com/sirupsen/logrus"
+	"github.com/urfave/cli"
+	cs "github.com/webtor-io/common-services"
+	"github.com/webtor-io/web-ui/services/claims"
+	"github.com/webtor-io/web-ui/services/job"
+	"github.com/webtor-io/web-ui/services/template"
+	w "github.com/webtor-io/web-ui/services/web"
+
+	stremios "github.com/webtor-io/web-ui/services/stremio"
+	"github.com/webtor-io/web-ui/services/torznab"
+)
+
+func makeServeCMD() cli.Command {
+	serveCMD := cli.Command{
+		Name:    "serve",
+		Aliases: []string{"s"},
+		Usage:   "Serves web server",
+		Action:  serve,
+	}
+	configureServe(&serveCMD)
+	return serveCMD
+}
+
+func configureServe(c *cli.Command) {
+	c.Flags = cs.RegisterPGFlags(c.Flags)
+	c.Flags = cs.RegisterNATSFlags(c.Flags)
+	c.Flags = cs.RegisterProbeFlags(c.Flags)
+	c.Flags = cs.RegisterPromFlags(c.Flags)
+	c.Flags = cs.RegisterS3ClientFlags(c.Flags)
+	c.Flags = api.RegisterFlags(c.Flags)
+	c.Flags = w.RegisterFlags(c.Flags)
+	c.Flags = common.RegisterFlags(c.Flags)
+	c.Flags = libapi.RegisterRateLimitFlags(c.Flags)
+	c.Flags = auth.RegisterFlags(c.Flags)
+	c.Flags = claims.RegisterClientFlags(c.Flags)
+	c.Flags = sess.RegisterFlags(c.Flags)
+	c.Flags = sta.RegisterFlags(c.Flags)
+	c.Flags = cs.RegisterRedisClientFlags(c.Flags)
+	c.Flags = as.RegisterFlags(c.Flags)
+	c.Flags = cs.RegisterPprofFlags(c.Flags)
+	c.Flags = umami.RegisterFlags(c.Flags)
+	c.Flags = spa.RegisterFlags(c.Flags)
+	c.Flags = event.RegisterFlags(c.Flags)
+	c.Flags = library.RegisterFlags(c.Flags)
+	c.Flags = embed.RegisterFlags(c.Flags)
+	c.Flags = rum.RegisterFlags(c.Flags)
+	c.Flags = stremios.RegisterClientFlags(c.Flags)
+	c.Flags = torznab.RegisterFlags(c.Flags)
+	c.Flags = ac.RegisterFlags(c.Flags)
+	c.Flags = configureEnricher(c.Flags)
+	c.Flags = configureRecommendations(c.Flags)
+	c.Flags = jj.RegisterFlags(c.Flags)
+	c.Flags = ci.RegisterFlags(c.Flags)
+	c.Flags = turnstile.RegisterFlags(c.Flags)
+	c.Flags = vault.RegisterApiFlags(c.Flags)
+	c.Flags = vault.RegisterFlags(c.Flags)
+	c.Flags = npg.RegisterFlags(c.Flags)
+	c.Flags = usv.RegisterFlags(c.Flags)
+	c.Flags = thumb.RegisterFlags(c.Flags)
+	c.Flags = donate.RegisterFlags(c.Flags)
+	c.Flags = stremios.RegisterFlags(c.Flags)
+	c.Flags = memwatch.RegisterFlags(c.Flags)
+	c.Flags = streamprefs.RegisterFlags(c.Flags)
+	c.Flags = transcodercaps.RegisterFlags(c.Flags)
+}
+
+func serve(c *cli.Context) error {
+	// Setting HTTP Client
+	cl := http.DefaultClient
+
+	// Setting DB
+	pg := cs.NewPG(c)
+	defer pg.Close()
+
+	// Setting Migrations
+	err := pgMigrate(c)
+	if err != nil {
+		return err
+	}
+
+	// Setting template renderer
+	re := multitemplate.NewRenderer()
+
+	// Setting TemplateManager
+	// Setting i18n (must be before template manager for helper registration)
+	i18nSvc := newI18n()
+
+	stremios.Configure(c)
+
+	// Setting Payments client (shared by profile and donate) and the offers
+	// built on its storefront catalog. Before the template manager: every
+	// upsell template reads the offers through its helper.
+	payClient := npg.New(c)
+	var offerSrc offer.Source
+	if payClient != nil {
+		offerSrc = payClient
+	}
+	offers := offer.New(offerSrc, donate.Checkout(c))
+	offers.Start()
+	defer offers.Close()
+
+	tm := template.NewManager[*w.Context](re).
+		WithHelper(w.NewHelper(c)).
+		WithHelper(umami.NewHelper(c)).
+		WithHelper(rec.NewHelper(c)).
+		WithHelper(si18n.NewHelper(i18nSvc)).
+		WithHelper(turnstile.NewHelper(c)).
+		WithHelper(stremios.NewHelper()).
+		WithHelper(offer.NewHelper(offers, func(lang, key string, data map[string]any) string {
+			return si18n.TranslateWithLocalizerData(i18nSvc.Localizer(lang), key, data)
+		}))
+
+	// The React app answers the views it has pages for (WEB_UI=react, or
+	// ?ui=react for one browser); the rest keep rendering from templates.
+	spaSvc := spa.New(c, tm)
+	wspa.RegisterPages(spaSvc, c, offers)
+	tm.WithHelper(spa.NewHelper(spaSvc)).WithTakeover(spaSvc)
+
+	var servers []cs.Servable
+	// Setting Probe
+	probe := cs.NewProbe(c)
+	if probe != nil {
+		servers = append(servers, probe)
+		defer probe.Close()
+	}
+
+	// Setting Pprof
+	pprof := cs.NewPprof(c)
+	if pprof != nil {
+		servers = append(servers, pprof)
+		defer pprof.Close()
+	}
+
+	// Setting Prom
+	prom := cs.NewProm(c)
+	if prom != nil {
+		servers = append(servers, prom)
+		defer prom.Close()
+	}
+
+	// Setting Gin. The metrics middleware wraps recovery on purpose: it
+	// reads the status once the chain returns, and a panic returns through
+	// recovery, which writes the 500 (metrics.Middleware).
+	r := gin.New()
+	// The access log without the credentials some paths carry (w.AccessLog).
+	r.Use(w.AccessLog(), metrics.Middleware(), gin.CustomRecovery(w.RecoverToLog))
+	r.Use(w.ErrorHandler(tm.MustRegisterViews("error/*").WithLayout("main")))
+	s3Hosts := s3svc.Hosts(c)
+	apiHosts := libapi.Hosts(c)
+	// Both protocol hosts are exempt from the canonical-domain redirect, or
+	// every request to them answers 302 instead of doing the work.
+	if redirect := w.RedirectNonCanonical(c.String(common.DomainFlag), c.String(w.RedirectDomainFlag), append(append([]string{}, s3Hosts...), apiHosts...)...); redirect != nil {
+		r.Use(redirect)
+	}
+	r.Use(w.NoindexDefault(c.Bool(w.StagingFlag)))
+	if fa := w.FrameAncestors(c.String(w.FrameAncestorsFlag)); fa != nil {
+		r.Use(fa)
+	}
+	r.RedirectTrailingSlash = false
+	r.HTMLRender = re
+
+	// Setting Web
+	web, err := w.New(c, r)
+	if err != nil {
+		return err
+	}
+	servers = append(servers, web)
+	defer web.Close()
+
+	// Setting i18n handler (HTTP middleware + Gin middleware). The dedicated
+	// API hosts bypass language routing entirely — a lang cookie must never
+	// 302 api.<domain>/v1/... onto a /ru/ URL.
+	hi18n.RegisterHandler(r, web, i18nSvc, apiHosts)
+
+	// Setting S3 host routing — before the session middleware, whose CSRF
+	// exemption is keyed on the /s3 prefix this rewrite produces.
+	s3svc.RegisterHostMiddleware(r, s3Hosts, s3svc.MountPath)
+
+	// Setting API host routing — same reasoning as S3 above: it has to run
+	// before the session middleware, whose CSRF exemption is keyed on the /api
+	// prefix this rewrite produces.
+	libapi.RegisterHostMiddleware(r, apiHosts, libapi.HostPrefix)
+
+	// Setting Static — after the host rewrites above (on the S3 and API hosts
+	// /assets/... is theirs, not ours) and before everything below: gin
+	// applies Use() only to routes registered after it, and the session
+	// (Redis), SuperTokens, the user lookup (Postgres) and the claims
+	// (claims-provider, Postgres) are of no use to a file on disk. Registered
+	// after them, the files answered 503 whenever claims-provider could not
+	// reach Postgres (2026-10-05 03:36–03:41Z, /assets and the manifest too).
+	err = sta.RegisterHandler(c, r)
+	if err != nil {
+		return err
+	}
+
+	if err := requireSessionSecret(c); err != nil {
+		return err
+	}
+
+	// Setting URL Alias
+	ual := ua.New(pg, r)
+	ual.RegisterHandler(r)
+
+	err = sess.RegisterHandler(c, r, []string{
+		"/auth/dashboard",
+		"/s/",
+		"/token/",
+		"/webdav/",
+		"/s3/",
+		"/api/",
+		"/transcoder-session/",
+	})
+	if err != nil {
+		return err
+	}
+	r.Use(metrics.Mark("sess"))
+
+	// Setting Auth
+	a := auth.New(c, cl, pg)
+
+	if a != nil {
+		err := a.Init()
+		if err != nil {
+			return err
+		}
+		// Surfaces that own their own wildcard, credential-less CORS — the
+		// SuperTokens policy must not answer for them: it 403s any origin
+		// but the site's own before their route group can run.
+		//   /api/v1  — JSON API (bearer-auth, PATCH);
+		//   /stremio — addon endpoints called by Stremio web/desktop, which
+		//              send Origin (incident 2026-09-03: 403 on every call);
+		//   /token/  — the access-token rewrite in front of the same
+		//              surfaces; the path is still /token/<id>/stremio/…
+		//              when this middleware runs.
+		a.RegisterHandler(r, libapi.MountPath, "/stremio/", "/token/")
+	}
+	r.Use(metrics.Mark("auth"))
+
+	// Setting S3 access key extraction — must run before the access token
+	// middleware below, which is what it feeds (see services/s3).
+	s3svc.RegisterAccessKeyMiddleware(r, s3svc.MountPath)
+
+	// Setting API key extraction — same rule: it feeds the access token
+	// middleware below, so it has to run first.
+	libapi.RegisterAPIKeyMiddleware(r, libapi.MountPath)
+
+	// Setting Access Token
+	ats := at.New(pg)
+	ats.RegisterHandler(r)
+	r.Use(metrics.Mark("token"))
+
+	// Setting Claims Client
+	cpCl := claims.NewClient(c)
+	if cpCl != nil {
+		defer cpCl.Close()
+	}
+
+	// Setting NATS
+	nats := cs.NewNATS(c)
+	if nats != nil {
+		defer nats.Close()
+	}
+
+	// Setting UserClaims
+	uc := claims.New(c, cpCl, pg)
+	if uc != nil {
+		// Setting UserClaimsHandler
+		uc.RegisterHandler(r)
+	}
+	r.Use(metrics.Mark("claims"))
+
+	// Setting S3 Client
+	s3Cl := cs.NewS3Client(c, cl)
+
+	// Setting Api
+	sapi := api.New(c, cl)
+
+	// Setting ApiClaimsHandler
+	sapi.RegisterHandler(r)
+
+	// Setting Migration from v1 to v2
+	wm.RegisterHandler(r)
+
+	// Setting Redis
+	redis := cs.NewRedisClient(c)
+	defer redis.Close()
+
+	// Setting AuthHandlers
+	if a != nil {
+		wau.RegisterHandler(r, tm, a, redis.Get())
+	}
+
+	// Setting the whole-interface auth gate (self-hosted; off by default).
+	//
+	// Placement is deliberate and load-bearing: gin applies Use() only to
+	// routes registered after it, and everything a signed-out visitor still
+	// needs is registered above — the static assets (sta.RegisterHandler) and
+	// the login form itself (wau.RegisterHandler). Move this call earlier and
+	// the login page arrives without its stylesheet and without a way to log
+	// in.
+	//
+	// The exempt prefixes are of two kinds, and the difference matters when
+	// judging a new one. Most carry their own authentication: the JSON API
+	// checks its key, the Stremio addon its token, S3 its signature. /donate
+	// carries none -- it is exempt because it is meant to be public, which is
+	// a deliberate policy rather than an oversight. Everything else added
+	// later is closed by default, which is the direction we want a mistake
+	// to fall.
+	if c.Bool(common.OnlyAuthorized) {
+		r.Use(auth.OnlyAuthorized(onlyAuthorizedExempt()...))
+	}
+
+	// Setting shared AI client (nil when no provider API key is configured).
+	// Consumed by both AI recommendations and AI enrichment.
+	aiCl := ac.New(c)
+
+	// Setting Enricher
+	en := makeEnricher(c, cl, pg, sapi, aiCl)
+
+	// Setting UserSubtitle service. Returns nil when the deployment is not
+	// configured with USER_SUBTITLE_S3_BUCKET; jobs and handlers then treat
+	// the feature as disabled.
+	userSubtitleSvc := usv.New(c, s3Cl, pg)
+
+	// Setting ThumbnailService — generates a resource preview at stream
+	// prep time when the resource has no IMDb-matched poster. Same nil-safe
+	// pattern as userSubtitleSvc: New returns nil when the bucket isn't
+	// configured, callers branch via Enabled().
+	thumbnailSvc := thumb.New(c, s3Cl, pg, sapi, cl)
+
+	// Setting UserSettings. Thin lazymap-backed cache over the
+	// user_settings row; read on the hot path (poster_resolver,
+	// templates), written on profile-toggle submit. Middleware
+	// stashes the loaded row into the gin context so web.NewContext
+	// picks it up without an extra DB lookup per handler.
+	userSettingsSvc := usettings.New(pg)
+	r.Use(usettings.Middleware(userSettingsSvc), metrics.Mark("settings"))
+
+	// Setting Vault API early: the onboarding middleware below needs to know
+	// whether Vault is configured, and vault.New is nil exactly when this is.
+	vaultApi := vault.NewApi(c, cl)
+
+	// Setting Onboarding. Derives the activation checklist from existing
+	// feature tables and keeps no state of its own. Mounted globally, before
+	// any route is registered, because the navbar shows a progress counter on
+	// every page — and after auth/claims, which the resolver reads.
+	onboardingSvc := onboarding.New(pg, vaultApi != nil, offers)
+	r.Use(w.OnboardingMiddleware(onboardingSvc))
+
+	// Mounted here for the same reason the onboarding middleware above is:
+	// gin's r.Use only applies to routes registered after it, and the navbar
+	// renders on every page. vaultApi != nil is the existing source of truth
+	// for whether vault is configured -- do not introduce a second one.
+	vaultConfigured := vaultApi != nil
+	r.Use(func(c *gin.Context) {
+		w.SetVaultEnabled(c, vaultConfigured)
+		c.Next()
+	})
+
+	// Setting Notification. Built here (earlier than the rest of the
+	// notification wiring below) so the unread-count middleware right after
+	// it can close over a real Service before any route is registered — pg
+	// and i18nSvc are both already available this early.
+	ns := notification.New(c, pg.Get(), i18nSvc)
+
+	// Counted per request so the badge is never stale. Anonymous users and
+	// store errors both fall through to zero rather than blocking the page:
+	// a missing badge is a smaller failure than a page that will not render.
+	r.Use(func(c *gin.Context) {
+		if u := auth.GetUserFromContext(c); u != nil && u.HasAuth() {
+			if n, err := ns.CountUnread(c.Request.Context(), u.ID); err == nil {
+				w.SetUnreadNotifications(c, n)
+			}
+		}
+		c.Next()
+	}, metrics.Mark("notif"))
+
+	// Setting JobQueues
+	queues := job.NewQueues(job.NewStorage(redis, gin.Mode()))
+
+	streamPrefs := streamprefs.New(c, pg)
+	// Setting CacheIndex. Before the jobs: stream and download starts report
+	// to it (jobs/scripts/cache_note.go).
+	cacheIndex := ci.New(c, pg)
+
+	jobs := jj.New(c, queues, tm, sapi, en, i18nSvc, userSubtitleSvc, thumbnailSvc, uc, streamPrefs, cacheIndex)
+
+	// Setting JobHandler
+	wj.RegisterHandler(r, queues)
+
+	// Setting AbuseStore
+	asc := as.New(c)
+
+	// Setting Turnstile
+	ts := turnstile.New(c)
+	actionTS := turnstile.NewAction(c)
+
+	if asc != nil {
+		defer asc.Close()
+		// Setting Support
+		support.RegisterHandler(r, tm, asc, ts)
+
+		// Setting Legal
+		legal.RegisterHandler(r, tm)
+	}
+
+	// Setting About
+	about.RegisterHandler(r, tm)
+
+	// Setting Speedtest
+	speedtest.RegisterHandler(r, tm, sapi, pg, offers)
+
+	// Setting DomainSettings
+	ds, err := embed.NewDomainSettings(c, pg, uc)
+	if err != nil {
+		return err
+	}
+
+	// Setting Vault (vaultApi is built earlier — the onboarding middleware
+	// needs to know whether Vault is configured before any route is mounted)
+	v := vault.New(c, vaultApi, uc, cl, pg, sapi)
+
+	// Setting VaultHandler
+	if v != nil {
+		vh.RegisterHandler(r, v, tm, pg)
+	}
+
+	// Setting the /trial short link (the Stremio paywall clip's QR code).
+	// Before ResourceHandler: its /:resource_id would take "trial" as an id.
+	trial.RegisterHandler(r, offers)
+
+	// Setting ResourceHandler
+	wr.RegisterHandler(c, r, tm, sapi, jobs, pg, v, en, offers)
+
+	// Setting IndexHandler
+	wi.RegisterHandler(r, tm, pg)
+
+	// Setting UserVideoStatus service
+	uvs := uvss.New(pg.Get())
+
+	// Setting UserVideoStatusHandler (manual mark/unmark)
+	uvsh.RegisterHandler(r, uvs)
+
+	// Setting WatchHistoryHandler
+	wh.RegisterHandler(r, pg, uvs)
+
+	// Setting SitemapHandler
+	sitemap.RegisterHandler(c, r)
+
+	// Setting ActionHandler
+	wa.RegisterHandler(r, tm, jobs, sapi, actionTS, streamPrefs)
+
+	// Setting release subscriptions. One service, two surfaces: the profile
+	// lists them, the Discover app and the resource banner create them.
+	releaseSubSvc := rss.New(pg, en, ns, c.String(common.DomainFlag), c.String(common.SessionSecretFlag))
+	release_subscription.RegisterHandler(r, tm, pg, releaseSubSvc)
+
+	// Setting NotificationHandler (the in-app feed behind the navbar bell —
+	// ns is the same Service the unread-count middleware above reads from).
+	notifications.RegisterHandler(r, tm, ns, donate.Billing(c), offers)
+
+	// Setting ProfileHandler
+	p.RegisterHandler(c, r, tm, a, ats, ual, pg, uc, v, userSettingsSvc, payClient, releaseSubSvc, ns, redis.Get())
+
+	// Setting device authorization confirmation page (the human half of the
+	// device flow; the API half lives in handlers/api)
+	wdev.RegisterHandler(r, tm, pg, redis.Get())
+
+	// Setting EmbedDomainHandler
+	err = embed_domain.RegisterHandler(c, r, pg)
+	if err != nil {
+		return err
+	}
+
+	// Setting EmbedExamplesHandler
+	wee.RegisterHandler(c, r, tm)
+
+	// Setting EmbedHandler
+	we.RegisterHandler(c, cl, r, tm, jobs, ds, sapi)
+
+	// Setting ExtHandler
+	ext.RegisterHandler(r, tm)
+
+	// Setting Donate (crypto checkout appears when the gateway is configured)
+	donate.RegisterHandler(c, r, tm, payClient, jobs)
+
+	// Setting RequestURLMapper
+	requestURLMapper, err := rum.NewRequestURLMapper(c)
+	if err != nil {
+		return err
+	}
+
+	// Setting StremioBuilder
+	stremioAddonCl := stremios.NewClient(c)
+
+	// Setting Torznab
+	torznabCl := torznab.New(c)
+	torznabTitles := torznab.NewCinemetaTitles(torznabCl.HTTP(), c.String(torznab.UserAgentFlag))
+	torznabValidator := torznab.NewValidator(torznabCl)
+
+	sb := stremios.NewBuilder(c, pg, stremioAddonCl, sapi, requestURLMapper, torznabCl, torznabTitles)
+
+	// Setting AI Recommendations (Discover)
+	//
+	// rec.New returns nil when the feature flag is off or
+	// no provider API key is configured. In that case we skip handler
+	// registration entirely — the routes simply don't exist.
+	//
+	// Built before Discover because the page has to be told: its chips
+	// arrive over an EventSource, which cannot see an HTTP status, so an
+	// unregistered route reaches the browser as a closed connection and is
+	// indistinguishable from a network blip. Left to infer, the section drew
+	// itself and then reported a failure on an instance that simply has no
+	// API key.
+	recSvc := rec.New(c, aiCl, pg, redis, en, en)
+	if recSvc != nil {
+		discover_ai.RegisterHandler(r, recSvc)
+	}
+
+	// Setting Discover. The transcoder's HEVC passthrough answer is read in
+	// the background (services/transcodercaps); a page never waits for it.
+	caps := transcodercaps.New(c)
+	caps.Start()
+	defer caps.Close()
+	discover.RegisterHandler(r, tm, pg, en, sb, recSvc != nil, cacheIndex, caps)
+
+	// Setting Discover Watchlist
+	discover_watchlist.RegisterHandler(r, pg, en)
+
+	// Setting Library
+	library.RegisterHandler(c, r, tm, sapi, pg, jobs, cl, s3Cl, en, thumbnailSvc)
+
+	// Setting UserSubtitle handler. When AWS_USER_SUBTITLE_BUCKET is not
+	// set the service is nil; RegisterHandler skips its routes and the UI
+	// hides the feature.
+	ush.RegisterHandler(r, tm, userSubtitleSvc, sapi)
+
+	// Setting AddonValidator with custom client and cli context
+	av := stremios.NewAddonValidator(c, stremioAddonCl)
+
+	// Setting LinkResolver
+	linkResolver := lr.New(cl, pg, sapi, cacheIndex)
+
+	// Setting Stremio (offers: a free viewer's click on a stream only Webtor
+	// can serve plays the paywall clip when a plan with a trial is on sale)
+	err = stremio.RegisterHandler(c, r, ats, sb, pg, linkResolver, offers)
+	if err != nil {
+		return err
+	}
+
+	// Setting Handler
+	err = stremio_addon_url.RegisterHandler(c, av, r, pg)
+	if err != nil {
+		return err
+	}
+
+	// Setting Torznab Indexers
+	err = torznab_indexer.RegisterHandler(c, torznabValidator, r, pg)
+	if err != nil {
+		return err
+	}
+
+	// Setting Stremio Settings
+	settings.RegisterHandler(r, ats, pg)
+
+	// Setting Streaming Backends
+	backends.RegisterHandler(r, ats, pg, linkResolver)
+
+	// Setting WebDAV
+	webdav.RegisterHandler(c, r, pg, ats, sapi, jobs)
+
+	// Setting S3 (same library tree as WebDAV, different protocol)
+	s3.RegisterHandler(c, r, pg, ats, sapi, jobs)
+
+	// Setting JSON API (same library tree again, plus vault and profile)
+	japi.RegisterHandler(c, r, pg, ats, sapi, jobs, v, userSettingsSvc, redis.Get())
+
+	// Setting Tests
+	tests.RegisterHandler(r, tm)
+
+	// Setting Instructions
+	instructions.RegisterHandler(c, r, tm, v)
+
+	// Setting Events
+	if nats != nil {
+		eh := event.New(c, nats, pg, v, uc, ns, donate.Billing(c), offers, cacheIndex)
+		if eh != nil {
+			servers = append(servers, eh)
+			defer eh.Close()
+		}
+	}
+
+	// Render templates
+	err = tm.Init()
+	if err != nil {
+		return err
+	}
+
+	// Setting Memwatch — in-process heap-spike profiler (plain goroutine,
+	// deliberately not a cs.Servable: diagnostics must never take the
+	// process down)
+	if mw := memwatch.New(c); mw != nil {
+		mwCtx, mwCancel := context.WithCancel(context.Background())
+		defer mwCancel()
+		go mw.Serve(mwCtx)
+	}
+
+	// Setting Serve
+	serve := cs.NewServe(servers...)
+
+	// And SERVE!
+	err = serve.Serve()
+	if err != nil {
+		log.WithError(err).Error("got server error")
+	}
+	// Drain HTTP before the deferred closes run: defers go in reverse, so
+	// Redis, NATS and the rest would otherwise be gone while the last
+	// requests are still being served.
+	web.Close()
+	return err
+}
+
+// onlyAuthorizedExempt lists the paths that stay reachable without a session
+// when ONLY_AUTHORIZED puts the rest of the interface behind a login. Each one
+// authenticates by its own means, so gating it here would break the mechanism
+// without adding any protection:
+//
+//   - /api/v1 checks an API key issued on the profile page;
+//
+//   - /stremio carries the addon token in its own URL;
+//
+//   - /s3 verifies a request signature;
+//
+//   - /embed is decided by the embed domain list on the profile page. A
+//     third-party iframe has no session with this instance, so a redirect to
+//     the login form would only render a broken player; with
+//     EMBED_ONLY_AUTHORIZED on, a domain that is not on the list gets the
+//     embed/unauthorized template instead, which a human can read.
+//
+//   - /profile/email/verify carries its own single-use token in the URL, the
+//     same shape /stremio uses. The link is clicked out of a mail client, in
+//     whatever browser that opens — often one with no session here — so
+//     gating it answers the confirmation with a login form and loses it.
+//     Deliberately narrower than /profile: only this subtree opens.
+//
+//   - /donate is the one entry that authenticates nothing. Asking someone to
+//     sign in before they may give money is backwards, and on an instance
+//     whose whole interface is gated the page would otherwise be unreachable
+//     for exactly the visitors most likely to want it. It exposes no user
+//     data: the handler renders payment options and takes a checkout.
+//
+// Kept as a named function rather than inline so the policy is greppable and
+// can be asserted in a test.
+func onlyAuthorizedExempt() []string {
+	return []string{libapi.MountPath, "/stremio", s3svc.MountPath, "/embed", "/donate", "/profile/email/verify"}
+}
+
+// requireSessionSecret refuses to start without SESSION_SECRET.
+//
+// The flag used to carry a working default, so an operator who never set it
+// got a healthy-looking instance keyed on a value published in this
+// repository. That one value signs five independent things — the session
+// cookie store, the CSRF token, the Stremio playback JWT, the unsubscribe
+// JWT, and (via the S3_SIGNING_SECRET fallback) the derivation of every
+// user's S3 secret access key — so the failure was total and silent.
+//
+// A missing signing key is a missing dependency, not a defaultable knob:
+// explain it at startup rather than paper over it. Production sets it
+// already, so this changes nothing there; it is self-hosted deployments that
+// were running on the default.
+func requireSessionSecret(c *cli.Context) error {
+	if strings.TrimSpace(c.String(common.SessionSecretFlag)) != "" {
+		return nil
+	}
+	return errors.Errorf(
+		"SESSION_SECRET is not set.\n\n" +
+			"It signs session cookies, CSRF tokens, Stremio playback links, " +
+			"unsubscribe links, and (unless S3_SIGNING_SECRET is set separately) " +
+			"every user's S3 secret key. There is deliberately no default: a " +
+			"shared one would make all of those forgeable by anyone.\n\n" +
+			"Generate one and pass it as SESSION_SECRET, for example:\n" +
+			"    SESSION_SECRET=$(openssl rand -hex 32)\n\n" +
+			"Note that changing it later invalidates every existing session " +
+			"and every issued S3 credential.")
+}

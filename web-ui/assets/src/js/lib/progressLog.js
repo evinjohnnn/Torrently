@@ -1,0 +1,399 @@
+import loadAsyncView from "./loadAsyncView";
+class Entry {
+    constructor(sdk, tag) {
+        this.sdk = sdk;
+        this.tag = tag;
+    }
+    inProgress(tag, message = null) {
+        return this.sdk.inProgress(tag, message);
+    }
+    updateStatus(status) {
+        return this.sdk.updateStatus(this.tag, status);
+    }
+    done(message = null) {
+        return this.sdk.done(this.tag, message);
+    }
+    warn(message = null) {
+        return this.sdk.warn(this.tag, message);
+    }
+    error(message = null) {
+        return this.sdk.error(this.tag, message);
+    }
+    info(message = null) {
+        return this.sdk.info(message);
+    }
+    close() {
+        return this.sdk.close();
+    }
+}
+class SDK {
+    constructor(onMessage) {
+        this.onMessage = onMessage;
+    }
+    clear() {
+        return this.push({level: 'clear'});
+    }
+    close() {
+        return this.push({level: 'close'});
+    }
+    info(message = null) {
+        return this.push({level: 'info', message});
+    }
+    inProgress(tag, message = null) {
+        return this.push({level: 'inprogress', message, tag});
+    }
+    updateStatus(tag, status) {
+        return this.push({level: 'statusupdate', status, tag});
+    }
+    done(tag, message = null) {
+        return this.push({level: 'done', tag, message});
+    }
+    warn(tag, message = null) {
+        return this.push({level: 'warn', message, tag});
+    }
+    error(tag, message = null) {
+        return this.push({level: 'error', message, tag});
+    }
+    push(data) {
+        this.onMessage(data);
+        return new Entry(this, data.tag);
+    }
+}
+import { rebindAsync } from './async';
+import { clearBusyFor } from './actionBusy';
+
+// byAttr: the element under root whose attribute is exactly value. A job's tag
+// is its step's own words (services/job: InProgress tags by the message), so
+// it never goes into a selector: an apostrophe -- "Getting the torrent's
+// details", French "l'URL du flux", Italian "dell'inizio" -- made
+// querySelector throw, and the whole message was lost, a no-peers or
+// download card included.
+function byAttr(root, name, value) {
+    for (const n of root.querySelectorAll(`[${name}]`)) {
+        if (n.getAttribute(name) === value) return n;
+    }
+    return null;
+}
+
+export function initProgressLog(el, func) {
+    const r = new Renderer(el, func);
+    function onMessage(data) {
+        r.renderMessage(data);
+    }
+
+    let src = null;
+    const url = el.getAttribute('data-async-progress-log');
+    if (url) {
+        src = new EventSource(url, {
+            withCredentials: true,
+        });
+        src.onmessage = (ev) => {
+            const data = JSON.parse(ev.data);
+            onMessage(data);
+            if (data.level === 'close') src.close();
+        };
+    }
+    const sdk = new SDK(onMessage);
+    sdk.destroy = () => { if (src) { src.close(); src = null; } };
+    return sdk;
+}
+
+class Renderer {
+    constructor(el, func = null) {
+        this.inited = false;
+        this.el = el;
+        this.func = func;
+        this.lt = el.querySelector('.log-target');
+        // A host rendered with partials/job_log.html has a .job-stage: one
+        // line in plain words for the running step, with its countdown or
+        // percent and a bar; the steps folded under "Show steps"; notes,
+        // cards and verdicts outside the fold. Every host has it but the
+        // embed's (embed off on prod from 2026-11-01), which keeps the plain
+        // log.
+        this.stage = el.querySelector('.job-stage');
+        this.results = (this.stage && el.querySelector('.job-results')) || this.lt;
+        this.announcer = this.stage ? el.querySelector('[data-job-announce]') : null;
+        for (const close of el.querySelectorAll('.closeable-close')) {
+            close.addEventListener('click', () => {
+                el.classList.add('hidden');
+            });
+        }
+    }
+    // setStage: the step now running is the line on top -- its words, no
+    // number yet, a bar without a value (indeterminate). Said once to a
+    // screen reader; the per-second numbers are not.
+    setStage(tag, title) {
+        if (!this.stage) return;
+        this.stageTag = tag;
+        this.stage.hidden = false;
+        this.stage.classList.remove('job-stage-done');
+        this.stage.querySelector('.job-stage-title').textContent = title;
+        this.stage.querySelector('.job-stage-meta').textContent = '';
+        this.stage.querySelector('.job-stage-bar').removeAttribute('value');
+        this.say(title);
+    }
+    // stageStatus: the running step's countdown or percent -- the percent
+    // fills the bar.
+    stageStatus(data) {
+        if (!this.stage || data.tag !== this.stageTag) return;
+        const status = data.status || '';
+        this.stage.querySelector('.job-stage-meta').textContent = status;
+        const bar = this.stage.querySelector('.job-stage-bar');
+        const pct = /(\d+)\s*%/.exec(status);
+        if (pct) bar.value = Number(pct[1]);
+        else bar.removeAttribute('value');
+    }
+    // endStage: a card or a verdict is the answer now -- the line goes, and
+    // the notes about the wait with it: "we're getting it from peers" over
+    // "nobody is sharing this torrent" said two things at once (stage,
+    // 2026-10-18).
+    endStage() {
+        if (!this.stage) return;
+        this.stage.hidden = true;
+        for (const n of this.results.querySelectorAll('pre.info-summary')) n.remove();
+    }
+    say(text) {
+        if (this.announcer && text) this.announcer.textContent = text;
+    }
+    addCustom(data) {
+        const el = byAttr(this.results, 'task-custom', data.tag);
+        if (el) return;
+        const div = document.createElement('div');
+        div.setAttribute('task-custom', data.tag);
+        this.results.appendChild(div);
+        this.endStage();
+        loadAsyncView(div, data.body);
+        // A card is a verdict too (no peers, too slow): its heading, said
+        // once. Only a heading -- the download card has none and starts with
+        // a <script> holding the link, api-key and token, which textContent
+        // would have read out; its verdict is the summary before it.
+        const h = div.querySelector('h1, h2, h3');
+        if (h) this.say(h.textContent.replace(/\s+/g, ' ').trim());
+        const closes = div.querySelectorAll('.closeable-close');
+        for (const close of closes) {
+            close.addEventListener('click', () => {
+                this.el.classList.add('hidden');
+            });
+        }
+        if (closes.length) {
+            // A card that brings its own "got it" (no-peers, dead magnet)
+            // owns the footer: the host's close link would stand right
+            // under it as a second "got it" (home page log, 2026-09-04).
+            this.customClose = true;
+            this.hideClose();
+        }
+    }
+    addSummary(data) {
+        if (!data.message) return;
+        const el = byAttr(this.results, 'task-summary', data.tag);
+        if (el) return;
+        const pre = document.createElement('pre');
+        const line = document.createElement('span');
+        line.classList.add('line');
+        pre.appendChild(line);
+        line.innerText = data.message;
+        const classList = [data.level + "-summary"];
+        pre.setAttribute('task-summary', data.tag);
+        for (const cl of classList) {
+            pre.classList.add(cl);
+        }
+        this.results.appendChild(pre);
+        this.endStage();
+        this.say(data.message);
+    }
+    // addNote: a job's info line is something to read, not a step -- "we
+    // don't have this torrent yet", "still waiting, you can close this
+    // page". With a stage it goes under the line, and the line stays: a note
+    // is not the answer. Its words tell one from another: services/job tags
+    // an info with the step before it, which is also why addLine drops it
+    // as that step's repeat -- in the plain log nobody ever saw one.
+    addNote(data) {
+        if (!this.stage || !data.message) return;
+        if (byAttr(this.results, 'task-note', data.message)) return;
+        const pre = document.createElement('pre');
+        const line = document.createElement('span');
+        line.classList.add('line');
+        pre.appendChild(line);
+        line.textContent = data.message;
+        pre.classList.add('info-summary');
+        pre.setAttribute('task-note', data.message);
+        this.results.appendChild(pre);
+        this.say(data.message);
+    }
+    addLine(data) {
+        const el = byAttr(this.lt, 'task-tag', data.tag);
+        if (el) return;
+        const pre = document.createElement('pre');
+        const line = document.createElement('span');
+        line.classList.add('line');
+        pre.appendChild(line);
+        line.innerText = data.message;
+        const classList = [data.level];
+        for (const cl of classList) {
+            pre.classList.add(cl);
+        }
+        if (data.tag) {
+            pre.setAttribute('task-tag', data.tag);
+        }
+        const status = document.createElement('span');
+        status.classList.add('task-status');
+        line.appendChild(status);
+        this.lt.appendChild(pre);
+        if (data.level === 'inprogress') this.setStage(data.tag, data.message);
+    }
+
+    updateLine(data) {
+        const el = byAttr(this.lt, 'task-tag', data.tag);
+        if (!el) return;
+        el.classList = [];
+        const classList = [data.level];
+        for (const cl of classList) {
+            el.classList.add(cl);
+        }
+        let span = el.querySelector('span.task-status');
+
+        if (data.status) {
+            span.innerText = `${data.status}`;
+        } else {
+            span.innerText = `${data.level}`;
+        }
+        if (data.level === 'statusupdate') this.stageStatus(data);
+    }
+
+    showClose() {
+        if (this.customClose) return;
+        const wrapper = this.el.querySelector('.alert-close-wrapper');
+        if (!wrapper) return;
+        wrapper.classList.remove('hidden');
+    }
+    enableError() {
+        const wrapper = this.el.querySelector('.alert-close-wrapper');
+        if (!wrapper) return;
+        const errorEl = wrapper.querySelector('.error');
+        if (errorEl) errorEl.classList.remove('hidden');
+    }
+    disableError() {
+        const wrapper = this.el.querySelector('.alert-close-wrapper');
+        if (!wrapper) return;
+        const errorEl = wrapper.querySelector('.error');
+        if (errorEl) errorEl.classList.add('hidden');
+    }
+
+    hideClose() {
+        const wrapper = this.el.querySelector('.alert-close-wrapper');
+        if (!wrapper) return;
+        this.el.querySelector('.alert-close-wrapper').classList.add('hidden');
+    }
+
+    renderMessage(data) {
+        if (data.level === 'clear') {
+            this.lt.textContent = '';
+            this.el.classList.add('hidden');
+            this.hideClose();
+            this.disableError();
+            this.inited = false;
+            this.rendered = false;
+            if (this.results !== this.lt) this.results.textContent = '';
+            this.endStage();
+            this.stageTag = null;
+        } else if (!this.inited) {
+            this.inited = true;
+            this.el.classList.remove('hidden');
+        }
+        // The job is over, whichever way it went: the button that started it
+        // goes back to being a button (actionBusy.js). Every ending counts --
+        // `error` (no peers, the cap modal), `rendertemplate`, `download`,
+        // `redirect`, `close`. A rendered player too, before it can play:
+        // held until canplay (prod 2026-10-15 07:23-07:49Z), the button was
+        // dead while a player that never got there stayed hidden -- and on
+        // the build before, 11% of Watch sessions played only after a second
+        // press with no card in between. First in renderMessage, so a throw
+        // further down can never leave a button working for a job that has
+        // finished.
+        if (data.level === 'rendertemplate') this.rendered = true;
+        if (data.level === 'error' || data.level === 'download' || data.level === 'redirect'
+            || data.level === 'rendertemplate' || (data.level === 'close' && !this.rendered)) {
+            clearBusyFor(this.el);
+        }
+        if (data.level === 'close') {
+            this.showClose();
+            // Over with nothing to show: the line stops spinning. A rendered
+            // player is still loading (app/action.js hides the log when it
+            // can play), so its line keeps going.
+            if (this.stage && !this.rendered) this.stage.classList.add('job-stage-done');
+        }
+        if (data.level === 'redirect') {
+            this.addSummary(data);
+            // Form-hosted progress logs (homepage magnet load, embed) can
+            // redirect through async-forms by setting action+requestSubmit;
+            // div-hosted ones (action flows that allow nested forms in custom
+            // partials) fall back to a plain location change.
+            if (this.el.tagName === 'FORM') {
+                this.el.setAttribute('action', data.location);
+                this.el.requestSubmit();
+            } else {
+                // Div hosts (nested-form friendly, see partials/load/progress)
+                // navigate asynchronously too: a throwaway link into the
+                // host's target, with the host's hidden inputs (file-idx)
+                // carried as query params — what the form path did.
+                const target = this.el.getAttribute('data-async-target');
+                if (!target) {
+                    window.location.href = data.location;
+                    return;
+                }
+                const u = new URL(data.location, window.location.origin);
+                for (const inp of this.el.querySelectorAll('input[type=hidden]')) {
+                    if (inp.name) u.searchParams.set(inp.name, inp.value);
+                }
+                const a = document.createElement('a');
+                a.href = u.toString();
+                a.setAttribute('data-async-target', target);
+                a.classList.add('hidden');
+                this.el.appendChild(a);
+                rebindAsync(this.el);
+                a.click();
+            }
+        }
+        if (data.level === 'rendertemplate') {
+            data.render = (el) => {
+                loadAsyncView(el, data.body);
+            };
+        }
+        if (data.level === 'custom') {
+            this.addCustom(data);
+        }
+        if (data.level === 'download') {
+            this.addSummary(data);
+            window.location = data.location;
+        }
+        if (data.level === 'info') {
+            this.addLine(data);
+            this.addNote(data);
+        }
+        if (data.level === 'inprogress') {
+            this.addLine(data);
+        }
+        if (data.level === 'skip') {
+            this.addLine(data);
+        }
+        if (data.level === 'done') {
+            this.updateLine(data);
+            this.addSummary(data);
+        }
+        if (data.level === 'statusupdate') {
+            this.updateLine(data);
+        }
+        if (data.level === 'warn') {
+            this.updateLine(data);
+            this.addSummary(data);
+        }
+        if (data.level === 'error') {
+            this.updateLine(data);
+            this.addSummary(data);
+            this.enableError();
+        }
+        if (this.func) {
+            this.func.call(this, data);
+        }
+    }
+}

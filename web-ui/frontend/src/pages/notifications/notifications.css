@@ -1,0 +1,75 @@
+.feed .note {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 16px 18px;
+}
+.note-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.note-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--olive);
+  transform: translateY(-2px);
+}
+.note-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 16px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.note.unread .note-title {
+  font-weight: 600;
+}
+.note-time {
+  flex: none;
+  font-size: 13px;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+.note-body {
+  max-width: 72ch;
+  font-size: 15px;
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
+}
+.note.unread .note-body {
+  padding-left: 18px;
+}
+.note-body p + p,
+.note-body ul,
+.note-body ol {
+  margin-top: 8px;
+}
+.note-body ul,
+.note-body ol {
+  margin-bottom: 0;
+  padding-left: 20px;
+}
+.note-body a {
+  font-weight: 500;
+}
+@media (max-width: 640px) {
+  .feed .note {
+    padding: 14px 12px;
+  }
+  .note-head {
+    flex-wrap: wrap;
+  }
+  .note-time {
+    order: 3;
+    flex-basis: 100%;
+    padding-left: 18px;
+  }
+  .note:not(.unread) .note-time {
+    padding-left: 0;
+  }
+}

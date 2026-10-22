@@ -1,0 +1,133 @@
+package libfs
+
+import (
+	"context"
+	"io"
+	"net/url"
+	"strings"
+
+	"github.com/pkg/errors"
+	cs "github.com/webtor-io/common-services"
+	"github.com/webtor-io/web-ui/models"
+	"github.com/webtor-io/web-ui/services/vfs"
+)
+
+type ContentDirectory struct {
+	BaseDirectory
+	*TorrentDirectory
+	Library
+	pg *cs.PG
+}
+
+func (s *ContentDirectory) Open(ctx context.Context, path string) (io.ReadCloser, *url.URL, error) {
+	lr, err := s.getContentItem(ctx, path)
+	if err != nil {
+		return nil, nil, err
+	}
+	if lr == nil {
+		return nil, nil, vfs.NewHTTPError(404, errors.New("file not found"))
+	}
+	return s.TorrentDirectory.Open(ctx, lr.Item.Torrent, lr.NewPath)
+}
+
+func (s *ContentDirectory) Stat(ctx context.Context, path string) (*vfs.FileInfo, error) {
+	lr, err := s.getContentItem(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	if lr == nil {
+		return nil, vfs.NewHTTPError(404, errors.New("file not found"))
+	}
+	if isRoot(lr.NewPath) {
+		return &vfs.FileInfo{
+			Path:    lr.Item.Torrent.Name + "/",
+			ModTime: lr.Item.Torrent.CreatedAt,
+			IsDir:   true,
+		}, nil
+	}
+	fi, err := s.TorrentDirectory.Stat(ctx, lr.Item.Torrent, lr.NewPath)
+	if err != nil {
+		return nil, err
+	}
+	return AddPrefix(fi, lr.Root), nil
+}
+
+func (s *ContentDirectory) ReadDir(ctx context.Context, path string, recursive bool) ([]vfs.FileInfo, error) {
+	if isRoot(path) {
+		ls, err := s.getContentWithContext(ctx)
+		if err != nil {
+			return nil, err
+		}
+		var fis = make([]vfs.FileInfo, len(ls))
+		for i, v := range ls {
+			fis[i] = s.libraryToFileInfo(v)
+		}
+		return fis, nil
+	}
+	lr, err := s.getContentItem(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	if lr == nil {
+		return nil, vfs.NewHTTPError(404, errors.New("file not found"))
+	}
+	fis, err := s.TorrentDirectory.ReadDir(ctx, lr.Item.Torrent, lr.NewPath, recursive)
+	if err != nil {
+		return nil, err
+	}
+	return AddPrefixes(fis, lr.Root), nil
+}
+
+func (s *ContentDirectory) getContentWithContext(ctx context.Context) ([]*models.Library, error) {
+	db := s.pg.Get()
+	if db == nil {
+		return nil, errors.New("db is nil")
+	}
+	wcc, err := getWebContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.GetContent(ctx, db, wcc.User.ID)
+}
+
+func (s *ContentDirectory) getContentItem(ctx context.Context, path string) (*ContentItemResponse, error) {
+	parts := strings.SplitN(strings.TrimPrefix(path, "/"), "/", 2)
+	name := parts[0]
+	db := s.pg.Get()
+	if db == nil {
+		return nil, errors.New("db is nil")
+	}
+	wcc, err := getWebContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	l, err := models.GetLibraryByTorrentName(ctx, db, wcc.User.ID, name)
+	if err != nil {
+		return nil, err
+	}
+	if l == nil {
+		return nil, nil
+	}
+	np := strings.TrimPrefix(path, "/"+l.Torrent.Name)
+	return &ContentItemResponse{
+		Item:    l,
+		NewPath: np,
+		Root:    "/" + name + "/",
+	}, nil
+}
+
+type ContentItemResponse struct {
+	Item    *models.Library
+	NewPath string
+	Root    string
+}
+
+func (s *ContentDirectory) libraryToFileInfo(l *models.Library) vfs.FileInfo {
+	return vfs.FileInfo{
+		Path:    l.Torrent.Name + "/",
+		ModTime: l.Torrent.CreatedAt,
+		IsDir:   true,
+	}
+}
+
+var _ vfs.FileSystem = (*ContentDirectory)(nil)

@@ -1,0 +1,255 @@
+# Project: web-ui (github.com/webtor-io/web-ui)
+
+## Architectural Decisions (web-ui specific)
+
+| Решение | Причина |
+|---------|---------|
+| Интерфейс Torrently — React-приложение (`frontend/`) поверх тех же Go-хендлеров | Переход вида за видом: хендлер строит те же Data, `services/spa` отдаёт приложению оболочку или JSON страницы, у вида без страницы остаётся шаблон. `<head>` (title, canonical, hreflang, og, JSON-LD) рендерят те же блоки шаблона — SEO не меняется. Включается `WEB_UI=react`. См. `docs/react_ui.md` |
+| Классический интерфейс: Go/Gin + HTML templates, Preact, DaisyUI (токены w-*) | Остаётся для видов без React-страницы (embed, ext) и как запасной (`WEB_UI=classic`, `?ui=classic`). Плеер работает на своём классическом коде и встраивается в React-страницу островом (`frontend/src/legacy`) |
+| `data-async` progressive enhancement | Формы работают без JS, async-атрибуты добавляют AJAX поведение поверх |
+| Webpack 5, не Vite | Стабильность, проверенные плагины, нет причин мигрировать |
+| Модели в models/, не в handlers | Чёткое разделение DB-логики. Handlers никогда не делают SQL-запросы напрямую |
+| Two-level handler pattern | HTTP-слой отделён от бизнес-логики. Упрощает тестирование и переиспользование |
+| 4K без перекодирования | Транскодер не кодирует 4K: слишком дорого, стриминг больших файлов нестабилен. 4K H.264 копируется как есть; 4K HEVC — passthrough, только где транскодер отдаёт HEVC (`GET /capabilities`) и страница декларирует `hevc10-2160`. Там Discover показывает 4K, а 4K-свитч держит только 4K-релизы, которые транскодер по имени всё равно отправит старым маршрутом (AV1, DV5, HLG, HDR без `hdr-pq`); в остальных местах свитч с предупреждением держит весь 4K. Свитчи HEVC/HDR в Discover — по тому, что декодирует браузер, не по деплою. См. `docs/discover.md`, «Video switches» |
+| go-i18n + path prefix routing | SEO (каждый язык — отдельный URL), обратная совместимость (EN без префикса), HTTP middleware до Gin routing |
+| `withContext` для sub-templates | Lang не протекает в domain structs. Контекст передаётся отдельно через wrapper |
+| Translation keys в Go коде | Tool titles, sort labels, button names, job messages — ключи вместо строк, перевод в шаблоне/runtime |
+| Adult-content blur — server-side, не client | Server рендерит блюр в poster_resolver на ответе. Защищает share-flow (Telegram/Stremio fetch'ат без auth → получают блюр гарантированно). См. `docs/adult_classification.md` |
+| `resource_metadata` table — не JSONB | `is_adult`/`is_sport` — индексируемые булы для hot-path запросов (poster blur, фильтры). Full ptn snapshot в `metadata` JSONB. Switch to JSONB only когда появится много long-tail soft-флагов |
+| `user_settings` — typed columns | Same rationale — `show_adult` индексируем для "сколько юзеров opted in". JSONB defer'нут до накопления флагов |
+| URL/UI хелперы — НЕ методы на `web.Context` | `web.Context` остаётся raw request-state (CSRF/User/Lang). Feature-specific URL builders принимают `*Context` параметром в helpers (`web.PosterURL(rid, w, isAdult, ctx)`), не методами на shared type |
+| Tool-страницы — данные, не партиал на страницу | Тело SEO-лендинга описывается списком секций в `handlers/common/tools.go`, рендерит общий `sections.html`. 19 постраничных партиалов (2537 строк) были одной и той же разметкой с разным префиксом ключей; новая страница = копия чужого файла. Шестой тип секции — сигнал, что нужен свой партиал, а не новый флаг. См. `docs/tool_pages.md` |
+| PWA lite — manifest без service worker'а | Install/share/protocol-handler интеграции без offline-кэша: SW с fetch-хендлером ломает hard-cutover деплой (refresh перестаёт гарантировать свежую версию). Push-only SW допустим в будущем. См. `docs/pwa.md` |
+| Общее состояние JS — в DOM или на `window`, не в области модуля | `splitChunks` выключен намеренно (энтрипойнты грузятся Go-хелперами независимо), поэтому модуль, импортированный из двух энтри или из энтри и ленивого чанка, **дублируется** — у каждой копии своя module-level `Map`/`let`. Дважды стреляло 2026-09-20: спиннер кнопки не гас (`lib/actionBusy.js`: `async.js` в `layout.js`, `progressLog.js` в чанке), второй Turnstile-виджет (`lib/turnstileAction.js`). Тест на это — второй `import('./mod.js?bundle=two')` |
+| Двухфазный warm-up стрима: 10 МБ, и 50 МБ только для замера | Воспроизведению нужен первый сегмент; гейту BT-slow нужен честный замер, а счётчик сидера движется целыми кусками и обрезан по диапазону — на 10 МБ он врёт вчетверо (куски 8 МБ) или молчит (16 МБ). Быстрый рой проходит по нижней оценке, остальные меряются по-старому. Не уменьшать `bandwidthTestSize`/`bandwidthSkipSize`. См. `docs/warmup.md` |
+| Seeder fast-path warmup — silent skip | Когда seeder pod уже держит head+tail pieces, `warmUp` тихо пропускается без `j.Skip` UI-следа и роутится через cap-modal ветку (как `Cache=true`). Главный win — share-flow: viewer попадает на hot pod сразу после sharer'а. См. `docs/warmup.md` |
+
+## Internationalization (i18n)
+
+- **Full guide**: `docs/i18n.md` — архитектура, паттерны, правила переводов
+- **Languages**: EN (default, no prefix), RU (`/ru/`), ES (`/es/`), DE (`/de/`), FR (`/fr/`), PT-BR (`/pt/`), IT (`/it/`), PL (`/pl/`), TR (`/tr/`), NL (`/nl/`), CS (`/cs/`)
+- **Locale files**: `locales/{en,ru,es,de,fr,pt,it,pl,tr,nl,cs}.json` — flat key-value JSON
+- **PT note**: bundle `pt` содержит PT-BR. `Accept-Language: pt-BR`/`pt-PT` оба сворачиваются в `pt` через `language.Base()`. Разделять на `pt-br`/`pt-pt` — только когда потребуется европейский португальский (нужна правка middleware для переменных префиксов)
+- **Template translation**: `{{ t $.Lang "key" }}`, `{{ tp $.Lang "key" "Param" value }}`
+- **Links**: всегда `{{ langPath $.Lang "/path" }}`
+- **Sub-templates с чужими данными**: `{{ template "name" withContext $ data }}`
+- **Job messages**: `i18n.Service` пробрасывается через `Jobs` → скрипты, `s.t("key")`
+- **Не переводим**: brand names (Vault, Discover, Stremio), technical terms, legal pages
+- **Русский**: "Смотрите" вместо "Стримьте", "Вклад" вместо "Залог"
+
+## Documentation
+
+- **Before starting work, check the `docs/` directory** — it contains technical specs, DB schemas, business logic, API specs, and edge cases for major features (e.g., `docs/vault.md`).
+- **After completing any task, update the relevant docs** — document new methods, services, DB tables, and changed functionality. Documentation updates are mandatory.
+
+## Build & Toolchain
+
+- **Go** 1.26 (module: `github.com/webtor-io/web-ui`)
+- **Node** 22.x for frontend assets
+- **npm** (not Yarn) — `package-lock.json` is present
+- Frontend assets: webpack → `assets/dist`, served at `/assets` — `Cache-Control` is immutable for a year only when the query is the file's current md5 (`?<hash>` from `web.Helper.Asset`), 30 min without one, `no-store` for a stale hash and for every error (`handlers/static/assets.go`, `docs/status_and_caching.md`)
+- Public static files: `pub/` mounted at `/` and `/pub`
+
+### Key Commands
+
+- `make build` — runs `npm run build` then `go build .`
+- `make run` — runs `./web-ui s` (serve)
+- `npm start` — webpack-dev-server only; the Go binary is run/debugged from GoLand (air was removed 2026-07)
+- `go test ./...` — run all Go tests
+- `npm test` — browser-side tests via `node --test` (no test framework installed). Works because `assets/src/js/package.json` declares `{"type": "module"}`; that also puts webpack into strict-ESM mode for the tree, which is why the js rule carries `resolve: { fullySpecified: false }` and the Babel config is a root `babel.config.json` rather than a `.babelrc`. **JSX is testable too** since 2026-09-16: the script passes `--import ./assets/src/js/test/register.mjs`, which installs module hooks (`assets/src/js/test/jsx-hooks.mjs`) that transpile `.jsx` with `@babel/core` through that same `babel.config.json`, resolve the extensionless relative imports webpack resolves, and stub the `.css` / `locales/*.json?prefix=` imports. `jsdom` is a pinned devDependency and gives a real DOM. Tests that need server-rendered markup read a committed fixture generated by a Go test rather than hand-writing HTML — see `assets/src/js/lib/player/Player.wiring.test.js` and `services/template/subtitles_dialog_fixture_test.go`
+- `go test ./services/parse_torrent_name -v` — parser tests (golden-file based)
+- `go test ./services/parse_torrent_name -run TestParser -update` — update golden files
+
+### Docker
+
+```
+docker build .
+```
+Produces minimal 3-stage Alpine image. Exposes ports 8080, 8081. Entrypoint `./server serve` with `GIN_MODE=release`.
+
+## Architecture Rules
+
+### Database Operations
+
+- **ALL database operations go in `models/`** — handlers must never contain direct DB queries.
+- Model files named after the entity (e.g., `models/embed_domain.go`).
+- Model methods accept `*pg.DB` as first parameter.
+- Provide Get/List, Create, Update, Delete, Count/Exists methods per entity.
+- **New user-keyed table → must be added to the GDPR data export.** Whenever you introduce a table with a `user_id` (or any column that ties rows to a single account), you MUST also wire it into `services/data_export/export.go` so it appears in the `/profile/export` JSON. Steps and rationale are in `docs/data_export.md`. Skipping this leaves a real Art. 20 compliance gap — treat it as part of the schema change, not a follow-up.
+
+### Handler Architecture (Two-Level Pattern)
+
+All handlers must follow two-level separation:
+
+- **Level 1 (HTTP layer)**: Extracts params from `gin.Context`, calls Level 2, handles HTTP responses.
+- **Level 2 (Business logic)**: Pure functions, no `gin.Context` dependency, returns values and errors.
+- **Auth**: Use `auth.HasAuth` middleware via `r.Group().Use(auth.HasAuth)` — don't check auth manually in handlers.
+- **Reference**: `handlers/embed_domain/handler.go`, `handlers/vault/handler.go`, `handlers/streaming/backends/handler.go`
+
+### Middleware chain and its dependencies (`serve.go`)
+
+gin applies `Use()` only to routes registered after it, so where a route sits in `serve()` decides which middleware it passes. What each layer needs, in order:
+
+| Layer | Needs | Anonymous, no cookies | Signed in, dependency down |
+|---|---|---|---|
+| Static: `/assets`, `/pub`, `pub/*` at the root, favicons, manifest (`sta.RegisterHandler`) | disk | — | — |
+| Session + CSRF (`handlers/session`) | Redis/Dragonfly | yes, every page | — |
+| SuperTokens + user row (`services/auth`) | SuperTokens core, Postgres | no call: no token, no core query | error page (503 core, 500 row), never anonymous. One exception: a page request (not XHR) with an expired access token is checked locally and passes on as anonymous (claims fallback included) to the refresh interstitial (`handlers/auth`), whose refresh call needs the core. A refresh that fails there shows the outage message, not `/login` (`settleRefresh`, `lib/auth/nextLocation.js`) |
+| Self-hosted admin, no SuperTokens (`adminauth.Store.Configured`, `registerAdminUser`) | Postgres, read on every request: is a password set | 503 as well: with the read failing, an open instance (no password, every visitor is the administrator) cannot be told from a closed one | 503, never anonymous. No Postgres configured (`adminauth.ErrNoDB`) is not an outage: closed and anonymous, as before |
+| Claims (`services/claims`) | claims-provider → Postgres, 1 min cache per key | the provider's last anonymous answer when it fails; a pod with none yet answers 503 | 503 |
+| Settings, onboarding, unread badge | Postgres | skipped | defaults (`ShowAdult=false`), page renders |
+
+Rules:
+- Static files are registered right after the S3/API host rewrites and before everything that needs a dependency (`static_order_test.go`). Before 2026-10-06 they sat behind claims: when Postgres went away on 2026-10-05 (03:36–03:41Z) `/assets` and the manifest answered 503 together with the pages.
+- A dependency that fails never turns a signed-in user anonymous or into "no such dependency": the request ends on the error page. `pg.Get() == nil` means "Postgres not configured", never "Postgres down".
+- An anonymous visitor degrades to the last real answer, never to a made-up one (`makeAdminClaims` is "no provider", not "provider failed").
+- Still needed by an anonymous page: Redis (session) and, for an embed on a foreign domain, Postgres (`embed_domain`). A claims-provider that hangs instead of failing costs an anonymous request up to 10 s before the fallback: lazymap does not keep errors, so `ErrorExpire` does nothing here.
+
+### Frontend Development
+
+- **Server-side rendering first** — use Go templates with Gin, minimize client-side JavaScript.
+- **No heavy JS frameworks** (React, Vue, Angular).
+- Use HTML forms with `method="post"` for mutations.
+- Use `data-async` attributes for progressive enhancement.
+- Use `data-async-target` and `data-async-push-state="false"` for partial page updates.
+- Handlers use `c.Redirect(http.StatusFound, c.GetHeader("X-Return-Url"))` for form processing.
+- Templates in `templates/partials/`, registered via TemplateManager before `tm.Init()`.
+- **Good examples**: Stremio (`templates/partials/profile/stremio.html`), WebDAV, Embed domains.
+
+#### Auto-updating Components
+
+- Container needs unique `id` and `data-async-layout` attribute.
+- Hidden form with `data-async-target` pointing to container `id` and `data-async-push-state="false"`.
+- Use `requestSubmit()` instead of `submit()`.
+- Call `document.querySelector("#component-id").reload()` for direct reload.
+- **Reference**: `templates/partials/vault/button.html`, `templates/partials/library/button.html`
+
+#### When JavaScript Is OK
+
+- Clipboard functionality
+- Progressive enhancement of server-side features
+- Interactive features that don't break core functionality without JS
+- Analytics (Umami)
+
+## Code Style
+
+### Go
+
+- `go fmt` and `go vet`
+- Logging: global `logrus` (`log "github.com/sirupsen/logrus"`), not injected loggers
+- Structured logging with `WithField()`, `WithError()` — messages start with lowercase
+- Error wrapping: `github.com/pkg/errors` with `errors.Wrap(err, "context")`
+- **Log errors only at the top level** (handlers/entry points) — lower levels wrap and return
+- External calls: use `context.WithTimeout` and `lazymap` caches
+- Interface names: no "Interface" suffix (e.g., `StreamService` not `StreamServiceInterface`)
+- Implementation structs: descriptive names (e.g., `HttpStreamService`)
+
+### SQL Migrations
+
+- File naming: `{number}_{description}.{up|down}.sql` (e.g., `19_create_stremio_settings.up.sql`)
+- Use `public.` schema prefix, tab indentation, lowercase data types
+- Constraint naming: `{table}_pk`, `{table}_{column}_unique`, `{table}_{reference}_fk`
+- Include `update_updated_at` trigger for tables with `updated_at`
+- Down migrations: `DROP TABLE IF EXISTS table_name;`
+- Follow patterns from `18_addon_url.up.sql`
+
+### Frontend
+
+- Tailwind v4, webpack 5, postcss
+- Stylelint available (not wired to npm scripts)
+- **UIKit reference**: `docs/uikit.html` — open in browser after `npm run build` to see all design tokens and components
+
+#### UIKit & Design System Rules
+
+The project uses a custom design system on top of DaisyUI (night theme). All tokens and components are documented in `docs/uikit.html`. **When adding or changing UI components, consult and update `docs/uikit.html` to keep it in sync.**
+
+**Color tokens** (`tailwind.config.js` → `w-*`): `bg`, `surface`, `card`, `pink`, `pinkL`, `purple`, `purpleL`, `cyan`, `text`, `sub`, `muted`, `line`. Use as `bg-w-{name}`, `text-w-{name}`, `border-w-{name}`.
+
+**Button variants** — each has a designated context, do NOT mix:
+| Variant | Use for | Do NOT use for |
+|---------|---------|----------------|
+| `btn-pink` | Homepage & tools page CTAs | Profile, vault, auth, support form |
+| `btn-soft` | Profile, auth & support form actions | Homepage CTAs, vault/library |
+| `btn-soft-cyan` | Secondary actions in cyan (info, tools, content) | Primary actions, profile/auth |
+| `btn-accent` | Vault, library actions | Homepage, profile, auth forms |
+| `btn-ghost border border-w-line` | Outlined ghost (nav, downloads, secondary) | Primary actions |
+| `btn-ghost` (no border) | Tertiary actions (demo, delete, logout) | Primary actions |
+
+**Focus color** — context-dependent:
+- `focus:border-w-pink` — profile & auth page inputs
+- `focus:border-w-cyan` — support form & tools page inputs
+
+**Badge color** — matches section theme:
+- Pink (`bg-w-pink/10 text-w-pinkL`) — features, profile
+- Purple (`bg-w-purple/10 text-w-purpleL`) — comparison sections
+- Cyan (`bg-w-cyan/10 text-w-cyan`) — info, tools, FAQ
+
+**Custom CSS classes** (`assets/src/styles/style.css`): `btn-pink`, `btn-soft`, `btn-soft-cyan`, `btn-busy` (a job-start button while its job runs — dimmed, not `disabled`; toggled only by `lib/actionBusy.js`), `toggle-soft`, `gradient-text`, `gradient-stat`, `hero-backdrop` (+ `hero-lamp`, `hero-film`, `hero-bloom`, `hero-stars`), `hero-band-light`, `hero-wave` (+ `wave-1/2/3`), `hero-dust` (+ `hero-dust-track`, `hero-dust-field`, depths `dust-far/mid/near`, `spark`), `hero-logo`, `hero-title`, `cta-glow`, `upload-dashed`, `navbar-redesign`, `collapse-webtor`, `progress-alert`, `promo`, `promo-close`, `promo-compact`, `promo-outline`, `loading-elipsis`, `popin`, `w-panel`, `tx` (+ `tx-head`, `tx-chain`, `tx-node`, `tx-seg`, `tx-badge` — the status badge, one element for every status pill: the resource page's while nothing moves and every pill on the Vault page, rendered only by `partials/status/badge.html` and updated only by `lib/statusBadge.js`, tones `muted/cyan/warn/err/ok/vault` + the Vault page's `pink`; a new pill is a tone or an icon, never new markup —, `tx-bar`/`tx-pbar`/`tx-pdiv`, `tx-hint`/`tx-vlink`, `tx-pbox` (+ `tx-px`, the ×: once up the box stays until it, `lib/transferStatus.js` `keepBox`; `data-quiet`, its button down in place while another offer is on screen), `tx-details` — the transfer status on the resource page, "swarm ▸ cache ▸ you" while something moves, the old badge while nothing does, both in one `.tx-head` row switched by `data-mode`; state rides on `data-*` attributes set in place, never on re-created markup; `@container` switches the compact chain below 670px of the block's own width (the longest full chain in any language); the piece bar's hatch is one masked layer under the whole bar (`--tx-holes`), not a per-cell background; approved design frozen in `docs/transfer_status.approved.html` (compare against it), living reference drawn by the real classes `docs/transfer_status.html`, `docs/uikit.html` §21; how it behaves and why — `docs/transfer_status.md`), `w-card-frame`, `w-card-title`, `w-card-badge`, `w-card-badge-label`, `w-card-badge-ghost`, `w-card-stars-compact`, `w-card-stars-full`, `track-chip`, `track-chip-active`, `lang-chip`, `lang-chip-active`, `chip-locked`, `chip-offered`, `picker-off` (track picker — see `docs/uikit.html` §19; JS toggles only the `-active` classes and `picker-off`, the muted state behind the subtitles switch).
+
+**Mobile patterns** — see `docs/uikit.html` section 15. Key rules:
+- Hide decorative badges/subtitles on mobile (`hidden sm:inline-flex` / `hidden sm:block`)
+- Use `sticky top-[72px]` for tab bars with `bg-w-bg/90 backdrop-blur-lg`
+- Use `flex-col sm:flex-row` to stack filters below tabs on mobile
+- Use container queries (not media queries) for card-level responsive: `w-card-badge-label`, `w-card-stars-compact/full` switch at 210px card width
+- Use `line-clamp-2` instead of `truncate` for torrent names
+- Touch targets: `w-card-badge-ghost` enlarges to 2.5rem on `@media (hover: none)`
+
+**Typography** (`tailwind.config.js`):
+- `font-sans` — Inter (primary body font)
+- `font-logo` — Comfortaa (logo/branding)
+- Font CSS embedded as base64 WOFF2 in `assets/src/styles/inter.css` and `comfortaa.css`
+
+## Configuration (Minimum)
+
+- `WEB_HOST` / `WEB_PORT` (default 8080)
+- REST API: `REST_API_SERVICE_HOST`, `REST_API_SERVICE_PORT`, or RapidAPI via `RAPIDAPI_HOST`/`RAPIDAPI_KEY`
+- Sessions: `SESSION_SECRET` (optional Redis via `REDIS_*` vars)
+- Assets: `ASSETS_PATH` (default `./assets/dist`)
+- DB: PostgreSQL via `common-services` flags (`PG_HOST`, etc.) — migrations auto-apply on startup
+- Redis: for job queues via `common-services`
+
+### Library Access
+
+- **WebDAV + S3** — one filesystem tree (`services/libfs`), two wire formats. Adding an operation lands in both at once. `DISABLE_WEBDAV`; `DISABLE_S3`, `S3_SIGNING_SECRET`, `S3_DOMAIN`. См. `docs/webdav.md`, `docs/s3.md`
+- **JSON API** (`/api/v1`, `docs/api.md`) — `/resource`, `/list`, `/export` это **пробросы в rest-api с его же контрактом** (возвращаются его структуры, не копии); `/library`, `/vault`, `/profile` — только здесь. Не заводить параллельную файловую абстракцию: `/fs`-вариант отвергнут, стрим-ссылки даёт `/export`. `DISABLE_API`, `API_DOMAIN` (выделенный хост → `/v1/...`; в проде это `api.webtor.io` — **передан web-ui от torrent-http-proxy 2026-08-08**, thp-клиенты живут на `api.cosmic-crab.buzz`). Swagger UI на `/api/v1/docs/index.html`; спека — `make swagger`, **обязательно** с `--instanceName libraryapi`, иначе коллизия со спекой rest-api и паника на старте процесса. Статус vault-загрузки — `GET /vault/pledges/{id}` (`libapi.NewPledgeStatus`, чистая функция). Per-key rate limit: `API_RATE_LIMIT`/`API_RATE_BURST` (в памяти реплики, 429 + `Retry-After`). На `/export` селекторы `types` (CSV, семантика rest-api) и `output` (ровно один, 404 если нет) взаимоисключающие. Дальнейшие планы — `docs/api_roadmap.md`
+
+### Optional Integrations
+
+- Umami analytics: `USE_UMAMI`, `UMAMI_WEBSITE_ID`, `UMAMI_HOST_URL`. What rides along — event defaults, the first touch as session data (`ft_source` etc.), and that `/` is stored with an empty `url_path`: `docs/analytics.md`
+- IndexNow: `INDEXNOW_KEY` — serves `/<key>.txt` so Bing/Yandex accept URL submissions for the host; unset — no file. Submitting: `docs/indexnow.md`
+- Claims (user tiers): `USE_CLAIMS`, `CLAIMS_PROVIDER_SERVICE_HOST/PORT`
+- Stremio addon: `STREMIO_ADDON_USER_AGENT`, `STREMIO_ADDON_PROXY`
+- Torznab indexers: `TORZNAB_TIMEOUT`, `TORZNAB_MAX_RESULTS`, `TORZNAB_USER_AGENT`, `TORZNAB_PROXY` (домашние провайдеры режут входящие с дата-центров — индексер, доступный из браузера, может быть недоступен с нод), `TORZNAB_ALLOW_PRIVATE_NETWORK` (последний — только для self-hosted: снимает запрет на приватные адреса, см. `docs/torznab.md`)
+- Release subscriptions: подписка на новые раздачи фильма или сезона, письма из cron-джобы `subscription poll`. Интервалы и батчи — `SUBSCRIPTION_*` (см. `docs/release_subscriptions.md`). Поллер гоняет **тот же** пользовательский стрим-пайплайн, что и Discover (`Builder.BuildPollStreamsService`), поэтому аккаунт без аддонов и индексеров подписку не получит — предлагать её там нечего
+- Subtitle translation: `SUBTITLE_TRANSLATE_ENABLED`, `SUBTITLE_TRANSLATE_FREE` (см. `docs/subtitle_translate.md`)
+- Transcoder capability (Discover): `CONTENT_TRANSCODER_SERVICE_HOST` / `CONTENT_TRANSCODER_SERVICE_PORT` — k8s инжектит их для Service `content-transcoder`, self-hosted задаёт в common env. `services/transcodercaps` в фоне раз в 30 с спрашивает `GET /capabilities` («отдаёт ли транскодер HEVC как есть»), страница получает `window._passthrough`. Последний ответ живёт, пока транскодер не скажет иное; `unknown` — только до первого ответа после старта пода, и это не `off`. Плеер это не читает: маршрут решает транскодер по декларации браузера. См. `docs/discover.md`, «Transcoder capability»
+- Embeds (`/show` → `/embed` в iframe чужого сайта, SDK `embed-sdk-js`): включены, если `USE_EMBED` (в chart `embed.enable`, по умолчанию true) и не `DISABLE_EMBED` — один предикат `embed.Enabled`. Выключены — `/embed` остаётся смонтирован и отдаёт `embed/off` («недоступно» + ссылка на self-hosted), а кнопка Embed в плеере, домены в профиле, `/embed-domain/*`, `/embed/example`, карточка SDK на главной и ссылка в футере не рендерятся. webtor.io эмбеды не отдаёт с 2026-10 (DMCA-риск, ни пользователей, ни денег). `EMBED_ONLY_AUTHORIZED` — список доменов из профиля, но домен берётся из referer, который присылает клиент: от DMCA не защищает. `FRAME_ANCESTORS` — CSP `frame-ancestors` на все ответы, кроме `/embed` и `/show` (в проде `'self'`); пусто — заголовка нет, инстанс можно фреймить (дашборды у самохостеров)
+- Offers (все апселлы и карточки /donate): витрина приходит из webhook `GET /prices` (`USE_PAYMENTS` + `WEBHOOK_SERVICE_HOST`), `services/offer` делает из неё промо-план. Скорость, Vault, длина триала и «какой план продаём» — данные, в шаблонах и локалях цифр нет. Нет каталога — нет оффера (self-hosted ничего не продаёт). Кнопка, начинающая триал промо-плана, ведёт через `/trial?from=<surface>` (`trialURL`, закрытый список `offer.TrialFroms`, счётчик `webui_trial_shortlink_total{from}`) — только пока триал можно начать; ссылки на конкретный план остаются прямыми. Коды скидок тоже из каталога (`discounts`): когда подписка закончилась без единой оплаты (отказ карты, после которого Patreon сдался; отменённый триал — с `WINBACK_TRIAL_ENDED_FROM`), уходит winback-письмо с живым кодом, раз на аккаунт; контрольная группа `WINBACK_HOLDOUT` (%, по умолчанию 0 — всем). См. `docs/offers.md`
+
+## Workflow
+
+- **After committing and pushing to git**, always suggest running `/deploy` to deploy the changes.
+
+## Debugging
+
+- pprof/probe via `common-services` flags (secondary port)
+- Prometheus metrics on `PROM_PORT` (8083) `/metrics`, `USE_PROM` — collectors in `services/metrics`, see `docs/metrics.md`. **Locally `webpack-dev-server` also uses 8083**: set `USE_PROM=false` (or `PROM_PORT=8084`) in the run configuration or the Go process exits on bind
+- Test API without RapidAPI: port-forward `rest-api` from K8s or set `REST_API_SERVICE_HOST/PORT`
+- Asset path issues: use `--assets-path` or `WEB_ASSETS_HOST` for CDN
+- Ad testing: set cookie `test-ads` or query param `test-ads`
+- **Subtitle picker as a free viewer (works in release)** — append `&debug=tier:free` to the resource hash (`#action=stream&debug=tier:free`): the AI subtitle track renders locked with the CTA even for a paid account. Downgrade-only, so `handlers/action/handler.go` lets this one `debug` value through under `GIN_MODE=release`; the value is part of the job cache key. See `docs/subtitle_translate.md`.
+- **Streaming-error modals (dev-only)** — append `&debug=<error>` to the resource hash to short-circuit `streamContent` and render the error template without any rest-api work. Gated by `gin.Mode() != gin.ReleaseMode` in `handlers/action/handler.go` so it's a no-op under `GIN_MODE=release`. Values:
+    - `debug=slow_download` — cap-modal (`IsRateLimited=true`, fake 5/10/15 Mbps, rate=5M). Useful because under grace=ON this branch is otherwise unreachable for free users.
+    - `debug=slow_download_bt` — BT-slow variant (`IsRateLimited=false`, 1/10/15 Mbps).
+    - `debug=no_peers` — no_peers modal, "dead swarm" variant, with the real tier from claims.
+    - `debug=no_peers_slow` / `debug=no_peers_timeout` — the other two variants of the same modal (peers exist but crawl; hard warm-up deadline), with sample counters.
+    - **Magnet failure card (dev-only)** — open `/magnet:?xt=urn:btih:<40 hex>&debug=magnet_dead|magnet_dead_long|magnet_invalid`: the load job plays an 8 s countdown and renders `load/errors/magnet` (dead: retry for 10 minutes via `magnet-wait=long`; `_long`: the ten-minute attempt failed; `invalid`: broken link, no retry). Inert under release.
+    - `debug=swarm_demo` — plays the warm-up status line for ~16 s (silent-swarm countdown, then the percent of the warm-up range) and ends in the slow variant. No network involved.
+    - `debug=no-os` — skips the OpenSubtitles lookup for this stream start, so a file with embedded subtitles exercises the live (transcoder playlist) translation source instead of a file source (`jobs/scripts/action.go`, `DebugNoOpenSubtitles`).
+    - `debug=error:<key>` — renders any user-facing error key in the job log (e.g. `debug=error:error.transcode_failed`); the keys live in `services/web/user_error.go`, see `docs/user_errors.md`.
+  - **Transfer status (dev-only)** — `?debug_status=idle|caching|cached|vaulting|vaulted|unknown|vault_waiting|vault_failed&seeders=4&leechers=9&peers=13&progress=42&rate=2500000&paused=1&noseeders=1&checking=1&debug_pieces=stream|sparse|half|full|empty` on a resource page sets the torrent side (`rate` is the swarm in bytes/s; `debug_pieces` paints a synthetic piece bar). The viewer's own link: `user_rate=<bytes/s>` flowing, `viewer=zero` nothing flowing (not on the chain: nothing goes to them), `viewer_stalled=1` open requests with no bytes, `plan_limited=1` at the plan's cap long enough for the plan box, `plan_limited=fact` its first seconds (the pink link, no box yet) (`plan_rate=20M` for another cap; `bitrate=8` adds "…and this file needs 8 Mbps" to the buffering line) — without any of them the viewer is unknown and not drawn. Nothing moving (no `rate`, no viewer bytes) draws the old badge instead of the chain. The swarm's availability: `availability=0.73` (the seeder knows it), `debug_missing=holes` (the hatched pieces nobody has), `wanted_missing=5`, `reader_missing=3` — with `peers=12&seeders=0` they reach `missing` / `missing_idle` / `vault_missing`. The plan box without a catalog shows a sample trial link. The query for every state of `docs/transfer_status.html` is in `handlers/resource/debug_states_test.go` (the test proves each lands on its key); `stream_ok`/`stream_stall`/`stream_over` are the `tier` preview with the page's player playing/buffering/playing a file the stream job marked `data-status-over-cap`. `status.js` forwards these to the `/status` SSE endpoint and `handlers/resource/status.go` (`debugStatus`) emits exactly that status instead of consulting the seeder, Vault and thp. The same params on `/vault` ride along to every live row's stream (`lib/statusDebug.js`, one list for both pages), so each badge state can be looked at there too. Inert under release. What each state means and when it is drawn: `docs/transfer_status.md`.
+  - Example: `http://localhost:8083/<hash>?file=...#action=stream&debug=no_peers`. Implementation: hash parsed in `assets/src/js/app/resource/get.js`, posted as `debug` form-field, branched in `jobs/scripts/action.go` `streamContent` before grace setup. Cache-key includes the debug value so a real run isn't masked by a cached debug result.
+- **Winback letter preview (dev-only)** — `GET /notifications/preview/winback?lang=ru` (`reason=trial` for a cancelled trial, default a declined card; `tier=`, `percent=`, `days=365`) renders the letter with the live discount code from the catalog, or a sample one without a webhook. Not registered under `GIN_MODE=release`.
+- **Tier welcome letter preview (dev-only)** — `GET /notifications/preview/tier-welcome?tier=silver&lang=ru&stremio=1&vault=1&billing=1&trial=1` renders the welcome mail (subject bar + wrapped body) exactly as `SendTierWelcome` would send it, without journaling or sending. The route is not registered under `GIN_MODE=release` (`handlers/notifications/handler.go` → `notification.Service.PreviewTierWelcome`).
+- **Profile Stremio block, pre-token state (dev-only)** — `/profile?preview=stremio-fresh` renders the Stremio section as an account that has not generated its addon URL yet (the state every new user meets). Gated by `gin.Mode()` in `handlers/profile/handler.go`; only the render changes, the real token is untouched.
+- **Onboarding checklist preview (dev-only)** — `?onboarding=free` / `?onboarding=paid` renders the activation checklist as a FRESH account of that tier (pristine progress, no DB), bypassing the age and all-done gates — a developer's own account is past both, so a tier switch alone shows nothing. Gated by `gin.Mode() != gin.ReleaseMode` in `services/web/onboarding_middleware.go` (→ `onboarding.Service.Preview`); affects rendering only and also switches the navbar counter on any page. See `docs/onboarding.md`.

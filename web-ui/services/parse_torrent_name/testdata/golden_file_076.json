@@ -1,0 +1,10 @@
+{
+  "input": "[HorribleSubs] Clockwork Planet - 10 [480p].mkv",
+  "want": {
+    "title": "Clockwork Planet",
+    "episode": 10,
+    "resolution": "480p",
+    "container": "mkv",
+    "website": "HorribleSubs"
+  }
+}

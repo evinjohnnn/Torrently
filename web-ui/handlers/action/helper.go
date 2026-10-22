@@ -1,0 +1,1329 @@
+package action
+
+import (
+	"fmt"
+	"net/url"
+	"regexp"
+	"strconv"
+
+	"github.com/pkg/errors"
+	"github.com/webtor-io/web-ui/models"
+
+	ra "github.com/webtor-io/rest-api/services"
+	"github.com/webtor-io/web-ui/services/api"
+	"github.com/webtor-io/web-ui/services/stremio"
+	"golang.org/x/text/language"
+)
+
+type ListItem struct {
+	ID       string
+	MPID     string
+	Label    string
+	Default  bool
+	SrcLang  string
+	Provider string
+	Src      string
+	Kind     string
+	Source   string
+	// Preload marks side-loaded tracks rendered as <track> elements in the
+	// page. Browsers fetch every <track> on load regardless of mode, so
+	// only the default track plus the viewer's language and English are
+	// rendered (capped by maxPreloadTracks); the rest are created on
+	// selection by the player. Embedded tracks are never <track> elements.
+	Preload bool
+	// Forced marks "signs only" tracks (foreign-language lines and
+	// on-screen text). They are never a full subtitle by the ladder and
+	// never a translation source; they are the default when the audio is
+	// already in the viewer's language.
+	Forced bool
+	// Locked is a track the viewer may not activate (AI translation for a
+	// free account): rendered with a lock and a CTA, no Src.
+	Locked bool
+	// Badge names the origin for the picker: user, embedded, sidecar, os,
+	// ai, forced (i18n key action.stream.badge.<Badge>).
+	Badge string
+	// Rank is the item's place in the ladder (see ladderRank): the player
+	// renders it as data-rank and reuses it when it has to pick a default
+	// itself, so the order lives in Go only and is never reimplemented in
+	// JS.
+	Rank int
+	// SourceBadge is set on the Translated item alone: the Badge of the
+	// human track the translation is made from, so the picker can say
+	// "AI - from <origin>" without knowing the ladder.
+	SourceBadge string
+	// MovieHashMatch is OpenSubtitles ground truth: true when the track
+	// was found by the moviehash of this very file, false when it was
+	// found by title (imdb) and may belong to another release. nil when
+	// the service did not report it -- every video-info before
+	// 2026-09-16 -- and the Source enum answers instead (hashMatched).
+	MovieHashMatch *bool
+	// SourceID is set on the Translated item alone: the ID of the list
+	// item being translated. Diagnostics only -- it is not rendered and
+	// not reported, unlike Source, which stays the OpenSubtitles
+	// hash|imdb enum for every provider.
+	SourceID string
+	// Saved marks the default that came from the viewer's own earlier
+	// choice (ud.SubtitleID) rather than from the ladder. Rendered as
+	// data-saved: the player re-runs the ladder when the viewer switches
+	// audio, and a choice the viewer made themselves must survive that.
+	// Default alone cannot say which of the two it is.
+	//
+	// It means exactly "the viewer chose this": the player writes
+	// ud.SubtitleID only on a click, an upload, or a flick of the subtitles
+	// switch, never on the activation it performs by itself (the
+	// audio-switch re-pick) -- see activateSubtitle's persist flag in
+	// Player.jsx. Otherwise a rule the player applied on the viewer's behalf
+	// would come back on the next page load as a choice that switches the
+	// rule off.
+	Saved bool
+	// Suggested is the track the picker's subtitles switch restores:
+	// rendered as data-suggested, at most one per list, and computed by
+	// offSuggestion whenever the "None" item is the default. Never the
+	// "None" item, never a locked one, and never a translation -- the
+	// switch does not spend tokens on the viewer's behalf.
+	//
+	// With subtitles on nothing is Suggested: Default already answers what
+	// is playing, and two answers would let the picker restore something
+	// other than that.
+	Suggested bool
+	// Offered is the AI translation the ladder would have turned on before
+	// 2026-09-16, when running one stopped being something the server does
+	// for the viewer. Rendered as data-offered and drawn as an action
+	// ("Translate to <language>", accent outline) rather than a selection.
+	//
+	// Never together with Default: a translation the viewer saved comes
+	// back playing, and the chip then reads as a track. "Offered and not
+	// playing" is exactly what the picker's hint explains, on both sides
+	// (template, and offerPending in track-picker.js).
+	//
+	// A separate field from Suggested on purpose (owner review): they
+	// answer different questions -- "what would the switch bring back" and
+	// "what can the viewer start here" -- and one list often needs both,
+	// on two different items. Never set on a locked item: a free viewer
+	// cannot run it, so it is not an action on offer but an upsell, and the
+	// chip keeps its old name-plus-lock shape.
+	Offered bool
+	// Upsell is Offered seen from a free account: the locked translation the
+	// ladder would have offered had the viewer been able to run it. Locked
+	// alone does not say that -- the locked item is appended whenever the
+	// preferred language has no human track, including when the audio is
+	// already in that language and nobody needs subtitles. Rendered as
+	// data-upsell; the player's on-screen offer reads it, the picker does
+	// not (the chip keeps its name-plus-lock shape either way).
+	Upsell bool
+	// LangGuessed: the source declared no language and SrcLang is
+	// GetSubtitles' display default. ffprobe reports no language tag for a
+	// Matroska track marked "und", and such a stream is labelled English --
+	// in the 2026-09-14 probe sample 7.8% of files with text subtitles had
+	// one, titled "Español", "Chinese", "Cyrillic", "rus full" and the
+	// like. Rendered as data-lang-guessed. offeredDefault, which turns a
+	// track on in a language the viewer did not ask for, does not trust it.
+	LangGuessed bool
+}
+
+// SubtitleOpts is defined once in models (see models/subtitle_opts.go);
+// this alias keeps the action package's call sites and signatures short.
+type SubtitleOpts = models.SubtitleOpts
+
+// maxPreloadTracks bounds how many side-loaded tracks are rendered as
+// <track> elements: enough for the native iOS subtitle menu to offer the
+// viewer's language and English, few enough that the page-load burst
+// stays well under the proxy's per-session concurrency caps.
+const maxPreloadTracks = 8
+
+type Helper struct {
+}
+
+func NewHelper() *Helper {
+	return &Helper{}
+}
+
+// UserSubtitleView builds the flat data struct the user_subtitles_view
+// partial expects. Called from the stream_video template so that the
+// initial render and the async-reload response (from the /user-subtitle
+// handler) feed the same shape into the same partial.
+//
+// lis is the output of GetSubtitles for the same render: the uploads
+// appear there too (provider UserSubtitle, same ID), and that is the only
+// place the ladder's verdict exists. Copying Default/Saved/Suggested across
+// is what lets the "My Subtitles" rows carry the same
+// data-default/data-saved/data-suggested markers as the other two lists;
+// pass nil when there is no ladder result to copy from (the async reload)
+// and the rows stay unmarked.
+//
+// expandedLang is the language the track row opens on (LangRow.Expanded):
+// the partial renders its chips inside that row, so it has to collapse them
+// by the same rule. It is passed in rather than recomputed here because the
+// template has already built the row — recomputing would need the viewer's
+// preferred language too, and the two results could drift apart.
+func (s *Helper) UserSubtitleView(resourceID, path, eiURL string, subs []models.UserSubtitleTrack, lis []ListItem, expandedLang string) *models.UserSubtitleView {
+	marks := make(map[string]ListItem, len(lis))
+	for _, li := range lis {
+		if li.Provider == "UserSubtitle" {
+			marks[li.ID] = li
+		}
+	}
+	out := make([]models.UserSubtitleTrack, len(subs))
+	copy(out, subs)
+	for i := range out {
+		if li, ok := marks[out[i].ID]; ok {
+			out[i].Default = li.Default
+			out[i].Saved = li.Saved
+			out[i].Suggested = li.Suggested
+		}
+	}
+	// Whether the switch is off is a property of the whole list, not of any
+	// upload: it is off when the "None" item is the default. Read from the
+	// same lis the marks come from, so it is false on the async reload for
+	// the same reason the marks are.
+	off := false
+	for _, li := range lis {
+		if li.ID == "none" && li.Default {
+			off = true
+		}
+	}
+	// RenderChips is deliberately left false: this is the initial render,
+	// where the dialog's own track loop already emits every upload as a
+	// chip inside the radiogroup. The partial here contributes only the
+	// disclosure button and the uploads panel, which live outside it. The
+	// async reload (handlers/user_subtitle.buildView) is the render that
+	// sets it.
+	return &models.UserSubtitleView{
+		ResourceID:    resourceID,
+		Path:          path,
+		EIURL:         eiURL,
+		UserSubtitles: out,
+		ExpandedLang:  expandedLang,
+		SubtitlesOff:  off,
+	}
+}
+
+func (s *Helper) GetDurationSec(mp *api.MediaProbe) string {
+	return mp.Format.Duration
+}
+
+func (s *Helper) HasControls(settings *models.StreamSettings) bool {
+	if settings.Controls == nil {
+		return true
+	}
+	controls := *settings.Controls
+	return controls
+}
+
+// jobs/scripts startAudio is a copy of this default rule (that package
+// cannot import this one); TestStartAudio_IsThePickersDefault fails when
+// they part.
+func (s *Helper) GetAudioTracks(ud *models.VideoStreamUserData, mp *api.MediaProbe) []ListItem {
+	var res []ListItem
+	if mp == nil {
+		res = append(res, ListItem{
+			ID:    "1",
+			Label: "Audio #1",
+		})
+	} else {
+		i := 0
+		for _, stream := range mp.Streams {
+			if stream.CodecType == "audio" {
+				meta := ""
+				if stream.ChannelLayout != "" {
+					meta = stream.ChannelLayout
+				}
+				if meta != "" {
+					meta = " (" + meta + ")"
+				}
+				title := fmt.Sprintf("Audio%v #%v", meta, i+1)
+				if stream.Tags.Title != "" {
+					title = stream.Tags.Title + meta
+				}
+
+				res = append(res, ListItem{
+					ID:       "mp-" + strconv.Itoa(i),
+					MPID:     strconv.Itoa(i),
+					Label:    title,
+					SrcLang:  stream.Tags.Language,
+					Provider: "MediaProbe",
+				})
+				i++
+			}
+		}
+	}
+	// markSaved=false: Saved is a subtitle-only field (the audio list has
+	// no rule the player must not re-decide over), so the audio choice is
+	// honoured without writing a value nothing reads.
+	lis := s.canonizeSrcLangs(res)
+	// A choice carried over from the previous file outranks this file's own
+	// saved one (carry.go).
+	id := ud.AudioID
+	if cid := carryAudioID(lis, ud.Carry); cid != "" {
+		id = cid
+	}
+	return s.selectListItem(lis, id, ud, false)
+}
+
+type langIndex map[language.Tag]int
+
+// selectListItem marks the default of a list: the viewer's saved id when
+// it names one of the items, otherwise an Accept-Language match, otherwise
+// the first item. markSaved says whether a matched id also sets Saved --
+// true for the subtitle list, where "the viewer chose this" is a state the
+// player has to respect, false for the audio list, which has no such rule
+// and would only be carrying a field nobody reads.
+func (s *Helper) selectListItem(lis []ListItem, id string, ud *models.VideoStreamUserData, markSaved bool) []ListItem {
+	if len(lis) == 0 {
+		return lis
+	}
+	for i, li := range lis {
+		if li.ID == id {
+			lis[i].Default = true
+			// id is the viewer's saved choice on every call that passes
+			// one; the ladder's fallback call passes "" and marks nothing.
+			lis[i].Saved = markSaved && id != ""
+			return lis
+		}
+	}
+	for _, li := range lis {
+		if li.Default {
+			return lis
+		}
+	}
+
+	lis[s.fallbackIndex(lis, ud)].Default = true
+	return lis
+}
+
+// fallbackIndex is the phase-1 answer: the Accept-Language match, or the
+// first item (the "None" entry) when nothing matches. Split out of
+// selectListItem so the same answer can be computed without marking
+// anything -- which is what a suggestion needs.
+func (s *Helper) fallbackIndex(lis []ListItem, ud *models.VideoStreamUserData) int {
+	index, err := s.matchLang(lis, ud)
+	if err != nil {
+		return 0
+	}
+	return index
+}
+
+func (s *Helper) matchLang(lis []ListItem, ud *models.VideoStreamUserData) (lIndex int, err error) {
+	lx := langIndex{}
+	// Built by ranging `lis`, never by ranging `lx`: language.Matcher breaks
+	// a tie by position in the supported list, and Go randomizes map
+	// iteration, so the map order gave a different answer per render
+	// whenever two candidates sat the same distance from the request
+	// (es-AR/es-CL/es-CO against Accept: es-MX, measured at 74/13/12 over
+	// 3000 draws). List order also makes the tie-break "earliest on the
+	// ladder wins", which is the rule the rest of this file already follows.
+	var langs []language.Tag
+	for i, li := range lis {
+		// Forced (signs-only) tracks are never a candidate for automatic
+		// language-based selection: they're not a full subtitle track, and
+		// picking one silently instead of "no subtitle" or a real track in
+		// the viewer's language would be a worse default. Task 3 adds the
+		// one case where a forced track IS the right default (forced track
+		// in the preferred language while the audio is already in that
+		// language) as a rule on top of this, not by loosening this one.
+		if li.Forced {
+			continue
+		}
+		// AI translations are never a candidate here either. applyLadder
+		// promotes the AI item itself when the viewer may activate it;
+		// everything that reaches this function is a fallback, and a
+		// fallback that lands on a locked item selects a track with no
+		// Src -- subtitles "on" and nothing on screen.
+		if li.Provider == "Translated" {
+			continue
+		}
+		if t, err := language.Parse(li.SrcLang); err == nil {
+			if _, ok := lx[t]; !ok {
+				lx[t] = i
+				langs = append(langs, t)
+			}
+		}
+	}
+	matcher := language.NewMatcher(langs)
+	_, index, confidence := matcher.Match(wantedLangs(ud)...)
+	if confidence > language.No {
+		lIndex = lx[langs[index]]
+		return
+	}
+	_, index, confidence = matcher.Match(ud.FallbackLangTag)
+	if confidence > language.No {
+		lIndex = lx[langs[index]]
+		return
+	}
+	err = errors.New("no accept lang")
+	return
+}
+
+// wantedLangs is what a list is matched against: the viewer's preferred
+// language first, then the browser's Accept-Language list. One order for the
+// audio default and for the subtitle fallback (owner, 2026-09-19): a viewer
+// who set Kazakh was offered Kazakh subtitles over whatever audio their
+// browser's language implied. The preferred language already IS the
+// browser's first tag unless the profile or the player's select says
+// otherwise, so for most viewers this changes nothing.
+func wantedLangs(ud *models.VideoStreamUserData) []language.Tag {
+	if ud == nil {
+		return nil
+	}
+	if ud.ResolvedLang != "" {
+		if t, err := language.Parse(ud.ResolvedLang); err == nil {
+			return append([]language.Tag{t}, ud.AcceptLangTags...)
+		}
+	}
+	return ud.AcceptLangTags
+}
+
+func (s *Helper) canonizeSrcLangs(lis []ListItem) []ListItem {
+	for i, li := range lis {
+		if t, err := language.Parse(li.SrcLang); err == nil {
+			lis[i].SrcLang = t.String()
+			//lis[i].Label = display.English.Tags().FieldType(t)
+		}
+	}
+	return lis
+}
+
+// Bitmap subtitle codecs cannot be rendered by the browser (they need
+// OCR) and cannot be translated. hdmv_pgs is also dropped by
+// content-transcoder from the HLS subtitle group, so it must not
+// consume an MPID; the other bitmap codecs stay in the group and keep
+// their slot even though we hide them.
+var bitmapSubtitleCodecs = map[string]bool{
+	"hdmv_pgs_subtitle": true,
+	"dvd_subtitle":      true,
+	"dvb_subtitle":      true,
+	"xsub":              true,
+}
+
+// forcedTitleRe matches "forced" as a word of its own. A plain substring
+// test also hides "Unforced" and "Reinforced", losing a real subtitle
+// stream from the picker.
+//
+// Not \b: `_` is a word character, so \b never fires next to one and
+// "Forced_English", "eng_forced" and "Movie.eng_forced.srt" all read as
+// ordinary tracks. Underscore separators are the norm in scene naming and
+// in mkvmerge track names, and the cost of missing one is more than a
+// missing badge -- an undetected forced track passes isHumanFull, which
+// makes it eligible as the ladder's default AND as a translation source,
+// i.e. a paid AI run over a signs-only file.
+//
+// The class is [^a-z0-9] under (?i), which Go folds to "not a letter and
+// not a digit": separators match, letters on either side do not.
+var forcedTitleRe = regexp.MustCompile(`(?i)(^|[^a-z0-9])forced($|[^a-z0-9])`)
+
+// textSubtitleCodecs mirrors content-transcoder's list of the same name
+// (services/hls.go): the subtitle codecs it converts to webvtt. Any other
+// non-PGS stream still has its s<N> slot in the HLS group, but the
+// transcoder never produces a playlist for it -- only an empty one. Offered
+// in the picker, such a track shows nothing, can win the default, and can
+// be picked as a translation source that holds a live job for the whole
+// film. Codec-less streams, hdmv_text_subtitle and dvb_teletext are the
+// ones that used to get through (not bitmaps, so not caught above).
+var textSubtitleCodecs = map[string]bool{
+	"subrip":     true,
+	"srt":        true,
+	"ass":        true,
+	"ssa":        true,
+	"webvtt":     true,
+	"mov_text":   true,
+	"text":       true,
+	"microdvd":   true,
+	"subviewer":  true,
+	"subviewer1": true,
+	"sami":       true,
+	"realtext":   true,
+	"mpl2":       true,
+	"pjs":        true,
+	"jacosub":    true,
+	"vplayer":    true,
+	"stl":        true,
+	"eia_608":    true,
+}
+
+// embeddedSubtitleVisible reports whether an embedded subtitle stream
+// is offered in the picker, whether it occupies an index in the
+// transcoder's HLS subtitle group (see content-transcoder
+// services/hls.go: everything but hdmv_pgs is included), and whether
+// it is a "forced" (signs-only) track by title until content-prober
+// exposes ffprobe's disposition flags. Only codecs the transcoder
+// converts are visible (textSubtitleCodecs); the slot does not depend
+// on that.
+func embeddedSubtitleVisible(codecName, title string) (visible bool, countsForHLS bool, forced bool) {
+	if codecName == "hdmv_pgs_subtitle" {
+		return false, false, false
+	}
+	if bitmapSubtitleCodecs[codecName] || !textSubtitleCodecs[codecName] {
+		return false, true, false
+	}
+	return true, true, forcedTitleRe.MatchString(title)
+}
+
+// embeddedPlaylistURL is the transcoder's subtitle variant for embedded
+// stream i: the same s<N>.m3u8 hls.js plays, so the translation service
+// follows exactly the track the viewer sees. N is the index among the
+// non-PGS subtitle streams -- the transcoder's numbering (NewHLS in
+// content-transcoder counts the same set).
+func embeddedPlaylistURL(base string, i int) string {
+	u, err := url.Parse(base)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	u.Path += "/s" + strconv.Itoa(i) + ".m3u8"
+	return u.String()
+}
+
+// sidecarForced reports whether a side-loaded (ExportTag) track is a
+// "forced" (signs-only) track by its label or source URL.
+func sidecarForced(label, src string) bool {
+	return forcedTitleRe.MatchString(label) || forcedTitleRe.MatchString(src)
+}
+
+// badgeFor names the origin badge shown on a list item (i18n key
+// action.stream.badge.<Badge>). A forced track always gets "forced"
+// regardless of provider, since that is the more useful signal to the
+// viewer than where the track came from.
+func badgeFor(provider string, forced bool) string {
+	if forced {
+		return "forced"
+	}
+	switch provider {
+	case "UserSubtitle":
+		return "user"
+	case "MediaProbe":
+		return "embedded"
+	case "ExportTag", "External":
+		return "sidecar"
+	case "OpenSubtitles":
+		return "os"
+	case "Translated":
+		return "ai"
+	}
+	return ""
+}
+
+// baseLang reduces a language tag to its base ("por" and "pt-BR" both
+// become "pt"), the granularity every rule of the ladder works at. An
+// unparseable or undetermined tag yields "", which the rules read as
+// "language unknown".
+func baseLang(tag string) string {
+	t, err := language.Parse(tag)
+	if err != nil {
+		return ""
+	}
+	b, conf := t.Base()
+	if conf == language.No {
+		return ""
+	}
+	return b.String()
+}
+
+// defaultAudioLang is the base language of the audio the viewer will
+// actually hear: the Default item of GetAudioTracks (the Accept-Language
+// match), not the first audio stream of the probe. "" when the language
+// of that track is unknown.
+func (s *Helper) defaultAudioLang(ud *models.VideoStreamUserData, mp *api.MediaProbe) string {
+	for _, a := range s.GetAudioTracks(ud, mp) {
+		if a.Default {
+			return baseLang(a.SrcLang)
+		}
+	}
+	return ""
+}
+
+// rankUnknown is the rank of an item outside the ladder ("None", and any
+// provider added later without a rank of its own): it always sorts last.
+// Ranks 6-8 are reserved for sources between the AI translation and
+// unknown (phase 3 whisper transcription takes 6).
+const rankUnknown = 9
+
+// hashMatched answers whether an OpenSubtitles track was found by the
+// moviehash of this very file rather than by title. The bool is the ground
+// truth and wins where the service sent one; the Source enum is the
+// fallback for a video-info that predates it. Asked of a non-OpenSubtitles
+// item it answers false, which is why every caller tests the provider
+// first.
+func hashMatched(li ListItem) bool {
+	if li.MovieHashMatch != nil {
+		return *li.MovieHashMatch
+	}
+	return li.Source == "hash"
+}
+
+// imdbMatched is "we know this OpenSubtitles track was matched by title",
+// which is not the same as "not a hash match": a track whose origin the
+// service never reported is unknown, and telling the viewer it may be out
+// of sync would be a claim nobody made.
+//
+// So the enum is tested for the value that means it, not for being
+// non-empty (review I4). `!= ""` read every third value as imdb --
+// video-info only ever sends "hash" or "imdb", but the fixture's own
+// "opensubtitles" placeholder was enough to put "may be out of sync" on
+// seven chips that had never been matched by anything.
+func imdbMatched(li ListItem) bool {
+	if li.Provider != "OpenSubtitles" || hashMatched(li) {
+		return false
+	}
+	if li.MovieHashMatch != nil {
+		return true // the bool said false, which is the claim itself
+	}
+	return li.Source == "imdb"
+}
+
+// ladderRank orders subtitle sources from the one the viewer trusts most
+// (what they uploaded themselves) to the one they trust least (a machine
+// translation). Within OpenSubtitles a hash match is a match on this very
+// file, while an imdb match is only the same title, so it can be out of
+// sync. The rank is also rendered as data-rank: the player reuses this
+// order when it has to pick a default itself instead of reimplementing
+// the ladder in JS.
+func ladderRank(li ListItem) int {
+	switch li.Provider {
+	case "UserSubtitle":
+		return 0
+	case "MediaProbe":
+		return 1
+	case "ExportTag", "External":
+		return 2
+	case "OpenSubtitles":
+		if hashMatched(li) {
+			return 3
+		}
+		return 4
+	case "Translated":
+		return 5
+	}
+	return rankUnknown
+}
+
+// isHumanFull reports whether the item is a complete, human-made subtitle
+// track: not the "None" entry, not a signs-only (forced) track, not a
+// machine translation.
+func isHumanFull(li ListItem) bool {
+	return li.ID != "none" && !li.Forced && li.Provider != "Translated"
+}
+
+// bestByLadder returns the index of the best item in lang by ladderRank,
+// among forced or among full tracks (never mixing the two), or -1.
+func bestByLadder(lis []ListItem, lang string, forced bool) int {
+	best, rank := -1, 99
+	for i, li := range lis {
+		if li.ID == "none" || li.Provider == "Translated" || li.Forced != forced || baseLang(li.SrcLang) != lang {
+			continue
+		}
+		if r := ladderRank(li); r < rank {
+			best, rank = i, r
+		}
+	}
+	return best
+}
+
+// isEmbeddedSource reports whether the item is an embedded (MediaProbe)
+// track, whose Src -- when it has one at all -- is the live subtitle
+// playlist of the viewer's own transcoder session. Everything else is a
+// finished file: an upload, a sidecar shipped in the torrent, an
+// OpenSubtitles track.
+func isEmbeddedSource(li ListItem) bool {
+	return li.Provider == "MediaProbe"
+}
+
+// translationSourceRank breaks a tie between two file sources of the same
+// language. It is deliberately NOT ladderRank: that order answers "which
+// track does the viewer want to read", this one answers "which text is the
+// machine most likely to translate correctly".
+//
+// The sidecar sits above the hash-matched OpenSubtitles track (owner
+// ruling, 2026-09-17, reversing 2026-09-16). A hash match guarantees the
+// TIMING fits this very file; it says nothing about the TEXT, and
+// community uploads routinely carry injected ad cues -- the demo film's
+// hash-matched English track turned out to be mostly ads, and the machine
+// translated the ads. A sidecar shipped in the torrent is whatever the
+// release carries: its timing can be off for another cut, but its text is
+// the film's, and a wrongly-timed line is a smaller failure for a
+// translation source than a correctly-timed advertisement.
+//
+// Embedded tracks never reach this function: they are a bucket of their
+// own (see pickTranslationSource).
+func translationSourceRank(li ListItem) int {
+	switch li.Provider {
+	case "UserSubtitle":
+		return 0
+	case "ExportTag", "External":
+		return 1
+	case "OpenSubtitles":
+		if hashMatched(li) {
+			return 2
+		}
+		return 3
+	}
+	return rankUnknown
+}
+
+// pickTranslationSource picks the human track the AI translation is made
+// from: a non-forced, URL-backed track.
+//
+// The LANGUAGE of the source decides first: the audio language (a
+// transcription of what is being said, not a translation of a translation),
+// then English, then anything. Within one language tier a FILE source wins
+// over an embedded one (owner ruling, 2026-09-16), for cost:
+//
+//   - A file is one fetch of seconds-to-minutes and leaves a final
+//     artifact cached under ArtifactKey for every later viewer. The
+//     embedded source is the live playlist of *this* viewer's transcoder
+//     session: it runs at transcode speed, holds one of the service's
+//     --live-max-jobs slots for the length of the film, stops when the
+//     viewer leaves, and caches a final only for a contiguous run from
+//     offset 0.
+//
+// Until 2026-09-18 the bucket was picked before the language: any file beat
+// every embedded track. A release with thirty-seven embedded tracks, English
+// among them, and three hash-matched OpenSubtitles files in Croatian, Czech
+// and Romanian was therefore translated into Georgian from the Croatian --
+// a translation of a translation, through a pair the model is weak in,
+// with the original sitting in the file. The cost argument still holds
+// where it costs nothing in quality (same tier), and the live playlist is
+// now paid for only when no file is in the audio language or in English.
+//
+// Embedded tracks remain a source when they carry a playlist Src
+// (transcoder session); a native MP4 without a session has none, and a
+// file-less, session-less list yields no translation at all.
+func pickTranslationSource(lis []ListItem, audioLang string) *ListItem {
+	file := translationCandidates(lis, audioLang, false)
+	embedded := translationCandidates(lis, audioLang, true)
+	for _, c := range []*ListItem{
+		file.audio, embedded.audio,
+		file.en, embedded.en,
+		file.any, embedded.any,
+	} {
+		if c != nil {
+			return c
+		}
+	}
+	return nil
+}
+
+// sourceCandidates is one bucket's best track per language tier.
+//
+// When the audio is English the audio tier takes every English track and
+// en stays nil: the two preferences want the same track there, and audio
+// is read first anyway. So en is not a running "best English track", and
+// nothing may read it as one.
+type sourceCandidates struct {
+	audio, en, any *ListItem
+}
+
+// translationCandidates fills the tiers for one bucket: the file sources
+// (embedded=false) or the embedded ones (embedded=true).
+// translationSourceRank breaks ties inside a tier; strictly better, so
+// equal ranks keep the first item seen and the list order stays the last
+// tie-break (it is the only stable one the embedded bucket has: every
+// embedded track ranks the same).
+func translationCandidates(lis []ListItem, audioLang string, embedded bool) sourceCandidates {
+	var c sourceCandidates
+	better := func(cur, cand *ListItem) bool {
+		return cur == nil || translationSourceRank(*cand) < translationSourceRank(*cur)
+	}
+	for i := range lis {
+		li := &lis[i]
+		if !isHumanFull(*li) || li.Src == "" {
+			continue
+		}
+		if isEmbeddedSource(*li) != embedded {
+			continue
+		}
+		if better(c.any, li) {
+			c.any = li
+		}
+		switch baseLang(li.SrcLang) {
+		case audioLang:
+			if audioLang != "" && better(c.audio, li) {
+				c.audio = li
+			}
+		case "en":
+			if better(c.en, li) {
+				c.en = li
+			}
+		}
+	}
+	return c
+}
+
+// applyLadder decides what the viewer gets selected when they have a
+// preferred content language: the best human track in that language, or
+// an AI translation offered (never started) when there is none -- with the
+// best English track playing meanwhile (offeredDefault) -- or nothing at
+// all when the audio is already in that language (then only a forced
+// track, if the file has one, is turned on). The viewer's own saved choice
+// always wins. When the preferred language yields nothing at all, the
+// phase-1 selection (Accept-Language, then the English fallback) still
+// applies: a language the ladder cannot serve must not switch subtitles
+// off.
+//
+// lis always starts with the "None" item, which GetSubtitles prepends
+// before anything else, so lis[0] is the safe "no subtitles" default.
+func (s *Helper) applyLadder(lis []ListItem, ud *models.VideoStreamUserData, audioLang string, opts SubtitleOpts) []ListItem {
+	lang := opts.PreferredLang
+	humanIdx := bestByLadder(lis, lang, false)
+	if humanIdx < 0 && opts.Translate {
+		// A language the translation service does not know is not offered
+		// at all: an item leading to a rejected request is worse than no
+		// item.
+		if l := stremio.LanguageByCode(lang); l != nil {
+			if src := pickTranslationSource(lis, audioLang); src != nil {
+				tr := ListItem{
+					ID:       "tr-" + lang,
+					Label:    l.Name + " · AI",
+					SrcLang:  lang,
+					Kind:     "subtitles",
+					Provider: "Translated",
+					Badge:    badgeFor("Translated", false),
+					// SourceBadge is the origin shown in the picker,
+					// SourceID the item it came from; Source stays empty
+					// (it is the OpenSubtitles hash|imdb enum).
+					SourceBadge: src.Badge,
+					SourceID:    src.ID,
+				}
+				tr.Rank = ladderRank(tr)
+				if opts.Paid {
+					tr.Src = api.TranslateURL(src.Src, lang, opts.Names)
+				} else {
+					// A locked item carries no Src on purpose: the URL is
+					// the entitlement, so a free viewer must not receive
+					// one even hidden in the markup.
+					tr.Locked = true
+				}
+				// TranslateURL refuses a source that is not an absolute
+				// URL, and an unlocked item with no Src is a track that
+				// selects and shows nothing. The locked item is the one
+				// legitimate Src-less case (it is an upsell, not a track).
+				if tr.Locked || tr.Src != "" {
+					lis = append(lis, tr)
+				}
+			}
+		}
+	}
+	// The viewer's saved choice always wins, and is the only default:
+	// ExternalData may have marked a track Default already. A choice that
+	// now points at a locked item (an AI track saved while the viewer was
+	// paying) is ignored, and the ladder decides as if nothing was saved.
+	if ud.SubtitleID != "" {
+		for i := range lis {
+			if lis[i].ID == ud.SubtitleID && !lis[i].Locked {
+				// "Off" is a state of the picker's toggle, not the absence
+				// of a choice: the toggle still has to know what it would
+				// turn on. Computed before the Defaults are cleared, so an
+				// embed's own track is read the same way the ladder reads
+				// it below.
+				if lis[i].ID == "none" {
+					up := s.ladderPick(lis, ud, audioLang, opts, humanIdx, true)
+					markUpsell(lis, up)
+					if p := s.ladderPick(lis, ud, audioLang, opts, humanIdx, false); p > 0 && lis[p].Provider == "Translated" {
+						// Same split as below: an offer, never the switch's
+						// answer. The switch restores what the ladder would
+						// have played beside the offer -- the English track
+						// (offeredDefault); with none, nothing is marked here
+						// and offSuggestion decides once the defaults are
+						// settled.
+						markOffered(lis, p)
+						markSuggested(lis, s.offeredDefault(lis, ud))
+					} else if e := s.offeredDefault(lis, ud); e > 0 && lis[up].Provider == "Translated" {
+						// Beside an upsell (a viewer who cannot run the
+						// translation) the switch restores the same English
+						// track the ladder plays below.
+						markSuggested(lis, e)
+					} else {
+						markSuggested(lis, p)
+					}
+				}
+				// Any other saved track withdraws the offer: the viewer has
+				// dealt with subtitles -- the English track the ladder plays
+				// beside it included, once the viewer has chosen it. The
+				// next episode keeps the offer because the player carries
+				// only a choice (readCarry reads data-saved), not what the
+				// ladder turned on; its ladder then runs as on any page.
+				for j := range lis {
+					lis[j].Default = false
+				}
+				lis[i].Default = true
+				lis[i].Saved = true
+				return lis
+			}
+		}
+	}
+	up := s.ladderPick(lis, ud, audioLang, opts, humanIdx, true)
+	markUpsell(lis, up)
+	pick := s.ladderPick(lis, ud, audioLang, opts, humanIdx, false)
+	// A translation is never turned on for the viewer (owner, 2026-09-16):
+	// starting one spends tokens, so it takes an explicit click. Where the
+	// ladder chose it, the item is marked Offered -- the picker draws that
+	// as an action ("Translate to Portuguese"), not as a selection -- and
+	// offeredDefault decides what plays meanwhile: the English track, or
+	// "None" when the file has none.
+	if lis[pick].Provider == "Translated" {
+		markOffered(lis, pick)
+		lis[s.offeredDefault(lis, ud)].Default = true
+		return lis
+	}
+	// The same rule for a viewer who cannot run the translation (owner,
+	// 2026-09-28: a free viewer, whose translation chip is an upsell): the
+	// English track plays beside the upsell. Without one, the phase-1
+	// selection below still decides, as it did before.
+	if lis[up].Provider == "Translated" {
+		if e := s.offeredDefault(lis, ud); e > 0 {
+			lis[e].Default = true
+			return lis
+		}
+	}
+	lis[pick].Default = true
+	return lis
+}
+
+// ladderPick is the ladder's own answer -- the index applyLadder makes
+// Default when the viewer has saved nothing. It is a pure lookup so the
+// same answer can be marked instead of selected: Suggested when the viewer
+// has subtitles off, Offered when the answer is a translation.
+//
+// humanIdx is bestByLadder's verdict for the preferred language, passed in
+// because applyLadder computes it before appending the AI item (appending
+// never shifts an existing index).
+//
+// admitLocked asks the same question for a viewer who could run the
+// translation: a locked item answers too. Only markUpsell reads that answer;
+// nothing is ever selected or offered from it.
+func (s *Helper) ladderPick(lis []ListItem, ud *models.VideoStreamUserData, audioLang string, opts SubtitleOpts, humanIdx int, admitLocked bool) int {
+	// An embed that asked for a specific track (ExternalData) has already
+	// marked it Default; that is the caller's explicit choice, and the
+	// ladder neither overrides it nor adds a second default to the list.
+	for i := range lis {
+		if lis[i].Default {
+			return i
+		}
+	}
+	// Subtitles are not needed when the audio is already in the preferred
+	// language. opts.PreferredLang is never "" here (GetSubtitles takes the
+	// legacy path then), so an unknown audio language ("") counts as needed.
+	if audioLang == opts.PreferredLang {
+		if f := bestByLadder(lis, opts.PreferredLang, true); f >= 0 {
+			return f
+		}
+		return 0 // "None"
+	}
+	if humanIdx >= 0 {
+		return humanIdx
+	}
+	for i := range lis {
+		// An offer, not a selection: since 2026-09-16 applyLadder turns
+		// this answer into Offered rather than Default, and the picker
+		// refuses to start a translation without a click. A locked item is
+		// not even offered -- it cannot be turned on, and the lock plus its
+		// CTA already say so.
+		if lis[i].Provider == "Translated" && (admitLocked || !lis[i].Locked) {
+			return i
+		}
+	}
+	// The preferred language yielded nothing activatable. Falling through
+	// to "None" would take subtitles away from viewers who had them in
+	// phase 1, so the old Accept-Language selection decides instead.
+	return s.fallbackIndex(lis, ud)
+}
+
+// offeredDefault is what plays while the ladder's answer is a translation
+// the viewer has not started (Offered): the best full human track in the
+// fallback language -- English -- by ladderRank, or "None" (index 0) when
+// the file has no such track.
+//
+// Owner, 2026-09-28: "show the main subtitles and offer to translate
+// them". Until then this was always "None" (owner, 2026-09-18): the offer
+// meant the viewer could have their own language in one click, so nothing
+// else was switched on -- and a viewer watching an English film with no
+// subtitles in their language saw nothing on screen until they clicked.
+//
+// What the 2026-09-18 rule was protecting still holds: the browser's
+// Accept-Language is NOT consulted here. That was the actual complaint --
+// a viewer who asked for Serbian got the Russian track their browser
+// implied, which read as the setting being ignored. English is not a guess
+// about the viewer; it is the one fallback language every viewer gets, the
+// same one the phase-1 fallback ends on (fallbackLang).
+//
+// Everything the rule does not touch is decided before this is reached:
+// a human track in the preferred language wins (humanIdx), audio already
+// in that language gets only a forced track or nothing, a saved choice
+// returns before the ladder runs, an embed's own track is a Default
+// ladderPick returns first, and a viewer
+// who cannot run the translation (locked, NSFW, unknown language) never
+// gets an Offered item and keeps the phase-1 fallback. A viewer whose
+// preferred language IS English never gets here with an English track on
+// the list: that track would have been humanIdx.
+//
+// The client re-runs the same rule on an audio switch (pickDefaultSubtitle
+// in subtitle-rules.js, FALLBACK_LANG), reading data-rank, so the track it
+// lands on is this one.
+//
+// Only a track whose language was DECLARED: not an embedded stream
+// labelled English for lack of a tag (LangGuessed), and not an "und"
+// tag, whose Base is CLDR's Low-confidence guess of English -- baseLang
+// accepts that, and bestByLadder with it. Either one turned a Spanish or
+// Chinese track on as "English" beside the offer, ahead of a real English
+// track of a worse rank.
+func (s *Helper) offeredDefault(lis []ListItem, ud *models.VideoStreamUserData) int {
+	l := fallbackLang(ud)
+	if l == "" {
+		return 0
+	}
+	best, rank := 0, rankUnknown+1
+	for i, li := range lis {
+		if !isHumanFull(li) || li.LangGuessed || declaredLang(li.SrcLang) != l {
+			continue
+		}
+		if r := ladderRank(li); r < rank {
+			best, rank = i, r
+		}
+	}
+	return best
+}
+
+// declaredLang is baseLang for a tag that names its language: "" for "und"
+// and anything else whose base is only inferred.
+func declaredLang(tag string) string {
+	t, err := language.Parse(tag)
+	if err != nil {
+		return ""
+	}
+	b, conf := t.Base()
+	if conf != language.Exact {
+		return ""
+	}
+	return b.String()
+}
+
+// fallbackLang is the base language of the phase-1 fallback,
+// ud.FallbackLangTag: English for every stream (NewVideoStreamUserData).
+// offeredDefault falls back to it too, so "the language subtitles fall
+// back to" is one field, not a second constant beside it.
+//
+// "" when the tag is unset. A zero Tag is "und", whose Base is a guess
+// (en, Low), not a setting -- and matchLang, the phase-1 side, gets No
+// confidence from it and falls back to nothing, so reading it as English
+// here would make the two fallbacks disagree.
+func fallbackLang(ud *models.VideoStreamUserData) string {
+	if ud == nil {
+		return ""
+	}
+	b, conf := ud.FallbackLangTag.Base()
+	if conf != language.Exact {
+		return ""
+	}
+	return b.String()
+}
+
+// markOffered marks the translation the viewer may start. Never the item
+// that is already playing: a translation saved in an earlier session comes
+// back as Default, and an invitation to start what is already on screen is
+// nonsense -- the chip has to read as a track, not as a verb.
+//
+// Locked is the same rule seen from the other side: a free viewer cannot
+// run it, so it is an upsell and not an action. Neither case can reach
+// here today -- a saved translation is never the item passed in (the
+// saved-choice branch marks only the ladder's pick, and only while
+// subtitles are saved off), and ladderPick never answers with a locked
+// item -- which is why this says the rule rather than enforcing a
+// possibility. It is the one place every call site passes through, so both
+// conditions are written once and read together.
+func markOffered(lis []ListItem, i int) {
+	if i < 0 || i >= len(lis) || lis[i].Default || lis[i].Locked {
+		return
+	}
+	lis[i].Offered = true
+}
+
+// markUpsell marks the locked translation the ladder would have offered.
+// An unlocked one is Offered instead, never both.
+func markUpsell(lis []ListItem, i int) {
+	if i < 0 || i >= len(lis) || lis[i].Provider != "Translated" || !lis[i].Locked {
+		return
+	}
+	lis[i].Upsell = true
+}
+
+// markSuggested marks the item the picker would turn on. "None" is never
+// suggested: it is the state the viewer is already in.
+func markSuggested(lis []ListItem, i int) {
+	if i < 0 || i >= len(lis) || lis[i].ID == "none" {
+		return
+	}
+	lis[i].Suggested = true
+}
+
+// offSuggestion is what the picker's switch turns on when the list opens
+// with no subtitles -- the state the ladder reaches on its own whenever
+// the audio is already in the viewer's language, not only when the viewer
+// saved it.
+//
+// The rungs, in order:
+//
+//  1. the best full human track in the preferred language (the ladder's own
+//     first choice);
+//  2. a forced (signs-only) track in the preferred language -- a real
+//     subtitle in the right language beats a full one in a language the
+//     viewer did not ask for. Reached when the audio is in a third
+//     language: the ladder never turns a forced track on there (that rule
+//     is for audio already in the viewer's language), so it lands on "None"
+//     and this is what the switch has to offer. Not reached when a
+//     translation is Offered and the file has an English track: the ladder
+//     then plays that track (offeredDefault), and with subtitles saved off
+//     applyLadder marks it Suggested itself -- the switch restores what the
+//     ladder would have played, as everywhere else;
+//  3. the Accept-Language pick (fallbackIndex), which knows nothing about
+//     the preferred language;
+//  4. the best activatable track whatever its language.
+//
+// What is NOT a rung, since 2026-09-16: the AI translation. The switch
+// restores what the viewer had; it never spends tokens on their behalf, so
+// a translation is reached only by clicking its chip, through
+// data-last-subtitle (one they already ran this session), or through the
+// mount-time restore of one they saved earlier -- all cached, none of them
+// this function's business. Where the ladder would have chosen a
+// translation, applyLadder marks it Offered, which is a different field
+// from Suggested: this function still runs in that state, and still has to
+// find the switch something real to restore.
+//
+// Rung 4 is the one the ladder itself would never take. The ladder answers
+// "should subtitles be on"; this answers "the viewer just said they should
+// be", and a switch that does nothing when pressed is worse than one that
+// gives the best track available.
+//
+// Deliberately NOT routed through ladderPick, close as the two orders are:
+// every state that reaches offSuggestion already has the "None" item marked
+// Default, and ladderPick answers with the first Default it finds -- index
+// 0, before it can consider anything else. Calling it here is dead code
+// that silently costs rung 2.
+//
+// -1 when there is nothing to turn on at all (an empty list, or only a
+// locked AI item): then the switch has no promise to make.
+func (s *Helper) offSuggestion(lis []ListItem, ud *models.VideoStreamUserData, opts SubtitleOpts) int {
+	if opts.PreferredLang != "" {
+		if i := bestByLadder(lis, opts.PreferredLang, false); i >= 0 {
+			return i
+		}
+		if i := bestByLadder(lis, opts.PreferredLang, true); i >= 0 {
+			return i
+		}
+	}
+	if i := s.fallbackIndex(lis, ud); i > 0 {
+		return i
+	}
+	for i := range lis {
+		// No Translated guard here, and none is needed: the AI item is
+		// appended last and exists only when some side-loaded track was
+		// found to translate FROM, so that source -- activatable, earlier
+		// in the list -- is always reached first. A guard that cannot fire
+		// reads like a rule and is really a decoration.
+		if lis[i].ID != "none" && !lis[i].Locked {
+			return i
+		}
+	}
+	return -1
+}
+
+func tagTracks(tag *ra.ExportTag) []ra.ExportTrack {
+	if tag == nil {
+		return nil
+	}
+	return tag.Tracks
+}
+
+func extTracks(ext *models.ExternalData) []models.ExternalTrack {
+	if ext == nil {
+		return nil
+	}
+	return ext.Tracks
+}
+
+func (s *Helper) GetSubtitles(ud *models.VideoStreamUserData, mp *api.MediaProbe, tag *ra.ExportTag, opensubs []api.OpenSubtitleTrack, ext *models.ExternalData, userSubs []models.UserSubtitleTrack, opts SubtitleOpts) []ListItem {
+	var res []ListItem
+	res = append(res, ListItem{
+		ID:    "none",
+		Label: "None",
+		Kind:  "subtitles",
+	})
+	if mp != nil {
+		i := 0
+		for _, stream := range mp.Streams {
+			if stream.CodecType != "subtitle" {
+				continue
+			}
+			visible, counts, forced := embeddedSubtitleVisible(stream.CodecName, stream.Tags.Title)
+			if !counts {
+				continue
+			}
+			if visible {
+				label := fmt.Sprintf("Subtitle #%v", i+1)
+				if stream.Tags.Title != "" {
+					label = stream.Tags.Title
+				}
+				srcLang := "eng"
+				if stream.Tags.Language != "" {
+					srcLang = stream.Tags.Language
+				}
+				src := ""
+				if opts.HLSSessionBase != "" {
+					src = embeddedPlaylistURL(opts.HLSSessionBase, i)
+				}
+				res = append(res, ListItem{
+					ID:       "mp-" + strconv.Itoa(i),
+					MPID:     strconv.Itoa(i),
+					Label:    label,
+					SrcLang:  srcLang,
+					Kind:     "subtitles",
+					Provider: "MediaProbe",
+					Src:      src,
+					Forced:   forced,
+					Badge:    badgeFor("MediaProbe", forced),
+					// srcLang above is a guess ("eng") when the tag is absent.
+					LangGuessed: stream.Tags.Language == "",
+				})
+			}
+			i++
+		}
+	}
+	// tag and ext come straight off the export response
+	// (exportResponse.ExportItems["stream"].Tag) and the embed's own data;
+	// either can be nil. A nil dereference inside a template func is
+	// re-panicked by text/template rather than wrapped, so it surfaces as a
+	// 500 with no route context.
+	for i, t := range tagTracks(tag) {
+		forced := sidecarForced(t.Label, t.Src)
+		res = append(res, ListItem{
+			ID:       "et-" + strconv.Itoa(i+1),
+			Label:    t.Label,
+			SrcLang:  t.SrcLang,
+			Kind:     string(t.Kind),
+			Src:      t.Src,
+			Provider: "ExportTag",
+			Forced:   forced,
+			Badge:    badgeFor("ExportTag", forced),
+		})
+	}
+	for _, t := range opensubs {
+		res = append(res, ListItem{
+			ID:             "os-" + t.ID,
+			Label:          t.Label,
+			SrcLang:        t.SrcLang,
+			Kind:           string(t.Kind),
+			Src:            t.Src,
+			Provider:       "OpenSubtitles",
+			Source:         t.Source,
+			MovieHashMatch: t.MovieHashMatch,
+			Badge:          badgeFor("OpenSubtitles", false),
+		})
+	}
+	for i, t := range extTracks(ext) {
+		res = append(res, ListItem{
+			ID:       "ext-" + strconv.Itoa(i+1),
+			Label:    t.Label,
+			SrcLang:  t.SrcLang,
+			Default:  t.Default,
+			Kind:     "subtitles",
+			Src:      t.Src,
+			Provider: "External",
+			Badge:    badgeFor("External", false),
+		})
+	}
+	for _, t := range userSubs {
+		res = append(res, ListItem{
+			ID:       t.ID,
+			Label:    t.Label,
+			SrcLang:  t.SrcLang,
+			Kind:     "subtitles",
+			Src:      t.Src,
+			Provider: "UserSubtitle",
+			Badge:    badgeFor("UserSubtitle", false),
+		})
+	}
+	lis := s.canonizeSrcLangs(res)
+	for i := range lis {
+		lis[i].Rank = ladderRank(lis[i])
+	}
+	audioLang := s.defaultAudioLang(ud, mp)
+	// From here on the carried choice, if this file can honour it, IS the
+	// viewer's saved choice (carry.go).
+	ud = withCarriedSubtitle(ud, lis)
+	if opts.PreferredLang == "" {
+		// Same rule as the ladder's, one phase down: with subtitles off the
+		// picker still needs the item the Accept-Language selection would
+		// have chosen, so its toggle has something to turn on.
+		if ud.SubtitleID == "none" {
+			markSuggested(lis, s.suggestIndex(lis, ud))
+		}
+		lis = s.selectListItem(lis, ud.SubtitleID, ud, true)
+	} else {
+		lis = s.applyLadder(lis, ud, audioLang, opts)
+	}
+	// lis[0] is the "None" item GetSubtitles prepends. Whenever it is the
+	// default -- saved by the viewer or reached by the ladder -- the picker
+	// renders its switch off, and the switch has to name what it would turn
+	// on. The branches above have already answered for the saved case (what
+	// the ladder would have done instead); this fills in every other way of
+	// arriving at "no subtitles".
+	if lis[0].Default && !hasSuggestion(lis) {
+		markSuggested(lis, s.offSuggestion(lis, ud, opts))
+	}
+	return s.markPreload(lis, ud)
+}
+
+func hasSuggestion(lis []ListItem) bool {
+	for i := range lis {
+		if lis[i].Suggested {
+			return true
+		}
+	}
+	return false
+}
+
+// suggestIndex is the phase-1 answer without the ladder: a Default the
+// caller already marked (an embed's own track) wins, then the
+// Accept-Language match.
+func (s *Helper) suggestIndex(lis []ListItem, ud *models.VideoStreamUserData) int {
+	for i := range lis {
+		if lis[i].Default {
+			return i
+		}
+	}
+	return s.fallbackIndex(lis, ud)
+}
+
+// markPreload sets Preload on the default track and on side-loaded tracks in
+// the viewer's Accept-Language base or English (not PreferredLang — see
+// docs/subtitle_translate.md, Known limitations), in list order, up to
+// maxPreloadTracks.
+func (s *Helper) markPreload(lis []ListItem, ud *models.VideoStreamUserData) []ListItem {
+	wanted := map[string]bool{"en": true}
+	if ud != nil && len(ud.AcceptLangTags) > 0 {
+		if base, conf := ud.AcceptLangTags[0].Base(); conf != language.No {
+			wanted[base.String()] = true
+		}
+	}
+	n := 0
+	for i, li := range lis {
+		// The Translated item is never a <track> in the page: the
+		// translation is produced on demand and polled by the player, so
+		// preloading it would start that work for every viewer.
+		if li.ID == "none" || li.Provider == "MediaProbe" || li.Src == "" || li.Provider == "Translated" {
+			continue
+		}
+		if n >= maxPreloadTracks {
+			break
+		}
+		if li.Default {
+			lis[i].Preload = true
+			n++
+			continue
+		}
+		if t, err := language.Parse(li.SrcLang); err == nil {
+			if base, _ := t.Base(); wanted[base.String()] {
+				lis[i].Preload = true
+				n++
+			}
+		}
+	}
+	return lis
+}

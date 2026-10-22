@@ -1,0 +1,194 @@
+package models
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/go-pg/pg/v10"
+	"github.com/satori/go.uuid"
+)
+
+type Movie struct {
+	*VideoContent
+
+	tableName struct{} `pg:"movie"`
+
+	MovieID         uuid.UUID  `pg:"movie_id,pk,type:uuid,default:uuid_generate_v4()"`
+	MovieMetadataID *uuid.UUID `pg:"movie_metadata_id"`
+	Path            *string    `pg:"path"`
+	FileIdx         *int       `pg:"file_idx"`
+	FileSize        *int64     `pg:"file_size"`
+	CreatedAt       time.Time  `pg:"created_at,default:now()"`
+	UpdatedAt       time.Time  `pg:"updated_at,default:now()"`
+
+	// Transient: populated by handlers from movie_status for UI badges.
+	UserWatched bool   `pg:"-"`
+	UserRating  *int16 `pg:"-"`
+
+	MediaInfo        *MediaInfo        `pg:"rel:has-one,fk:resource_id"`
+	MovieMetadata    *MovieMetadata    `pg:"rel:has-one,fk:movie_metadata_id"`
+	ResourceMetadata *ResourceMetadata `pg:"rel:has-one,fk:resource_id"`
+	LibraryItems     []*Library        `pg:"rel:has-many,fk:library_id,join_fk:resource_id"`
+}
+
+// IsAdult returns the classification flag from the joined
+// resource_metadata. Nil-safe — un-classified rows return false so
+// they render normally.
+func (s *Movie) IsAdult() bool {
+	return s.ResourceMetadata != nil && s.ResourceMetadata.IsAdult
+}
+
+func (s *Movie) GetMetadata() *VideoMetadata {
+	if s.MovieMetadata == nil {
+		return nil
+	}
+	return s.MovieMetadata.VideoMetadata
+}
+
+func (s *Movie) GetContent() *VideoContent {
+	return s.VideoContent
+}
+
+func (s *Movie) GetContentType() ContentType {
+	return ContentTypeMovie
+}
+
+func (s *Movie) GetID() uuid.UUID {
+	return s.MovieID
+}
+
+func (s *Movie) GetPath() *string {
+	return s.Path
+}
+
+func (s *Movie) GetFileIdx() *int {
+	return s.FileIdx
+}
+
+func (s *Movie) GetFileSize() *int64 {
+	return s.FileSize
+}
+
+func (s *Movie) GetIntYear() int {
+	if s.Year == nil {
+		return 0
+	}
+	return int(*s.Year)
+}
+
+func (s *Movie) GetEpisode(season int, episode int) *Episode {
+	return nil
+}
+
+func ReplaceMoviesForResource(ctx context.Context, db *pg.DB, resourceID string, movies []*Movie) error {
+	tx, err := db.BeginContext(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Close()
+	}()
+
+	// Delete existing movies for the resource
+	_, err = tx.Model((*Movie)(nil)).
+		Where("resource_id = ?", resourceID).
+		Context(ctx).
+		Delete()
+	if err != nil {
+		return err
+	}
+
+	// Insert new movies if any
+	if len(movies) > 0 {
+		_, err = tx.Model(&movies).
+			Context(ctx).
+			Insert()
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+func GetMoviesByResourceID(ctx context.Context, db *pg.DB, resourceID string) ([]*Movie, error) {
+	var movies []*Movie
+
+	err := db.Model(&movies).
+		Where("resource_id = ?", resourceID).
+		Context(ctx).
+		Select()
+
+	if err != nil {
+		return nil, err
+	}
+
+	return movies, nil
+}
+
+func GetMovieWithMetadataByResourceID(ctx context.Context, db *pg.DB, resourceID string) (*Movie, error) {
+	var m Movie
+
+	err := db.Model(&m).
+		Context(ctx).
+		Where("resource_id = ?", resourceID).
+		Relation("MovieMetadata").
+		Limit(1).
+		Select()
+
+	if errors.Is(err, pg.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return &m, nil
+}
+
+// GetMovieWithMetadataByResourceIDAndPath resolves the movie row that
+// belongs to one file of a torrent. A resource can hold several movie
+// rows (a multi-film pack), and GetMovieWithMetadataByResourceID picks
+// an arbitrary one — fine for the poster/title fallback it was written
+// for, wrong for anything keyed to the file being played, such as the
+// OpenSubtitles imdb hint.
+//
+// Resolution order:
+//
+//   - a row whose path equals pathStr — the file is enriched, use it;
+//   - otherwise, if the resource has exactly one movie row, use it: a
+//     single-film torrent's path column may be empty (rows written
+//     before the column existed) or stale (renamed file), and the one
+//     row can only be about that film;
+//   - otherwise nil, nil — several candidates and none matched, so no
+//     hint at all beats confidently naming the wrong film.
+func GetMovieWithMetadataByResourceIDAndPath(ctx context.Context, db *pg.DB, resourceID string, pathStr string) (*Movie, error) {
+	var movies []*Movie
+
+	err := db.Model(&movies).
+		Context(ctx).
+		Where("resource_id = ?", resourceID).
+		Relation("MovieMetadata").
+		Select()
+
+	if err != nil && !errors.Is(err, pg.ErrNoRows) {
+		return nil, err
+	}
+
+	return pickMovieRow(movies, pathStr), nil
+}
+
+// pickMovieRow implements the resolution order documented on
+// GetMovieWithMetadataByResourceIDAndPath.
+func pickMovieRow(movies []*Movie, pathStr string) *Movie {
+	for _, m := range movies {
+		if m.Path != nil && *m.Path == pathStr {
+			return m
+		}
+	}
+	if len(movies) == 1 {
+		return movies[0]
+	}
+	return nil
+}

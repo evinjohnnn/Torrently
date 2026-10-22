@@ -1,0 +1,15 @@
+{
+  "input": "[Cleo]Dies_Irae_-_ONA_01_(Dual Audio_10bit_BD1080p_x265).mkv",
+  "want": {
+    "title": "Dies Irae",
+    "episode": 1,
+    "resolution": "1080p",
+    "quality": "BluRay",
+    "color_depth": "10bit",
+    "codec": "x265",
+    "audio": "Dual Audio",
+    "container": "mkv",
+    "website": "Cleo",
+    "kind": "ONA"
+  }
+}

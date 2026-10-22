@@ -1,0 +1,7 @@
+{
+  "input": "tonyropeuk bbc addict british kerry louise",
+  "want": {
+    "title": "tonyropeuk bbc addict british kerry louise",
+    "adult": true
+  }
+}

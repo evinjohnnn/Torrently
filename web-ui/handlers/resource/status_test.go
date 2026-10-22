@@ -1,0 +1,555 @@
+package resource
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/webtor-io/web-ui/services/api"
+	"github.com/webtor-io/web-ui/services/statusview"
+
+	vaultModels "github.com/webtor-io/web-ui/models/vault"
+	vault "github.com/webtor-io/web-ui/services/vault"
+)
+
+// --- Mock implementations ---
+
+type mockStatusVaultDB struct {
+	resource *vaultModels.Resource
+	err      error
+}
+
+func (m *mockStatusVaultDB) GetResource(_ context.Context, _ string) (*vaultModels.Resource, error) {
+	return m.resource, m.err
+}
+
+type mockStatusVaultAPI struct {
+	resource *vault.Resource
+	err      error
+}
+
+func (m *mockStatusVaultAPI) GetResource(_ context.Context, _ string) (*vault.Resource, error) {
+	return m.resource, m.err
+}
+
+// --- Tests for resolveStatus ---
+
+func TestResolveStatus_Idle(t *testing.T) {
+	status := resolveStatus(nil, nil, nil)
+	if status.State != "idle" {
+		t.Errorf("expected idle, got %q", status.State)
+	}
+}
+
+func TestResolveStatus_IdleNotFunded(t *testing.T) {
+	db := &vaultModels.Resource{Funded: false, Vaulted: false}
+	status := resolveStatus(db, nil, nil)
+	if status.State != "idle" {
+		t.Errorf("expected idle, got %q", status.State)
+	}
+}
+
+func TestResolveStatus_Caching(t *testing.T) {
+	stats := &TorrentStatsData{Total: 100, Completed: 45, Seeders: 3}
+	status := resolveStatus(nil, nil, stats)
+	if status.State != "caching" {
+		t.Errorf("expected caching, got %q", status.State)
+	}
+	if status.Progress != 45 {
+		t.Errorf("expected progress 45, got %v", status.Progress)
+	}
+	if status.Seeders != 3 {
+		t.Errorf("expected seeders 3, got %v", status.Seeders)
+	}
+}
+
+func TestResolveStatus_Cached(t *testing.T) {
+	stats := &TorrentStatsData{Total: 100, Completed: 100, Seeders: 5}
+	status := resolveStatus(nil, nil, stats)
+	if status.State != "cached" {
+		t.Errorf("expected cached, got %q", status.State)
+	}
+}
+
+func TestResolveStatus_VaultingQueued(t *testing.T) {
+	db := &vaultModels.Resource{Funded: true, Vaulted: false}
+	apiRes := &vault.Resource{Status: vault.StatusQueued}
+	status := resolveStatus(db, apiRes, nil)
+	if status.State != "vaulting" {
+		t.Errorf("expected vaulting, got %q", status.State)
+	}
+	if status.Progress != 0 {
+		t.Errorf("expected progress 0, got %v", status.Progress)
+	}
+}
+
+func TestResolveStatus_VaultingProcessing(t *testing.T) {
+	db := &vaultModels.Resource{Funded: true, Vaulted: false}
+	apiRes := &vault.Resource{Status: vault.StatusProcessing, StoredSize: 72, TotalSize: 100}
+	status := resolveStatus(db, apiRes, nil)
+	if status.State != "vaulting" {
+		t.Errorf("expected vaulting, got %q", status.State)
+	}
+	if status.Progress != 72 {
+		t.Errorf("expected progress 72, got %v", status.Progress)
+	}
+}
+
+func TestResolveStatus_Vaulted_DB(t *testing.T) {
+	db := &vaultModels.Resource{Vaulted: true}
+	status := resolveStatus(db, nil, nil)
+	if status.State != "vaulted" {
+		t.Errorf("expected vaulted, got %q", status.State)
+	}
+}
+
+func TestResolveStatus_Vaulted_API(t *testing.T) {
+	db := &vaultModels.Resource{Funded: true, Vaulted: false}
+	apiRes := &vault.Resource{Status: vault.StatusCompleted}
+	status := resolveStatus(db, apiRes, nil)
+	if status.State != "vaulted" {
+		t.Errorf("expected vaulted, got %q", status.State)
+	}
+}
+
+func TestResolveStatus_VaultFailed(t *testing.T) {
+	db := &vaultModels.Resource{Funded: true, Vaulted: false}
+	apiRes := &vault.Resource{Status: vault.StatusFailed}
+	apiRes.Error = "unexpected status 502 downloading url=http://thp.internal:8080/abc?token=T&api-key=K"
+	status := resolveStatus(db, apiRes, nil)
+	// Funded, last transfer attempt failed: say so (the system retries). This
+	// used to hide as "vaulting".
+	if status.State != "vault_failed" {
+		t.Errorf("expected vault_failed, got %+v", status)
+	}
+	// The Vault worker's raw error quotes the URL it fetched, token and
+	// api-key included: it goes to nobody's browser.
+	b, _ := json.Marshal(status)
+	if strings.Contains(string(b), "token=") || strings.Contains(string(b), "thp.internal") {
+		t.Errorf("the Vault error went out on the status: %s", b)
+	}
+}
+
+func TestResolveStatus_VaultWaitingForSeeders(t *testing.T) {
+	db := &vaultModels.Resource{Funded: true}
+	queued := &vault.Resource{Status: vault.StatusQueued}
+	// Nothing stored, seeder in the swarm and sees nobody for the whole
+	// noSeedersAfter → waiting for seeders.
+	if st := resolveStatus(db, queued, &TorrentStatsData{Total: 100, Seeders: 0, Peers: 0, Live: true, LiveFor: noSeedersAfter}); st.State != "vault_waiting" {
+		t.Errorf("queued + empty live swarm must read vault_waiting, got %+v", st)
+	}
+	// The same swarm just come live (Vault's first read loaded the torrent):
+	// the seeder has not reached trackers and the DHT yet, an empty swarm
+	// says nothing.
+	if st := resolveStatus(db, queued, &TorrentStatsData{Total: 100, Seeders: 0, Peers: 0, Live: true, LiveFor: noSeedersAfter - time.Second}); st.State != "vaulting" || st.Progress != 0 {
+		t.Errorf("queued + swarm live for less than noSeedersAfter must read vaulting 0%%, got %+v", st)
+	}
+	// The same empty swarm from a cold reply: the seeder read the numbers
+	// from disk and did not join the swarm -- nobody streams the torrent and
+	// Vault has not started on it. Nothing is known about seeders, so no
+	// "no seeders online, points returned" to someone who has just paid.
+	if st := resolveStatus(db, queued, &TorrentStatsData{Total: 100, Seeders: 0, Peers: 0}); st.State != "vaulting" || st.Progress != 0 {
+		t.Errorf("queued + cold reply must read vaulting 0%%, got %+v", st)
+	}
+	// Peers around → plain vaulting.
+	if st := resolveStatus(db, queued, &TorrentStatsData{Total: 100, Seeders: 2, Peers: 3, Live: true, LiveFor: noSeedersAfter}); st.State != "vaulting" || st.Seeders != 2 {
+		t.Errorf("queued + peers must stay vaulting with the swarm, got %+v", st)
+	}
+	// No stats at all → we do not know, so no claim.
+	if st := resolveStatus(db, queued, nil); st.State != "vaulting" {
+		t.Errorf("queued without stats must stay vaulting, got %+v", st)
+	}
+	// Progress already made → not waiting even if the swarm emptied.
+	if st := resolveStatus(db, &vault.Resource{Status: vault.StatusProcessing, StoredSize: 50, TotalSize: 100}, &TorrentStatsData{Total: 100, Live: true, LiveFor: noSeedersAfter}); st.State != "vaulting" {
+		t.Errorf("progress > 0 must stay vaulting, got %+v", st)
+	}
+	// The whole file in the cache → Vault takes it from there: not "no
+	// seeders online". Those are the stats the loop sets for cached
+	// content (the export has no stat item), with nobody in them; and the
+	// last live frame of a torrent the seeder holds complete, before it
+	// closes the stream.
+	if st := resolveStatus(db, queued, &TorrentStatsData{Total: 1, Completed: 1, Seeders: 0}); st.State != "vaulting" || st.Progress != 0 {
+		t.Errorf("queued, cached: must read vaulting 0%%, got %+v", st)
+	}
+	if st := resolveStatus(db, queued, &TorrentStatsData{Total: 100, Completed: 100, Live: true, LiveFor: noSeedersAfter}); st.State != "vaulting" || st.Progress != 0 {
+		t.Errorf("queued, complete in a live seeder: must read vaulting 0%%, got %+v", st)
+	}
+	// Some of it cached, nobody around: still waiting for seeders -- when
+	// the seeder is in the swarm to see that.
+	if st := resolveStatus(db, queued, &TorrentStatsData{Total: 100, Completed: 40, Live: true, LiveFor: noSeedersAfter}); st.State != "vault_waiting" {
+		t.Errorf("queued, partly cached, empty live swarm: got %+v", st)
+	}
+	if st := resolveStatus(db, queued, &TorrentStatsData{Total: 100, Completed: 40}); st.State != "vaulting" {
+		t.Errorf("queued, partly cached, cold reply: must read vaulting, got %+v", st)
+	}
+}
+
+// Nothing cached yet: idle, with the swarm the seeder reports -- the
+// approved "Waiting (14 seeders)" -- and the availability it knows, so the
+// pieces nobody has can be the story before a single one is cached.
+func TestResolveStatus_IdleCarriesTheSwarm(t *testing.T) {
+	st := resolveStatus(nil, nil, &TorrentStatsData{Total: 100, Seeders: 14, Leechers: 2, Peers: 16})
+	if st.State != "idle" || st.Seeders != 14 || st.Leechers != 2 || !st.swarmKnown {
+		t.Errorf("idle with a swarm: %+v", st)
+	}
+	holes := &TorrentStatsData{Total: 100, Peers: 12, Fill: []byte{0, 0}, Active: []byte{0}, Holes: []byte{1},
+		AvailabilityKnown: true, Availability: 0.73, WantedMissing: 5, ReaderMissing: 3}
+	st = resolveStatus(nil, nil, holes)
+	if st.State != "idle" || !st.availKnown || !st.holes || st.readerMissing != 3 || st.Missing == "" || st.Pieces == "" {
+		t.Errorf("idle with holes: %+v", st)
+	}
+	// Vault's word still outranks it.
+	if st := resolveStatus(&vaultModels.Resource{Vaulted: true}, nil, holes); st.State != "vaulted" {
+		t.Errorf("vaulted: %+v", st)
+	}
+}
+
+func TestResolveStatus_CachingAndVaulting(t *testing.T) {
+	db := &vaultModels.Resource{Funded: true, Vaulted: false}
+	apiRes := &vault.Resource{Status: vault.StatusProcessing, StoredSize: 30, TotalSize: 100}
+	stats := &TorrentStatsData{Total: 100, Completed: 60, Seeders: 2}
+	status := resolveStatus(db, apiRes, stats)
+	// Vaulting has higher priority than caching
+	if status.State != "vaulting" {
+		t.Errorf("expected vaulting (higher priority), got %q", status.State)
+	}
+	if status.Progress != 30 {
+		t.Errorf("expected progress 30, got %v", status.Progress)
+	}
+	if status.Seeders != 2 {
+		t.Errorf("expected seeders 2 from stats, got %v", status.Seeders)
+	}
+}
+
+func TestResolveStatus_CachedAndVaulting(t *testing.T) {
+	db := &vaultModels.Resource{Funded: true, Vaulted: false}
+	apiRes := &vault.Resource{Status: vault.StatusProcessing, StoredSize: 50, TotalSize: 100}
+	stats := &TorrentStatsData{Total: 100, Completed: 100, Seeders: 5}
+	status := resolveStatus(db, apiRes, stats)
+	// Vaulting has higher priority than cached
+	if status.State != "vaulting" {
+		t.Errorf("expected vaulting (higher priority), got %q", status.State)
+	}
+	if status.Seeders != 5 {
+		t.Errorf("expected seeders 5 from stats, got %v", status.Seeders)
+	}
+}
+
+func TestResolveStatus_CachingAndVaulted(t *testing.T) {
+	db := &vaultModels.Resource{Vaulted: true}
+	stats := &TorrentStatsData{Total: 100, Completed: 50, Seeders: 3}
+	status := resolveStatus(db, nil, stats)
+	// Vaulted has highest priority
+	if status.State != "vaulted" {
+		t.Errorf("expected vaulted (highest priority), got %q", status.State)
+	}
+}
+
+func TestResolveStatus_ZeroTotalSize(t *testing.T) {
+	db := &vaultModels.Resource{Funded: true, Vaulted: false}
+	apiRes := &vault.Resource{Status: vault.StatusProcessing, StoredSize: 0, TotalSize: 0}
+	status := resolveStatus(db, apiRes, nil)
+	if status.State != "vaulting" {
+		t.Errorf("expected vaulting, got %q", status.State)
+	}
+	if status.Progress != 0 {
+		t.Errorf("expected progress 0, got %v", status.Progress)
+	}
+}
+
+func TestResolveStatus_FundedNoAPI(t *testing.T) {
+	db := &vaultModels.Resource{Funded: true, Vaulted: false}
+	status := resolveStatus(db, nil, nil)
+	if status.State != "vaulting" {
+		t.Errorf("expected vaulting (funded, no API data), got %q", status.State)
+	}
+	if status.Progress != 0 {
+		t.Errorf("expected progress 0, got %v", status.Progress)
+	}
+}
+
+func TestResolveStatus_StatsZeroTotal(t *testing.T) {
+	stats := &TorrentStatsData{Total: 0, Completed: 0, Seeders: 1}
+	status := resolveStatus(nil, nil, stats)
+	if status.State != "idle" {
+		t.Errorf("expected idle for zero total stats, got %q", status.State)
+	}
+}
+
+// --- Tests for prepareInitialStatus ---
+
+func TestPrepareInitialStatus_NoVault(t *testing.T) {
+	h := &Handler{vault: nil}
+	status := h.prepareInitialStatus(context.Background(), "test-id")
+	if status.State != "idle" {
+		t.Errorf("expected idle, got %q", status.State)
+	}
+}
+
+func TestPrepareInitialStatus_DBError(t *testing.T) {
+	// When vault DB returns an error, prepareInitialStatus falls back to idle.
+	// We test resolveStatus with nil (the fallback path).
+	status := resolveStatus(nil, nil, nil)
+	if status.State != "idle" {
+		t.Errorf("expected idle on error fallback, got %q", status.State)
+	}
+}
+
+func TestPrepareInitialStatus_Vaulted(t *testing.T) {
+	db := &vaultModels.Resource{Vaulted: true}
+	status := resolveStatus(db, nil, nil)
+	if status.State != "vaulted" {
+		t.Errorf("expected vaulted, got %q", status.State)
+	}
+}
+
+func TestPrepareInitialStatus_Funded(t *testing.T) {
+	db := &vaultModels.Resource{Funded: true, Vaulted: false}
+	status := resolveStatus(db, nil, nil)
+	if status.State != "vaulting" {
+		t.Errorf("expected vaulting, got %q", status.State)
+	}
+	if status.Progress != 0 {
+		t.Errorf("expected progress 0, got %v", status.Progress)
+	}
+}
+
+type mockVaultForStatus struct {
+	resource *vaultModels.Resource
+	err      error
+}
+
+func (m *mockVaultForStatus) GetResource(_ context.Context, _ string) (*vaultModels.Resource, error) {
+	return m.resource, m.err
+}
+
+func TestResolveStatus_CarriesSeedersLeechersPeers(t *testing.T) {
+	st := resolveStatus(nil, nil, &TorrentStatsData{Total: 100, Completed: 10, Seeders: 4, Leechers: 9, Peers: 13})
+	if st.State != "caching" || st.Seeders != 4 || st.Leechers != 9 || st.Peers != 13 {
+		t.Errorf("swarm counters must ride on the status: %+v", st)
+	}
+}
+
+type testPiece = struct {
+	Position int  `json:"position"`
+	Complete bool `json:"complete"`
+	Priority int  `json:"priority"`
+}
+
+func evWith(ps ...testPiece) api.EventData {
+	var ev api.EventData
+	ev.Pieces = append(ev.Pieces, ps...)
+	return ev
+}
+
+func TestPieceMap_FullThenDiff(t *testing.T) {
+	// A stream opens with the full list: 512 pieces → 256 cells of two.
+	var full api.EventData
+	for i := 0; i < 512; i++ {
+		full.Pieces = append(full.Pieces, testPiece{Position: i, Complete: i < 3})
+	}
+	var m pieceMap
+	m.apply(full)
+	fill, active := m.buckets()
+	if len(fill) != PieceBuckets || fill[0] != 255 || fill[1] != 127 || fill[2] != 0 {
+		t.Fatalf("after full: %v", fill[:4])
+	}
+	if m.done() != 3 || len(m.complete) != 512 {
+		t.Errorf("counts after full: done %d total %d", m.done(), len(m.complete))
+	}
+	// Then only what changed: piece 3 completes, piece 4 starts fetching.
+	m.apply(evWith(testPiece{Position: 3, Complete: true}, testPiece{Position: 4, Priority: 1}))
+	fill, active = m.buckets()
+	if fill[1] != 255 {
+		t.Errorf("diff must patch the map, not replace it: cell 1 = %d", fill[1])
+	}
+	if fill[0] != 255 {
+		t.Errorf("untouched cells must keep their state: cell 0 = %d", fill[0])
+	}
+	if active[0]&(1<<2) == 0 {
+		t.Errorf("fetching piece 4 must light cell 2: %08b", active[0])
+	}
+	if m.done() != 4 {
+		t.Errorf("done after diff: %d", m.done())
+	}
+	// An event without pieces (peers changed only) leaves the map alone.
+	m.apply(api.EventData{Peers: 9})
+	if f, _ := m.buckets(); f[1] != 255 || len(f) != PieceBuckets {
+		t.Error("a pieceless event must not erase the map")
+	}
+}
+
+func TestPieceMap_SmallTorrentAndDiffOnlyStream(t *testing.T) {
+	var m pieceMap
+	var small api.EventData
+	for i := 0; i < 10; i++ {
+		small.Pieces = append(small.Pieces, testPiece{Position: i, Complete: i%2 == 0})
+	}
+	m.apply(small)
+	fill, _ := m.buckets()
+	if len(fill) != 10 || fill[0] != 255 || fill[1] != 0 {
+		t.Errorf("small torrent, one cell per piece: %v", fill)
+	}
+	// A stream that (for whatever reason) never sent the full list still
+	// yields a picture sized by the highest position seen.
+	var d pieceMap
+	d.apply(evWith(testPiece{Position: 7, Complete: true}))
+	if len(d.complete) != 8 || d.done() != 1 {
+		t.Errorf("diff-only sizing: %d/%d", d.done(), len(d.complete))
+	}
+	var empty pieceMap
+	if f, _ := empty.buckets(); f != nil {
+		t.Error("nothing known → no bar")
+	}
+}
+
+// Complete content draws no bar — the badge already says it; the bar exists
+// only while something moves.
+// presented is st as the stream sends it: presented for the resource page
+// (withView) or for a Vault dashboard row.
+func presented(st *TorrentStatus, withView bool) *TorrentStatus {
+	env := &viewEnv{lang: "en", loc: ruLoc().Localizer("en"), tier: "free", withView: withView}
+	env.present(st, statusview.Viewer{}, statusview.Viewer{}, 0, 0, dashT0)
+	return st
+}
+
+// Complete content draws no bar: a static full bar told the user nothing
+// the badge did not.
+func TestPresent_NoBarForCompleteContent(t *testing.T) {
+	if st := presented(resolveStatus(&vaultModels.Resource{Funded: true, Vaulted: true}, nil, nil), true); st.Pieces != "" {
+		t.Error("vaulted must not draw a bar")
+	}
+	if st := presented(resolveStatus(nil, nil, &TorrentStatsData{Total: 10, Completed: 10, Fill: []byte{255}, Active: []byte{0}, PiecesDone: 1, PiecesTotal: 1}), true); st.State != "cached" || st.Pieces != "" || st.PiecesLabel != "" {
+		t.Errorf("cached must not draw a bar: %+v", st)
+	}
+	if idle := presented(resolveStatus(nil, nil, nil), true); idle.Pieces != "" {
+		t.Error("idle must not pretend to know the pieces")
+	}
+	// Whole, the swarm sends nothing any more: no speed on its link,
+	// whatever the smoothed rate still says.
+	cached := presented(resolveStatus(nil, nil, &TorrentStatsData{Total: 10, Completed: 10, Seeders: 3, Rate: 4 << 20}), true)
+	if seg := cached.View.Segs[0]; seg.On {
+		t.Errorf("a cached torrent's swarm link moves: %+v", seg)
+	}
+}
+
+// One policy for the piece bar -- statusview's (View.Bar): the bar's data
+// goes out exactly where the page draws a bar. An idle seeder that knows
+// its pieces draws nothing; one whose pieces nobody else has does (the
+// hatch). The Vault dashboard draws no bar at all.
+func TestPresent_PieceBarOnlyWhereDrawn(t *testing.T) {
+	bar := func(st *TorrentStatus) bool {
+		return st.Pieces != "" && st.Active != "" && st.PiecesLabel != "" && st.View.Bar.Mode == "pieces"
+	}
+	stats := &TorrentStatsData{Total: 100, Completed: 0, Seeders: 1, Fill: []byte{255, 0}, Active: []byte{0}, PiecesDone: 1, PiecesTotal: 2}
+	if st := presented(resolveStatus(nil, nil, stats), true); st.State != "idle" || st.Pieces != "" || st.PiecesLabel != "" {
+		t.Errorf("idle with known pieces must not draw a bar: %+v", st)
+	}
+	stats.Completed = 10
+	if st := presented(resolveStatus(nil, nil, stats), true); st.State != "caching" || !bar(st) {
+		t.Errorf("caching must draw the bar: %+v", st)
+	}
+	holes := &TorrentStatsData{Total: 100, Peers: 12, Fill: []byte{0, 0}, Active: []byte{0}, Holes: []byte{2}, AvailabilityKnown: true, PiecesTotal: 2}
+	if st := presented(resolveStatus(nil, nil, holes), true); st.State != "idle" || !bar(st) || st.Missing == "" {
+		t.Errorf("idle with holes draws the bar: %+v", st)
+	}
+	db := &vaultModels.Resource{Funded: true}
+	// Vault waiting for seeders: the purple bar over what the cache holds,
+	// as the approved design (2026-09-25) draws it.
+	waiting := presented(resolveStatus(db, &vault.Resource{Status: vault.StatusQueued}, &TorrentStatsData{Total: 100, Fill: []byte{255, 0}, Active: []byte{0}, Live: true, LiveFor: noSeedersAfter, PiecesTotal: 2}), true)
+	if waiting.State != "vault_waiting" || !bar(waiting) {
+		t.Errorf("waiting for seeders draws the cache's pieces: %+v", waiting)
+	}
+	failed := presented(resolveStatus(db, &vault.Resource{Status: vault.StatusFailed, StoredSize: 30, TotalSize: 100}, &TorrentStatsData{Total: 100, Completed: 30, Fill: []byte{255, 0}, Active: []byte{0}, PiecesTotal: 2}), true)
+	if failed.State != "vault_failed" || !bar(failed) {
+		t.Errorf("a failed transfer with stored pieces keeps its bar: %+v", failed)
+	}
+	// The dashboard's rows draw the badge and the fill, never the bar:
+	// its data was three quarters of a row's bytes.
+	dash := presented(resolveStatus(nil, nil, &TorrentStatsData{Total: 100, Completed: 10, Seeders: 1, Fill: []byte{255, 0}, Active: []byte{1}, Holes: []byte{2}, AvailabilityKnown: true, PiecesTotal: 2}), false)
+	if dash.Pieces != "" || dash.Active != "" || dash.Missing != "" || dash.PiecesLabel != "" || dash.Badge == nil {
+		t.Errorf("the dashboard got the bar: %+v", dash)
+	}
+}
+
+// The verdict is earned, not assumed: nothing is said about partially cached
+// content for the first settleAfter unless activity proves it alive; after
+// that it is paused — nothing moves — and only a swarm that stayed empty for
+// the whole long window is called dead.
+func TestJudgeSwarm(t *testing.T) {
+	cases := []struct {
+		name     string
+		observed time.Duration
+		activity bool
+		seeders  int
+		peers    int
+		want     swarmVerdict
+	}{
+		{"fresh stream, quiet, seeders around", time.Second, false, 3, 5, verdictChecking},
+		{"fresh stream, quiet, empty swarm", time.Second, false, 0, 0, verdictChecking},
+		{"fresh stream but bytes moving", time.Second, true, 0, 0, verdictCaching},
+		{"settled, quiet, seeders around → paused", 6 * time.Second, false, 2, 4, verdictPaused},
+		{"settled, quiet, only peers → paused", 6 * time.Second, false, 0, 4, verdictPaused},
+		// A cold seeder pod sees nobody for tens of seconds while it reaches
+		// trackers and the DHT — paused (nothing moves), not "no seeders",
+		// and not a spinner: checking ends at settleAfter whoever is around.
+		{"6 s, quiet, nobody → paused", 6 * time.Second, false, 0, 0, verdictPaused},
+		{"29 s, quiet, nobody → still paused", 29 * time.Second, false, 0, 0, verdictPaused},
+		{"31 s, quiet, nobody → no seeders", 31 * time.Second, false, 0, 0, verdictNoSeeders},
+		{"31 s, quiet, a peer showed up → paused", 31 * time.Second, false, 0, 1, verdictPaused},
+		{"settled and moving → caching", 60 * time.Second, true, 1, 1, verdictCaching},
+	}
+	for _, c := range cases {
+		if got := judgeSwarm("caching", c.observed, c.observed, c.activity, true, c.seeders, c.peers); got != c.want {
+			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
+		}
+	}
+	if judgeSwarm("vaulting", time.Minute, time.Minute, false, true, 0, 0) != verdictCaching || judgeSwarm("idle", time.Minute, time.Minute, false, true, 0, 0) != verdictCaching {
+		t.Error("only caching is judged")
+	}
+	// Cold replies: the seeder did not join the swarm, so an empty swarm
+	// is not evidence — paused at once, never "checking", never "no seeders".
+	for _, d := range []time.Duration{time.Second, 6 * time.Second, 31 * time.Second} {
+		if got := judgeSwarm("caching", d, 0, false, false, 0, 0); got != verdictPaused {
+			t.Errorf("cold, quiet, %v: got %v, want paused", d, got)
+		}
+	}
+	// A reconnect: watched for a minute, the new stream's swarm live for
+	// five seconds -- settled (no spinner again), not yet "no seeders".
+	if got := judgeSwarm("caching", time.Minute, 5*time.Second, false, true, 0, 0); got != verdictPaused {
+		t.Errorf("reconnected, empty for 5 s: got %v, want paused", got)
+	}
+	if judgeSwarm("caching", time.Second, 0, true, false, 0, 0) != verdictCaching {
+		t.Error("cold but moving must still read as caching")
+	}
+	if hasActive([]byte{0, 0}) || !hasActive([]byte{0, 4}) {
+		t.Error("hasActive bitset check")
+	}
+}
+
+func TestReconnectPolicy(t *testing.T) {
+	inProgress := &TorrentStatsData{Total: 100, Completed: 40}
+	fresh := 3 * time.Second
+	if !shouldReconnect(inProgress, 0, fresh) || !shouldReconnect(inProgress, 4, fresh) {
+		t.Error("a download interrupted mid-flight is worth reconnecting for")
+	}
+	if shouldReconnect(inProgress, 5, fresh) {
+		t.Error("retries are bounded")
+	}
+	// The seeder unloads idle torrents itself: a stream that closes after a
+	// quiet spell, or with no progress ever seen, must not wake a pod.
+	if shouldReconnect(inProgress, 0, 2*time.Minute) || shouldReconnect(inProgress, 0, -1) {
+		t.Error("no recent activity: let it go idle instead of waking a seeder")
+	}
+	if shouldReconnect(&TorrentStatsData{Total: 100, Completed: 0}, 0, fresh) {
+		t.Error("nothing stored yet: do not wake a seeder for it")
+	}
+	if shouldReconnect(&TorrentStatsData{Total: 100, Completed: 100}, 0, fresh) || shouldReconnect(nil, 0, fresh) {
+		t.Error("complete or unknown: nothing to reconnect for")
+	}
+	if sinceProgress(time.Time{}, time.Now()) != -1 {
+		t.Error("no progress observed reads as -1")
+	}
+}

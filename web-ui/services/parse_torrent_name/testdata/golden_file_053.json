@@ -1,0 +1,12 @@
+{
+  "input": "Interstellar (2014) CAM ENG x264 AAC-CPG",
+  "want": {
+    "title": "Interstellar",
+    "year": 2014,
+    "quality": "CAM",
+    "codec": "x264",
+    "audio": "AAC",
+    "group": "CPG",
+    "extra": "ENG"
+  }
+}

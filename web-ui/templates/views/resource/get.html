@@ -1,0 +1,424 @@
+{{/* .torrent download + copy-magnet split button. One definition for both
+     the enriched and the plain resource header — the 22-line block used to
+     be duplicated byte-for-byte and edits landed in one branch only.
+     Called with (withContext $ .Resource): .Ctx = request context (Lang),
+     .Data = the resource. The magnet button has no data-umami-event — the
+     copy-magnet event fires from share.js only after a successful copy.
+
+     A visitor who submitted the torrent on a tool page (?tool=<slug>, see
+     partials/resource/tool_intent) gets the slug as a `tool` prop on both
+     events. From /torrent-to-magnet the magnet button is the whole point of
+     the visit, and an unlabelled icon is easy to miss: it shows its label
+     (the same resource.copyMagnet as its title) and the green it otherwise
+     gets on hover. */}}
+{{/* The transfer status block (partials/resource/status.html). The outer div is an
+     async-layout target: status.js calls this.reload() when the stream token expires,
+     which re-fetches the page URL with X-Layout = data-async-layout and swaps the inner
+     partial (fresh block + fresh token) in, then the view re-inits (lib/async.js
+     asyncLayout, lib/loadAsyncView.js). Same route, same edge challenge. Called with the
+     view context ($): .Data = GetData. data-status-file is the file the plan box's
+     download ETA prices (the whole torrent without one). The CSRF token rides with the
+     status token: both are the renewal's, and a session cookie changed since the page
+     refused the renewed stream again with the page's old one. data-status-unknown: the
+     status's words once renewing does not help (lib/statusStream.js). */}}
+{{ define "resource/status_inner" }}
+<div id="torrent-status-block" data-status-token="{{ statusToken .Data.Resource.ID }}" data-csrf="{{ .CSRF }}" data-status-unknown="{{ t .Lang "resource.status.unknown" }}"{{ with .Data }}{{ if and (has . "Item") .Item }} data-status-file="{{ .Item.PathStr }}"{{ end }}{{ end }}>
+{{- with .Data }}{{ if and (has . "StatusView") .StatusView }}{{ template "resource/status" (withContext $ .StatusView) }}{{ end }}{{ end }}
+{{- /* What matters, said once to a screen reader (app/resource/status.js): outside .tx,
+     which the sticky bar copies -- every word would be said twice. */}}
+<p class="sr-only" role="status" aria-live="polite" data-tx-announce></p>
+</div>
+{{ "resource/status.js" | asset }}
+{{ end }}
+{{/* The status where the eye cannot lose it (owner, 2026-09-19). Measured:
+     the median wait from pressing Watch to the first frame is 58 s, and the
+     only sign of progress -- this badge and its piece bar -- lives in the
+     header and scrolls away while people wait. Out of sight, 59% of them
+     pressed Watch again.
+
+     A fixed bar rather than `sticky`: it belongs to the page, not to the card
+     it mirrors, and it must not reflow anything when it appears. It carries
+     the very same block (owner, 2026-09-24: no compact variant, no torrent
+     name): resource/status.js clones the card's .tx into
+     [data-status-mirror-for] once and updates both from the same stream.
+     Hidden until the card's block scrolls out of view, and only while bytes
+     move somewhere on the chain or the plan binds (view.sticky) -- see
+     stickyStatus.js. */}}
+{{ define "resource/status_sticky" }}
+<div id="torrent-status-sticky" hidden
+     {{/* Same glass as the navbar above it (nav.html + .navbar-redesign:
+          rgba(10,14,26,.9) with backdrop-blur-xl): the two bars touch, and a
+          denser one below read as a second, opaque strip (owner). */}}
+     class="fixed inset-x-0 top-[72px] z-sticky px-3 sm:px-6 pt-3 pb-3.5 bg-w-bg/90 backdrop-blur-xl border-b border-w-line
+            transition-transform duration-200 -translate-y-full motion-reduce:transition-none">
+    {{/* No role, not live: the block is updated by every SSE message (the
+         speeds change each second), and a live region would read that out
+         for as long as the bar is up. What matters is said once, by the
+         card's block ([data-tx-announce], outside the .tx this clones). */}}
+    <div class="max-w-[900px] mx-auto" data-status-mirror-for="{{ .Data.Resource.ID }}"></div>
+</div>
+{{ end }}
+{{/* The "Content" section: the picked file's card and the file browser.
+     One async target, so a file link swaps both and leaves the rest of the
+     page alone. Called with the view context. */}}
+{{ define "resource/content" }}
+{{/* `has` guards: this snippet travels as X-Layout and a history entry can
+     replay it against another page's data (services/web/has_guard_test.go). */}}
+{{ with .Data }}
+    {{ if and (has . "Item") .Item }}
+    {{- /* data-status-file: the file picked, for the status's plan box -- the
+         status stream lives outside #content and reprices its download ETA
+         when a file link swaps this (app/resource/status.js). */}}
+    <div id="file" class="scroll-mt-18" data-status-file="{{ .Item.PathStr }}" data-async-layout="{{`{{ template "file" . }}`}}">
+      {{ template "file" $ }}
+    </div>
+    {{ end }}
+    {{ if and (has . "List") .List }}
+    <div id="list" data-async-layout="{{`{{ template "list" . }}`}}">
+    {{ template "list" $ }}
+    </div>
+    {{ end }}
+{{ end }}
+{{ end }}
+{{/* overflow-anchor: none -- the block is never the engine's scroll anchor: what its
+     own growth moves is made up for by app/resource/status.js (steadily). */}}
+{{ define "resource/status_container" }}
+<div id="torrent-status" class="min-w-0" style="overflow-anchor: none" data-resource-id="{{ .Data.Resource.ID }}" data-async-layout="{{`{{ template "resource/status_inner" $ }}`}}">
+    {{ template "resource/status_inner" . }}
+</div>
+{{ end }}
+{{ define "resource/torrent_magnet_split" }}
+                    {{- $tool := "" }}{{ with .Ctx.Data }}{{ with .Args }}{{ with .FromTool }}{{ $tool = .Url }}{{ end }}{{ end }}{{ end }}
+                    {{- $magnet := eq $tool "torrent-to-magnet" }}
+                    {{/* Right-aligned only from md, where it shares the line with the
+                         Vault/Library buttons; below that the row wraps and the group
+                         starts its own line flush left. */}}
+                    <div class="md:ml-auto shrink-0 flex items-stretch">
+                        <a href="{{ .Data | torrentFileURL }}" class="btn btn-sm btn-ghost border border-w-line rounded-r-none relative hover:z-[1] text-w-sub hover:border-w-pink hover:text-base-content whitespace-nowrap" data-umami-event="download-torrent"{{ with $tool }} data-umami-event-tool="{{ . }}"{{ end }} download>
+                            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-4 h-4">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
+                            </svg>
+                            .torrent
+                        </a>
+                        <button type="button" class="btn btn-sm btn-ghost border {{ if $magnet }}border-green-400 text-green-400 whitespace-nowrap{{ else }}border-w-line text-w-sub{{ end }} rounded-none -ml-px relative hover:z-[1] hover:border-green-400 hover:text-green-400 px-2.5"
+                                data-magnet-hash="{{ .Data.ID }}" data-magnet-name="{{ .Data.Name }}"
+                                data-copied-text="{{ t .Ctx.Lang "resource.magnetCopied" }}"{{ with $tool }}
+                                data-tool="{{ . }}"{{ end }}
+                                onclick="copyMagnet(this)"
+                                title="{{ t .Ctx.Lang "resource.copyMagnet" }}" aria-label="{{ t .Ctx.Lang "resource.copyMagnet" }}">
+                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-4 h-4">
+                                <path d="m6 15-4-4 6.75-6.77a7.79 7.79 0 0 1 11 11L13 22l-4-4 6.39-6.36a2.14 2.14 0 0 0-3-3L6 15"/>
+                                <path d="m5 8 4 4"/>
+                                <path d="m12 15 4 4"/>
+                            </svg>
+                            {{- if $magnet }}
+                            <span>{{ t .Ctx.Lang "resource.copyMagnet" }}</span>
+                            {{- end }}
+                        </button>
+                        {{/* Hands the support form the cause and infohash: two of
+                             twelve playback tickets in 2026-08 arrived with no way
+                             to tell which torrent they were about. */}}
+                        <a href="{{ langPath .Ctx.Lang "/support" }}?cause=2&infohash={{ .Data.ID }}&filename={{ .Data.Name | urlquery }}" class="btn btn-sm btn-ghost border border-w-line -ml-px relative hover:z-[1] text-w-sub hover:border-w-cyan hover:text-w-cyan px-2.5 rounded-l-none"
+                           title="{{ t .Ctx.Lang "resource.reportProblem" }}" aria-label="{{ t .Ctx.Lang "resource.reportProblem" }}" data-umami-event="report-problem">
+                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-4 h-4">
+                                <path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/>
+                            </svg>
+                        </a>
+                    </div>
+{{ end }}
+{{ define "title" }}
+    {{ with .Data }}
+        {{ if . | hasEnrichment }}
+            {{ . | getEnrichedTitle }}{{ if . | hasEnrichedYear }} ({{ . | getEnrichedYear }}){{ end }}
+        {{ else if has . "Item" }}
+            {{ .Item.PathStr }} | {{ .Resource.Name }}
+        {{ else }}
+            {{ .Resource.Name }}
+        {{ end }}
+    {{ end }}
+{{ end }}
+{{ define "description" }}
+    {{ with .Data }}{{ if . | hasEnrichment }}{{ $plot := . | getEnrichedPlot }}{{ if $plot }}
+    <meta name="description" content="{{ $plot }}">
+    {{ end }}{{ end }}{{ end }}
+{{ end }}
+{{ define "og" }}
+    <meta property="og:site_name" content="Torrently">
+    <meta name="twitter:card" content="summary_large_image">
+    {{ with .Data }}
+    {{ if . | hasEnrichment }}
+    <meta property="og:type" content="{{ if . | isEnrichedMovie }}video.movie{{ else }}video.tv_show{{ end }}">
+    <meta property="og:title" content="{{ . | getEnrichedTitle }}{{ if . | hasEnrichedYear }} ({{ . | getEnrichedYear }}){{ end }} | Torrently">
+    {{ $plot := . | getEnrichedPlot }}{{ if $plot }}<meta property="og:description" content="{{ $plot }}">{{ else }}<meta property="og:description" content="{{ t $.Lang "resource.ogShareTagline" }}">{{ end }}
+    {{ else }}
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="{{ .Resource.Name }} | Torrently">
+    <meta property="og:description" content="{{ t $.Lang "resource.ogShareTagline" }}">
+    {{ end }}
+    <meta property="og:image" content="{{ domain }}{{ . | getOGImageURL }}">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    {{ end }}
+{{ end }}
+{{ define "head_extra" }}
+{{ with .Data }}{{ if . | hasEnrichment }}
+<script type="application/ld+json">
+{
+    "@context": "https://schema.org",
+    "@type": "{{ if . | isEnrichedMovie }}Movie{{ else }}TVSeries{{ end }}",
+    "name": "{{ . | getEnrichedTitle }}"
+    {{ if . | hasEnrichedYear }},"datePublished": "{{ . | getEnrichedYear }}"{{ end }}
+    {{ $plot := . | getEnrichedPlot }}{{ if $plot }},"description": "{{ $plot }}"{{ end }}
+    {{ if . | hasEnrichedRating }},"aggregateRating": {
+        "@type": "AggregateRating",
+        "ratingValue": "{{ printf "%.1f" (. | getEnrichedRating) }}",
+        "bestRating": "10"
+    }{{ end }}
+    {{ if . | hasEnrichedPoster }},"image": "{{ domain }}{{ getResourcePosterURL . 480 $ }}"{{ end }}
+    ,"url": "{{ domain }}/{{ .Resource.ID }}"
+}
+</script>
+{{ end }}{{ end }}
+{{ end }}
+{{ define "main" }}
+{{/* Outside the cards on purpose: a page-level fixed bar nested inside the
+     header card sat under its `overflow-hidden` (and one `transform` away
+     from being positioned against the card instead of the viewport), which
+     is why nothing appeared. */}}
+{{ with .Data }}{{ if .TorrentStatus }}{{ template "resource/status_sticky" $ }}{{ end }}{{ end }}
+<section class="min-h-screen pt-24 sm:pt-[120px] pb-20 px-3 sm:px-6">
+  <div class="max-w-[900px] mx-auto">
+    {{/* Shown to whoever does not have a paid plan yet: a sales banner
+         follows the sale, not the ads claim. */}}
+    {{ if and (not (.Claims | isPaid)) promoOffer }}
+    <div class="promo-compact">
+        <div id="promo-banner" class="relative max-w-[680px] mx-auto z-10">
+            {{ template "promo" . }}
+            <button data-promo-dismiss class="promo-close" aria-label="Close"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
+            {{ "promo.js" | asset }}
+        </div>
+    </div>
+    {{ end }}
+
+    {{ with .Data }}
+    <div class="hidden sm:inline-flex badge badge-lg bg-w-pink/10 border-w-pink/30 text-w-pinkL gap-2 px-4 py-3 mb-5 text-xs font-semibold tracking-widest uppercase">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-3.5 h-3.5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
+        </svg>
+        {{ if . | isEnrichedMovie }}{{ t $.Lang "resource.movie" }}{{ else if . | isEnrichedSeries }}{{ t $.Lang "resource.series" }}{{ else }}{{ t $.Lang "resource.torrent" }}{{ end }}
+    </div>
+
+    <!-- Torrent header card -->
+    {{ if . | hasEnrichment }}
+    <div class="relative overflow-hidden rounded-2xl p-4 sm:p-6 mb-4 bg-gradient-to-br from-w-pink/10 via-base-300/50 to-base-300/50 border border-w-pink/20">
+        <div class="absolute top-0 right-0 w-40 h-40 bg-w-pink/5 rounded-full -translate-y-1/2 translate-x-1/2 pointer-events-none"></div>
+        <dialog id="share-dialog" class="modal" data-link-copied-text="{{ t $.Lang "resource.linkCopied" }}">
+            <div class="modal-box max-w-sm bg-w-card border border-w-line">
+                <h3 class="font-bold text-lg mb-4">{{ t $.Lang "resource.share" }}</h3>
+                <div class="flex gap-2">
+                    <input id="share-url" type="text" readonly class="input input-bordered input-sm flex-1 bg-base-200 text-w-sub" />
+                    <button type="button" class="btn btn-sm btn-soft" onclick="copyShareUrl()">{{ t $.Lang "resource.copy" }}</button>
+                </div>
+                <div class="modal-action">
+                    <form method="dialog"><button class="btn btn-sm btn-ghost">{{ t $.Lang "resource.close" }}</button></form>
+                </div>
+            </div>
+            <form method="dialog" class="modal-backdrop"><button tabindex="-1" aria-hidden="true">close</button></form>
+        </dialog>
+        {{/* Poster | the column; the status block between the column's top
+             (title .. description) and its actions (owner, 2026-09-24). On a
+             phone the column is ~215px and the chain does not fit, so there
+             the block spans the whole card under the poster row -- one block,
+             moved by the grid, never a second copy. */}}
+        <div class="relative grid grid-cols-[100px_minmax(0,1fr)] sm:grid-cols-[140px_minmax(0,1fr)] grid-rows-[auto_1fr] sm:grid-rows-[auto_auto_1fr] gap-x-3 sm:gap-x-5 gap-y-3.5 sm:gap-y-3">
+            <div class="col-[1/2] row-[1/3] sm:row-[1/4] self-stretch w-full aspect-[2/3] rounded-xl overflow-hidden border border-w-line/30 shadow-lg relative">
+                <div class="absolute inset-0 bg-gradient-to-br from-w-purple/20 via-w-pink/10 to-w-cyan/15 text-w-purpleL/60 flex items-center justify-center">
+                    <div class="text-center font-bold text-sm p-3 line-clamp-3 drop-shadow-sm">{{ . | getEnrichedTitle }}</div>
+                </div>
+                {{/* Same unified endpoint as the fallback header and
+                     library cards — resolves IMDb → thumbnail → 404.
+                     onerror drops the <img> on 404 so the gradient
+                     placeholder behind shows through. The endpoint
+                     itself applies adult/sport blur server-side; this
+                     badge labels the intent so it doesn't look broken. */}}
+                <img src="{{ getResourcePosterURL . 480 $ }}" alt="{{ . | getEnrichedTitle }}" class="absolute inset-0 w-full h-full object-cover" loading="lazy"
+                     onerror="this.remove()">
+                {{ if showAdultBadge (isAdult .) $ }}
+                <div class="w-adult-badge absolute inset-0 grid place-items-center pointer-events-none" data-resource-id="{{ .Resource.ID }}">
+                    <span class="badge bg-transparent text-white/90 border-2 border-white/70 font-semibold tracking-wide backdrop-blur-sm leading-none flex items-center justify-center cursor-pointer pointer-events-auto select-none">18+</span>
+                </div>
+                {{ end }}
+            </div>
+            <div class="col-[2/3] row-start-1 min-w-0 [&>*:last-child]:mb-0">
+                <div class="flex items-center gap-2">
+                    <h1 class="text-[clamp(1.5rem,3.5vw,2rem)] font-bold tracking-tight leading-snug break-words line-clamp-2 text-balance" title="{{ . | getEnrichedTitle }}">{{ . | getEnrichedTitle }}</h1>
+                    <button type="button" class="shrink-0 text-w-muted hover:text-base-content transition-colors duration-200 cursor-pointer" onclick="shareResource({location:'header'})" aria-label="Share">
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-7 h-7">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M9 8.25H7.5a2.25 2.25 0 0 0-2.25 2.25v9a2.25 2.25 0 0 0 2.25 2.25h9a2.25 2.25 0 0 0 2.25-2.25v-9a2.25 2.25 0 0 0-2.25-2.25H15m0-3-3-3m0 0-3 3m3-3V15" />
+                        </svg>
+                    </button>
+                </div>
+                <div class="flex flex-wrap items-center gap-2 mb-1 text-sm text-w-sub">
+                    {{ if . | hasEnrichedYear }}<span>{{ . | getEnrichedYear }}</span>{{ end }}
+                    {{ if . | hasEnrichedRating }}
+                    <span class="flex items-center gap-1 text-yellow-400">
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-4 h-4"><path fill-rule="evenodd" d="M10.788 3.21c.448-1.077 1.976-1.077 2.424 0l2.082 5.006 5.404.434c1.164.093 1.636 1.545.749 2.305l-4.117 3.527 1.257 5.273c.271 1.136-.964 2.033-1.96 1.425L12 18.354 7.373 21.18c-.996.608-2.231-.29-1.96-1.425l1.257-5.273-4.117-3.527c-.887-.76-.415-2.212.749-2.305l5.404-.434 2.082-5.005Z" clip-rule="evenodd" /></svg>
+                        {{ printf "%.1f" (. | getEnrichedRating) }}
+                    </span>
+                    {{ end }}
+                    {{ if . | isEnrichedSeries }}<span class="badge badge-sm bg-w-cyan/10 text-w-cyan border-0">{{ t $.Lang "resource.series" }}</span>{{ end }}
+                </div>
+                {{ if or .Movie .Series }}
+                <div class="flex items-center gap-2 mt-2 mb-3">
+                    <div class="join">
+                        <div id="watched-button" data-async-layout="{{`{{ if .Data.Movie }}{{ template "user_video_status/movie_button" $ }}{{ else }}{{ template "user_video_status/series_button" $ }}{{ end }}`}}">
+                            {{ if .Movie }}{{ template "user_video_status/movie_button" $ }}{{ else }}{{ template "user_video_status/series_button" $ }}{{ end }}
+                        </div>
+                        <div id="rate-button" data-async-layout="{{`{{ template "user_video_status/rate_button" $ }}`}}">
+                            {{ template "user_video_status/rate_button" $ }}
+                        </div>
+                    </div>
+                </div>
+                {{ end }}
+                {{ $plot := . | getEnrichedPlot }}{{ if $plot }}
+                {{/* Clamped to 3 lines via max-h in em (3 × leading-relaxed 1.625). resource/get.js cuts the text at the fitting prefix and appends a clickable inline "…" when it overflows; the expanded text ends with an inline "↑" that collapses it back. Without JS the plot stays clamped with no toggle. */}}
+                <p data-plot-clamp class="text-sm text-w-sub leading-relaxed overflow-hidden max-h-[4.875em] mb-4">{{ $plot }}</p>
+                {{ end }}
+            </div>
+            {{ if .TorrentStatus }}
+            <div class="col-[1/-1] row-start-3 sm:col-[2/3] sm:row-start-2 min-w-0 pt-3 border-t border-white/[.06] sm:pt-0 sm:border-t-0">
+                {{ template "resource/status_container" $ }}
+            </div>
+            {{ end }}
+            <div class="col-[2/3] row-start-2 sm:row-start-3 min-w-0">
+                <div class="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2">
+                    <div id="pledge-button" class="shrink-0" data-async-layout="{{`{{ template "vault/button" (withContext $ .Data.VaultButton) }}`}}" data-async-get="">
+                        {{ if .Vault }}
+                            {{ template "vault/button" (withContext $ .VaultButton) }}
+                        {{ end }}
+                    </div>
+                    <div id="library-button" class="shrink-0" data-async-layout="{{`{{ with .Data }}{{ if has . "Resource" }}{{ template "library/button" (withContext $ .Resource) }}{{ end }}{{ end }}`}}">
+                        {{ template "library/button" (withContext $ .Resource) }}
+                    </div>
+                    {{ template "resource/torrent_magnet_split" (withContext $ .Resource) }}
+                </div>
+                {{ template "resource/tool_intent" $ }}
+            </div>
+        </div>
+    </div>
+    {{ else }}
+    <!-- Fallback: plain torrent header card -->
+    <div class="relative overflow-hidden rounded-2xl p-4 sm:p-6 mb-4 bg-gradient-to-br from-w-pink/10 via-base-300/50 to-base-300/50 border border-w-pink/20">
+        <div class="absolute top-0 right-0 w-40 h-40 bg-w-pink/5 rounded-full -translate-y-1/2 translate-x-1/2 pointer-events-none"></div>
+        <dialog id="share-dialog" class="modal" data-link-copied-text="{{ t $.Lang "resource.linkCopied" }}">
+            <div class="modal-box max-w-sm bg-w-card border border-w-line">
+                <h3 class="font-bold text-lg mb-4">{{ t $.Lang "resource.share" }}</h3>
+                <div class="flex gap-2">
+                    <input id="share-url" type="text" readonly class="input input-bordered input-sm flex-1 bg-base-200 text-w-sub" />
+                    <button type="button" class="btn btn-sm btn-soft" onclick="copyShareUrl()">{{ t $.Lang "resource.copy" }}</button>
+                </div>
+                <div class="modal-action">
+                    <form method="dialog"><button class="btn btn-sm btn-ghost">{{ t $.Lang "resource.close" }}</button></form>
+                </div>
+            </div>
+            <form method="dialog" class="modal-backdrop"><button tabindex="-1" aria-hidden="true">close</button></form>
+        </dialog>
+        {{/* The same grid as the enriched header's: the status block between
+             the title and the actions, under the poster row on a phone. */}}
+        <div class="relative grid grid-cols-[100px_minmax(0,1fr)] sm:grid-cols-[140px_minmax(0,1fr)] grid-rows-[auto_1fr] sm:grid-rows-[auto_auto_1fr] gap-x-3 sm:gap-x-5 gap-y-3.5 sm:gap-y-3">
+            <!-- Poster slot: shows the per-resource thumbnail when one
+                 exists (generated during stream/download), otherwise the
+                 onerror handler hides the <img> and the gradient
+                 placeholder underneath shows through. Same picture as
+                 the OG share preview, so a visitor arriving via a
+                 shared link sees consistent artwork. -->
+            <div class="col-[1/2] row-[1/3] sm:row-[1/4] self-stretch w-full aspect-[2/3] rounded-xl overflow-hidden border border-w-line/30 shadow-lg relative">
+                <div class="absolute inset-0 bg-gradient-to-br from-w-purple/20 via-w-pink/10 to-w-cyan/15 text-w-purpleL/60 flex items-center justify-center">
+                    <div class="text-center font-bold text-sm p-3 line-clamp-3 drop-shadow-sm">{{ .Resource.Name }}</div>
+                </div>
+                <img src="{{ getResourcePosterURL . 480 $ }}" alt="{{ .Resource.Name }}" class="absolute inset-0 w-full h-full object-cover" loading="lazy"
+                     onerror="this.remove()">
+                {{ if showAdultBadge (isAdult .) $ }}
+                <div class="w-adult-badge absolute inset-0 grid place-items-center pointer-events-none" data-resource-id="{{ .Resource.ID }}">
+                    <span class="badge bg-transparent text-white/90 border-2 border-white/70 font-semibold tracking-wide backdrop-blur-sm leading-none flex items-center justify-center cursor-pointer pointer-events-auto select-none">18+</span>
+                </div>
+                {{ end }}
+            </div>
+            <div class="col-[2/3] row-start-1 min-w-0">
+                <div class="flex items-center gap-2">
+                    <h1 class="text-[clamp(1.5rem,3.5vw,2rem)] font-bold tracking-tight leading-snug break-words line-clamp-2 text-balance" title="{{ .Resource.Name }}">{{ .Resource.Name }}</h1>
+                    <button type="button" class="shrink-0 text-w-muted hover:text-base-content transition-colors duration-200 cursor-pointer" onclick="shareResource({location:'header'})" aria-label="Share">
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-7 h-7">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M9 8.25H7.5a2.25 2.25 0 0 0-2.25 2.25v9a2.25 2.25 0 0 0 2.25 2.25h9a2.25 2.25 0 0 0 2.25-2.25v-9a2.25 2.25 0 0 0-2.25-2.25H15m0-3-3-3m0 0-3 3m3-3V15" />
+                        </svg>
+                    </button>
+                </div>
+            </div>
+            {{ if .TorrentStatus }}
+            <div class="col-[1/-1] row-start-3 sm:col-[2/3] sm:row-start-2 min-w-0 pt-3 border-t border-white/[.06] sm:pt-0 sm:border-t-0">
+                {{ template "resource/status_container" $ }}
+            </div>
+            {{ end }}
+            <div class="col-[2/3] row-start-2 sm:row-start-3 min-w-0">
+                <div class="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2">
+                    <div id="pledge-button" class="shrink-0" data-async-layout="{{`{{ template "vault/button" (withContext $ .Data.VaultButton) }}`}}" data-async-get="">
+                        {{ if .Vault }}
+                            {{ template "vault/button" (withContext $ .VaultButton) }}
+                        {{ end }}
+                    </div>
+                    <div id="library-button" class="shrink-0" data-async-layout="{{`{{ with .Data }}{{ if has . "Resource" }}{{ template "library/button" (withContext $ .Resource) }}{{ end }}{{ end }}`}}">
+                        {{ template "library/button" (withContext $ .Resource) }}
+                    </div>
+                    {{ template "resource/torrent_magnet_split" (withContext $ .Resource) }}
+                </div>
+                {{ template "resource/tool_intent" $ }}
+            </div>
+        </div>
+    </div>
+    {{ end }}
+
+    {{ if $.ErrKey }}
+    <div class="progress-alert progress-alert-oneline mb-4">
+        <pre class="error">{{ t $.Lang $.ErrKey }}</pre>
+    </div>
+    {{ end }}
+
+    {{ template "resource/release_subscribe_banner" $ }}
+
+    <!-- Content divider -->
+    <div class="flex items-center gap-3 mt-6 mb-4">
+        <h2 class="text-xs font-semibold tracking-widest uppercase text-w-muted">{{ t $.Lang "resource.content" }}</h2>
+        <div class="flex-1 h-px bg-w-line/50"></div>
+    </div>
+
+    {{/* A script block (window._ads), not a slot on the page: it used to sit
+         between the file card and the list, and stays out of #content so that
+         picking a file does not run it again. */}}
+    {{ if and ($.Claims | hasAds) (not (.Resource.MagnetURI | isDemoMagnet)) }}{{ template "get_ads" $ }}{{ end }}
+
+    {{/* Picking a file reloads THIS and nothing above it (owner, 2026-09-20):
+         the links in partials/list.html target #content. They used to target
+         `main`, which re-rendered the header, restarted the status stream and
+         threw the sticky status away on every click. The title is the one
+         thing outside that names the file; nav carries the language links,
+         which must point at the new URL. */}}
+    <div id="content" class="scroll-mt-18" data-async-layout="{{`{{ template "resource/content" . }}`}}" data-async-update-title="{{`{{ template "title" . }} | Torrently`}}" data-async-update-nav="{{`{{ template "nav" . }}`}}">
+    {{ template "resource/content" $ }}
+    </div>
+    {{ if and ($.User | hasAuth) .Vault }}
+        <div id="pledge-modal" data-async-layout="{{`{{ template "vault/pledge-modal" (withContext $ .Data) }}`}}">
+            {{ template "vault/pledge-modal" (withContext $ .) }}
+        </div>
+    {{ end }}
+    {{ if and ($.User | hasAuth) (or .Movie .Series) }}
+        <div id="rate-modal" data-async-layout="{{`{{ template "user_video_status/rate-modal" (withContext $ .Data) }}`}}">
+            {{ template "user_video_status/rate-modal" (withContext $ .) }}
+        </div>
+    {{ end }}
+    {{ end }}
+
+  </div>
+</section>
+{{ template "get_extra" . }}
+{{ "resource/get.js" | asset }}
+{{ end }}

@@ -1,0 +1,1408 @@
+package api
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/sha1"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/gin-contrib/sessions"
+	"github.com/gin-gonic/gin"
+	log "github.com/sirupsen/logrus"
+	"github.com/webtor-io/lazymap"
+	"github.com/webtor-io/web-ui/services/common"
+
+	"github.com/pkg/errors"
+	"github.com/webtor-io/web-ui/helpers"
+
+	"github.com/urfave/cli"
+
+	ra "github.com/webtor-io/rest-api/services"
+
+	"github.com/golang-jwt/jwt/v5"
+
+	"github.com/webtor-io/web-ui/services/auth"
+	"github.com/webtor-io/web-ui/services/claims"
+)
+
+const (
+	apiKeyFlag                      = "webtor-key"
+	apiSecretFlag                   = "webtor-secret"
+	apiSecureFlag                   = "webtor-rest-api-secure"
+	apiHostFlag                     = "webtor-rest-api-host"
+	apiPortFlag                     = "webtor-rest-api-port"
+	apiExpireFlag                   = "webtor-rest-api-expire"
+	rapidApiKeyFlag                 = "rapidapi-key"
+	rapidApiHostFlag                = "rapidapi-host"
+	useInternalTorrentHTTPProxyFlag = "use-internal-torrent-http-proxy"
+	torrentHTTPProxyHostFlag        = "torrent-http-proxy-host"
+	torrentHTTPProxyPortFlag        = "torrent-http-proxy-port"
+)
+
+func RegisterFlags(f []cli.Flag) []cli.Flag {
+	return append(f,
+		cli.StringFlag{
+			Name:   apiHostFlag,
+			Usage:  "webtor rest-api host",
+			EnvVar: "REST_API_SERVICE_HOST",
+		},
+		cli.IntFlag{
+			Name:   apiPortFlag,
+			Usage:  "webtor rest-api port",
+			EnvVar: "REST_API_SERVICE_PORT",
+			Value:  80,
+		},
+		cli.BoolFlag{
+			Name:   apiSecureFlag,
+			Usage:  "webtor rest-api secure (https)",
+			EnvVar: "REST_API_SECURE",
+		},
+		cli.IntFlag{
+			Name:   apiExpireFlag,
+			Usage:  "webtor rest-api expire in days",
+			EnvVar: "REST_API_EXPIRE",
+			Value:  1,
+		},
+		cli.StringFlag{
+			Name:   apiKeyFlag,
+			Usage:  "webtor api key",
+			Value:  "",
+			EnvVar: "WEBTOR_API_KEY",
+		},
+		cli.StringFlag{
+			Name:   apiSecretFlag,
+			Usage:  "webtor api secret",
+			Value:  "",
+			EnvVar: "WEBTOR_API_SECRET",
+		},
+		cli.StringFlag{
+			Name:   rapidApiHostFlag,
+			Usage:  "RapidAPI host",
+			Value:  "",
+			EnvVar: "RAPIDAPI_HOST",
+		},
+		cli.StringFlag{
+			Name:   rapidApiKeyFlag,
+			Usage:  "RapidAPI key",
+			Value:  "",
+			EnvVar: "RAPIDAPI_KEY",
+		},
+		cli.BoolFlag{
+			Name:   useInternalTorrentHTTPProxyFlag,
+			Usage:  "use internal torrent http proxy",
+			EnvVar: "USE_INTERNAL_TORRENT_HTTP_PROXY",
+		},
+		cli.StringFlag{
+			Name:   torrentHTTPProxyHostFlag,
+			Usage:  "torrent http proxy host",
+			EnvVar: "TORRENT_HTTP_PROXY_SERVICE_HOST",
+		},
+		cli.IntFlag{
+			Name:   torrentHTTPProxyPortFlag,
+			Usage:  "torrent http proxy port",
+			EnvVar: "TORRENT_HTTP_PROXY_SERVICE_PORT",
+			Value:  80,
+		},
+	)
+}
+
+type EventData struct {
+	Total     int64 `json:"total"`
+	Completed int   `json:"completed"`
+	Peers     int   `json:"peers"`
+	Status    int   `json:"status"`
+	Pieces    []struct {
+		Position int  `json:"position"`
+		Complete bool `json:"complete"`
+		Priority int  `json:"priority"`
+	} `json:"pieces"`
+	Seeders  int `json:"seeders"`
+	Leechers int `json:"leechers"`
+	// Live says whether the seeder answered from a loaded torrent (true)
+	// or from disk for a torrent nobody is streaming (false). Seeders
+	// before 2026-09-09 do not send it: nil reads as live.
+	Live *bool `json:"live"`
+	// The swarm's availability over the same pieces, at the same positions
+	// (torrent-web-seeder StatReply fields 9-14; a seeder without them sends
+	// none, which reads as AvailabilityKnown false and nothing missing).
+	//
+	// Availability is the share of the pieces complete here or claimed by a
+	// connected peer, a lower bound until AvailabilityKnown: a peer is
+	// connected before its bitfield arrives, so an early union paints holes
+	// that are not there. Missing are the pieces neither complete here nor
+	// claimed by anyone connected, as sorted runs -- merged past 512 runs,
+	// so a run may also cover complete pieces: completion is drawn over it.
+	// The stream is stateful for them like for pieces: MissingUnchanged
+	// says this frame leaves Missing out because it did not change, while a
+	// frame that carries them (MissingUnchanged false) replaces them, null
+	// or [] meaning none. WantedMissing counts the wanted, incomplete pieces
+	// nobody connected has; ReaderMissing those of them an open reader is on
+	// or reads ahead into. All of it is empty unless AvailabilityKnown.
+	Availability      float64      `json:"availability"`
+	AvailabilityKnown bool         `json:"availability_known"`
+	Missing           []PieceRange `json:"missing"`
+	MissingUnchanged  bool         `json:"missing_unchanged"`
+	WantedMissing     int          `json:"wanted_missing"`
+	ReaderMissing     int          `json:"reader_missing"`
+}
+
+// StatTerminated is EventData.Status for the seeder's StatReply_TERMINATED:
+// the pod got SIGTERM (a deploy rotates every seeder pod) and says so on
+// every stats stream it holds, just before it ends them. The frame carries
+// nothing else -- every counter zero -- so it is not stats at all
+// (torrent-web-seeder services/stat.go StatStream).
+const StatTerminated = 3
+
+// PieceRange is a half-open run [Start, End) of piece positions.
+type PieceRange struct {
+	Start int `json:"start"`
+	End   int `json:"end"`
+}
+
+// statsMaxLine caps one line of the seeder's stats stream. The first frame
+// lists every piece of the torrent: ~405 KB at 8k pieces, ~3.2 MB at 64k,
+// ~13 MB at 256k. A line past the cap ends the stream, and at the old 1 MB a
+// torrent of ~20k pieces or more never got a status at all.
+const statsMaxLine = 16 << 20
+
+type ExtSubtitle struct {
+	Srclang string `json:"srclang"`
+	Label   string `json:"label"`
+	Src     string `json:"src"`
+	Format  string `json:"format"`
+	Id      string `json:"id"`
+	Hash    string `json:"hash"`
+	// Source is video-info's enum for which leg found this track: "hash"
+	// (the OpenSubtitles moviehash of this very file) or "imdb" (the same
+	// title, possibly another release, so possibly out of sync).
+	Source string `json:"source"`
+	// MovieHashMatch is the bool Source is derived from, reported since
+	// 2026-09-16. A pointer because absent and false are different
+	// answers: an older video-info sends neither field's ground truth and
+	// nil falls back to the Source enum, the way EventData.Live does.
+	MovieHashMatch *bool `json:"moviehash_match"`
+}
+
+type MediaProbeChapter struct {
+	StartTime string `json:"start_time"`
+	EndTime   string `json:"end_time"`
+	Tags      struct {
+		Title string `json:"title"`
+	} `json:"tags"`
+}
+
+type MediaProbe struct {
+	Format struct {
+		FormatName string `json:"format_name"`
+		BitRate    string `json:"bit_rate"`
+		Duration   string `json:"duration"`
+		Tags       struct {
+			CompatibleBrands string    `json:"compatible_brands"`
+			Copyright        string    `json:"copyright"`
+			CreationTime     time.Time `json:"creation_time"`
+			Description      string    `json:"description"`
+			Encoder          string    `json:"encoder"`
+			MajorBrand       string    `json:"major_brand"`
+			MinorVersion     string    `json:"minor_version"`
+			Title            string    `json:"title"`
+		} `json:"tags"`
+	} `json:"format"`
+	// Chapters is the container's chapter list (ffprobe -show_chapters), present
+	// for probes made since content-prober started asking for it (2026-09-21);
+	// an older cached probe simply has none. The player reads where the
+	// credits begin from it -- jobs/scripts/credits.go.
+	Chapters []MediaProbeChapter `json:"chapters,omitempty"`
+	Streams  []struct {
+		CodecName string `json:"codec_name"`
+		CodecType string `json:"codec_type"`
+		Width     int    `json:"width,omitempty"`
+		Height    int    `json:"height,omitempty"`
+		BitRate   string `json:"bit_rate"`
+		Duration  string `json:"duration"`
+		Tags      struct {
+			CreationTime time.Time `json:"creation_time"`
+			HandlerName  string    `json:"handler_name"`
+			Language     string    `json:"language"`
+			VendorId     string    `json:"vendor_id"`
+			Title        string    `json:"title"`
+			// The stream's average bitrate as mkvmerge's statistics tags
+			// record it: in a Matroska file ffprobe leaves a video
+			// stream's bit_rate empty, and these are all there is (BPS-eng
+			// is older mkvmerge's spelling). A tool that remuxed the file
+			// later may have copied them unchanged -- stale.
+			BPS    string `json:"BPS,omitempty"`
+			BPSEng string `json:"BPS-eng,omitempty"`
+		} `json:"tags"`
+		Index         int    `json:"index,omitempty"`
+		Channels      int    `json:"channels,omitempty"`
+		ChannelLayout string `json:"channel_layout,omitempty"`
+		SampleRate    string `json:"sample_rate,omitempty"`
+		// ColorTransfer and Disposition are ffprobe's own fields, which the
+		// ~cp path hands through untouched (content-prober returns raw
+		// ffprobe JSON). The probe the transcoder's index.json serves (the
+		// media_probe export) goes through content-prober's gRPC proto and
+		// has neither: zero there. Read by File info
+		// (jobs/scripts/file_info.go); the player still guesses "forced"
+		// from the title (handlers/action/helper.go).
+		ColorTransfer string `json:"color_transfer,omitempty"`
+		// ClosedCaptions is 1 on a video stream carrying CEA-608/708
+		// captions: they are not a subtitle stream of their own.
+		ClosedCaptions int `json:"closed_captions,omitempty"`
+		Disposition    struct {
+			Default         int `json:"default"`
+			Forced          int `json:"forced"`
+			HearingImpaired int `json:"hearing_impaired"`
+			// AttachedPic marks cover art an MP4 carries as a video stream.
+			AttachedPic int `json:"attached_pic"`
+		} `json:"disposition"`
+	} `json:"streams"`
+}
+
+type Claims struct {
+	jwt.RegisteredClaims
+	Rate          string `json:"rate,omitempty"`
+	Role          string `json:"role,omitempty"`
+	SessionID     string `json:"sessionID"`
+	Domain        string `json:"domain"`
+	Agent         string `json:"agent"`
+	RemoteAddress string `json:"remoteAddress"`
+	// Hash binds the primary token to a specific torrent infohash. THP's
+	// generic claim-hash check (web.go: boundHash != src.InfoHash → 403)
+	// covers any token carrying this field. Set whenever Rules is set so
+	// the manifest request itself fails fast on cross-content replay,
+	// instead of only the inner grace-token check on segments.
+	Hash string `json:"hash,omitempty"`
+	// Rules ride inside the X-Token header to rest-api, which copies the
+	// header verbatim into the ?token= of every signed export URL. THP
+	// then reads them off the segment-request token. See docs/grace_token.md.
+	Rules []Rule `json:"rules,omitempty"`
+}
+
+type Api struct {
+	url                         string
+	prepareRequest              func(r *http.Request, c *Claims) (*http.Request, error)
+	cl                          *http.Client
+	domain                      string
+	expire                      int
+	torrentCache                *lazymap.LazyMap[[]byte]
+	listResponseCache           *lazymap.LazyMap[*ra.ListResponse]
+	resourcesCache              *lazymap.LazyMap[*ra.ResourceResponse]
+	useInternalTorrentHTTPProxy bool
+	torrentHTTPProxyHost        string
+	torrentHTTPProxyPort        int
+	secret                      string
+}
+
+type ListResourceContentOutputType string
+
+const (
+	OutputList ListResourceContentOutputType = "list"
+	OutputTree ListResourceContentOutputType = "tree"
+)
+
+type ListResourceContentArgs struct {
+	Limit  uint
+	Offset uint
+	Path   string
+	Output ListResourceContentOutputType
+	Sort   string
+}
+
+func (s *ListResourceContentArgs) ToQuery() url.Values {
+	q := url.Values{}
+	limit := uint(10)
+	offset := s.Offset
+	path := "/"
+	output := OutputList
+	if s.Limit > 0 {
+		limit = s.Limit
+	}
+	if s.Path != "" {
+		path = s.Path
+	}
+	if s.Output != "" {
+		output = s.Output
+	}
+	q.Set("limit", strconv.Itoa(int(limit)))
+	q.Set("offset", strconv.Itoa(int(offset)))
+	q.Set("path", path)
+	q.Set("output", string(output))
+	if s.Sort != "" {
+		q.Set("sort", s.Sort)
+	}
+	return q
+}
+
+func New(c *cli.Context, cl *http.Client) *Api {
+	host := c.String(apiHostFlag)
+	port := c.Int(apiPortFlag)
+	secure := c.Bool(apiSecureFlag)
+	secret := c.String(apiSecretFlag)
+	expire := c.Int(apiExpireFlag)
+	key := c.String(apiKeyFlag)
+	rapidApiHost := c.String(rapidApiHostFlag)
+	rapidApiKey := c.String(rapidApiKeyFlag)
+	if rapidApiHost != "" {
+		host = rapidApiHost
+		port = 443
+		secure = true
+	}
+	protocol := "http"
+	if secure {
+		protocol = "https"
+	}
+	u := fmt.Sprintf("%v://%v:%v", protocol, host, port)
+	prepareRequest := func(r *http.Request, cl *Claims) (*http.Request, error) {
+		token := jwt.NewWithClaims(jwt.SigningMethodHS256, cl)
+		tokenString, err := token.SignedString([]byte(secret))
+		if err != nil {
+			return nil, err
+		}
+		r.Header.Set("X-Token", tokenString)
+		r.Header.Set("X-Api-Key", key)
+		return r, nil
+	}
+	if rapidApiHost != "" && rapidApiKey != "" {
+		log.Info("using RapidAPI")
+		prepareRequest = func(r *http.Request, cl *Claims) (*http.Request, error) {
+			r.Header.Set("X-RapidAPI-Host", rapidApiHost)
+			r.Header.Set("X-RapidAPI-Key", rapidApiKey)
+			return r, nil
+		}
+	}
+	log.Infof("api endpoint %v", u)
+	apiURL, _ := url.Parse(c.String(common.DomainFlag))
+	return &Api{
+		url:            u,
+		cl:             cl,
+		prepareRequest: prepareRequest,
+		domain:         apiURL.Hostname(),
+		expire:         expire,
+		torrentCache: lazymap.New[[]byte](&lazymap.Config{
+			Expire: time.Minute,
+		}),
+		resourcesCache: lazymap.New[*ra.ResourceResponse](&lazymap.Config{
+			Expire: time.Minute,
+		}),
+		listResponseCache: lazymap.New[*ra.ListResponse](&lazymap.Config{
+			Expire: time.Minute,
+		}),
+		useInternalTorrentHTTPProxy: c.Bool(useInternalTorrentHTTPProxyFlag),
+		torrentHTTPProxyHost:        c.String(torrentHTTPProxyHostFlag),
+		torrentHTTPProxyPort:        c.Int(torrentHTTPProxyPortFlag),
+		secret:                      secret,
+	}
+}
+
+func (s *Api) GetResource(ctx context.Context, c *Claims, infohash string) (e *ra.ResourceResponse, err error) {
+	u := s.url + "/resource/" + infohash
+	e = &ra.ResourceResponse{}
+	err = s.doRequest(ctx, c, u, "GET", nil, e)
+	if e.ID == "" {
+		e = nil
+	}
+	return
+}
+
+// errResourceNotFound carries rest-api's 404 out of resourcesCache, which
+// keeps only successes: a cached miss would keep a hash stored a moment later
+// unknown for the whole minute (an API client stores, then pledges).
+var errResourceNotFound = errors.New("resource not found")
+
+func (s *Api) GetResourceCached(ctx context.Context, c *Claims, infohash string) (e *ra.ResourceResponse, err error) {
+	e, err = s.resourcesCache.Get(infohash, func() (*ra.ResourceResponse, error) {
+		r, err := s.GetResource(ctx, c, infohash)
+		if err == nil && r == nil {
+			return nil, errResourceNotFound
+		}
+		return r, err
+	})
+	if errors.Is(err, errResourceNotFound) {
+		return nil, nil
+	}
+	return
+}
+
+func (s *Api) GetTorrent(ctx context.Context, c *Claims, infohash string) (closer io.ReadCloser, err error) {
+	u := s.url + "/resource/" + infohash + ".torrent"
+	res, err := s.doRequestRaw(ctx, c, u, "GET", nil)
+	if err != nil {
+		return nil, err
+	}
+	return res.Body, nil
+}
+
+func (s *Api) GetTorrentCached(ctx context.Context, c *Claims, infohash string) ([]byte, error) {
+	return s.torrentCache.Get(infohash, func() ([]byte, error) {
+		resp, err := s.GetTorrent(ctx, c, infohash)
+		if err != nil {
+			return nil, err
+		}
+		defer func(Body io.ReadCloser) {
+			_ = Body.Close()
+		}(resp)
+		data, err := io.ReadAll(resp)
+		if err != nil {
+			return nil, err
+		}
+		return data, nil
+	})
+
+}
+
+func (s *Api) StoreResource(ctx context.Context, c *Claims, resource []byte) (e *ra.ResourceResponse, err error) {
+	u := s.url + "/resource"
+	e = &ra.ResourceResponse{}
+	err = s.doRequest(ctx, c, u, "POST", resource, e)
+	if e.ID == "" {
+		e = nil
+	}
+	return
+}
+
+func (s *Api) ListResourceContent(ctx context.Context, c *Claims, infohash string, args *ListResourceContentArgs) (e *ra.ListResponse, err error) {
+	u := s.url + "/resource/" + infohash + "/list?" + args.ToQuery().Encode()
+	e = &ra.ListResponse{}
+	err = s.doRequest(ctx, c, u, "GET", nil, e)
+	return
+}
+
+func (s *Api) ListResourceContentCached(ctx context.Context, c *Claims, infohash string, args *ListResourceContentArgs) (*ra.ListResponse, error) {
+	key := infohash + fmt.Sprintf("%+v", args)
+	return s.listResponseCache.Get(key, func() (*ra.ListResponse, error) {
+		return s.ListResourceContent(ctx, c, infohash, args)
+	})
+}
+
+func (s *Api) doRequestRaw(ctx context.Context, c *Claims, url string, method string, data []byte) (res *http.Response, err error) {
+	var payload io.Reader
+
+	if data != nil {
+		payload = bytes.NewReader(data)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, url, payload)
+
+	if err != nil {
+		return
+	}
+
+	req, err = s.prepareRequest(req, c)
+
+	if err != nil {
+		return
+	}
+
+	res, err = s.do(req)
+	if err != nil {
+		return
+	}
+
+	return
+}
+
+// ErrForbidden is rest-api's 403: torrent-store refuses the hash (banned,
+// stoplisted). By identity, so a caller can tell a refusal from a failure
+// without reading text an upstream body may carry; the message stays the
+// one web.ClassifyError and the logs match.
+var ErrForbidden = errors.New("access is forbidden")
+
+func (s *Api) doRequest(ctx context.Context, c *Claims, url string, method string, data []byte, v any) error {
+	res, err := s.doRequestRaw(ctx, c, url, method, data)
+	if err != nil {
+		return err
+	}
+
+	defer func(Body io.ReadCloser) {
+		_ = Body.Close()
+	}(res.Body)
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return err
+	}
+
+	if res.StatusCode == http.StatusOK {
+		err = json.Unmarshal(body, v)
+		if err != nil {
+			return err
+		}
+		return nil
+	} else if res.StatusCode == http.StatusNotFound {
+		return nil
+	} else if res.StatusCode == http.StatusForbidden {
+		return fmt.Errorf("%w url=%v", ErrForbidden, url)
+	} else {
+		var e ra.ErrorResponse
+		err = json.Unmarshal(body, &e)
+		if err != nil {
+			return errors.Wrapf(err, "failed to parse status=%v body=%v url=%v", res.StatusCode, body, url)
+		}
+		return errors.New(e.Error)
+	}
+}
+
+type SpeedtestURL struct {
+	URL  string `json:"url"`
+	Type string `json:"type"`
+}
+
+func (s *Api) GetSpeedtestURLs(ctx context.Context, c *Claims) ([]SpeedtestURL, error) {
+	u := s.url + "/speedtest"
+	var resp struct {
+		URLs []SpeedtestURL `json:"urls"`
+	}
+	err := s.doRequest(ctx, c, u, "GET", nil, &resp)
+	if err != nil {
+		return nil, err
+	}
+	return resp.URLs, nil
+}
+
+func (s *Api) ExportResourceContent(ctx context.Context, c *Claims, infohash string, itemID string, imdbID string) (e *ra.ExportResponse, err error) {
+	return s.ExportResourceContentWithArchiveFormat(ctx, c, infohash, itemID, imdbID, "", nil)
+}
+
+// ExportResourceContentStandardDomain is ExportResourceContent with every URL
+// on the standard domain (use-premium-domain=false), whatever the viewer's
+// role: for URLs web-ui reads event streams from on its own side — the
+// premium edge buffers them. rest-api already pins the stat URL there; this
+// pins the rest, from which the status derives the viewer's session stream.
+func (s *Api) ExportResourceContentStandardDomain(ctx context.Context, c *Claims, infohash string, itemID string) (*ra.ExportResponse, error) {
+	q := url.Values{}
+	q.Set("use-premium-domain", "false")
+	return s.exportResourceContent(ctx, c, infohash, itemID, q)
+}
+
+// ExportResourceContentWithArchiveFormat additionally forwards the archive
+// format ("tar" or "zip") that rest-api uses to name directory downloads
+// (empty keeps the rest-api default, zip) and the optional selection of
+// file/folder paths the archive should be limited to.
+func (s *Api) ExportResourceContentWithArchiveFormat(ctx context.Context, c *Claims, infohash string, itemID string, imdbID string, archiveFormat string, paths []string) (e *ra.ExportResponse, err error) {
+	q := url.Values{}
+	if imdbID != "" {
+		q.Add("imdb-id", imdbID)
+	}
+	if archiveFormat != "" {
+		q.Add("archive-format", archiveFormat)
+	}
+	for _, p := range paths {
+		q.Add("paths", p)
+	}
+	return s.exportResourceContent(ctx, c, infohash, itemID, q)
+}
+
+func (s *Api) exportResourceContent(ctx context.Context, c *Claims, infohash string, itemID string, q url.Values) (*ra.ExportResponse, error) {
+	u := s.url + "/resource/" + infohash + "/export/" + itemID
+	if len(q) > 0 {
+		u += "?" + q.Encode()
+	}
+	e := &ra.ExportResponse{}
+	err := s.doRequest(ctx, c, u, "GET", nil, e)
+	return e, err
+}
+
+// Download GETs u through torrent-http-proxy. The body comes back whatever
+// the status, and the status comes back with it: which non-200 answers are
+// worth asking again is the caller's call (jobs/scripts/hls.go).
+func (s *Api) Download(ctx context.Context, u string) (io.ReadCloser, int, error) {
+	return s.DownloadWithRange(ctx, u, 0, -1)
+}
+
+func (s *Api) proxyURL(u string) (string, error) {
+	if s.useInternalTorrentHTTPProxy {
+		ur, err := url.Parse(u)
+		if err != nil {
+			return "", err
+		}
+		ur.Host = fmt.Sprintf("%v:%v", s.torrentHTTPProxyHost, s.torrentHTTPProxyPort)
+		ur.Scheme = "http"
+		return ur.String(), nil
+	}
+	return u, nil
+}
+
+// do is s.cl.Do with the URL in its error redacted. A failed request's error
+// quotes the URL whole, and the URLs to torrent-http-proxy carry the site's
+// api-key and the viewer's token; every caller logs that error (Loki,
+// 2026-10-03: "stats SSE failed", 267 lines a day).
+func (s *Api) do(req *http.Request) (*http.Response, error) {
+	res, err := s.cl.Do(req)
+	if ue, ok := err.(*url.Error); ok {
+		ue.URL = helpers.RedactURL(ue.URL)
+	}
+	return res, err
+}
+
+func (s *Api) makeTorrentHTTPProxyRequest(ctx context.Context, u string) (*http.Request, error) {
+	resolved, err := s.proxyURL(u)
+	if err != nil {
+		return nil, err
+	}
+	return http.NewRequestWithContext(ctx, "GET", resolved, nil)
+}
+
+type TranscoderSession struct {
+	ID       string  `json:"id"`
+	Duration float64 `json:"duration"`
+	// VideoRoute is what the transcoder does with the video of this
+	// session: passthrough (the source's HEVC as it is), copy, reencode,
+	// audio. "" from a transcoder that predates routes.
+	VideoRoute string `json:"video_route"`
+	// RouteReason is why (content-transcoder services/route.go): ok for
+	// passthrough; no_declaration, passthrough_off, not_hevc, needs_2160
+	// and the like for the old route.
+	RouteReason string `json:"route_reason"`
+}
+
+// TranscoderRefusal is a POST /session the transcoder answered with 415 or
+// 503: the body, and the route reason it names (X-Video-Route-Reason; ""
+// from a transcoder that names none, or for a refusal the route did not
+// cause). Error() is the text this error had before it was typed, byte for
+// byte: web.ClassifyError and the logs match on it.
+type TranscoderRefusal struct {
+	Status     int
+	Body       string
+	Reason     string
+	RetryAfter string
+	// Fallback: the start that was refused is a restart after a
+	// passthrough failed in the browser -- the refusal of a file this
+	// browser was just shown and could not play (set by the caller that
+	// knows it, jobs/scripts bufferSessionHLS).
+	Fallback bool
+}
+
+func (e *TranscoderRefusal) Error() string {
+	return fmt.Sprintf("transcoder session creation failed status=%d body=%s", e.Status, e.Body)
+}
+
+// withDecode adds the browser's declaration to a POST /session URL as the
+// last query parameter. The query that is there already (thp's token and
+// api-key) is left as it is: re-encoding it through url.Values would sort
+// it. "" leaves the URL untouched.
+func withDecode(sessionURL, decode string) (string, error) {
+	if decode == "" {
+		return sessionURL, nil
+	}
+	u, err := url.Parse(sessionURL)
+	if err != nil {
+		return "", err
+	}
+	if u.RawQuery != "" {
+		u.RawQuery += "&"
+	}
+	u.RawQuery += "decode=" + url.QueryEscape(decode)
+	return u.String(), nil
+}
+
+func appendPath(base string, suffix string) (string, error) {
+	u, err := url.Parse(base)
+	if err != nil {
+		return "", err
+	}
+	u.Path += suffix
+	return u.String(), nil
+}
+
+// CreateTranscoderSession opens a transcoding session. decode is the
+// browser's declaration (models.ParseDecodeDeclaration; "" for none, and
+// the request is then byte for byte what it was before declarations). A
+// 415 or 503 comes back as a *TranscoderRefusal.
+func (s *Api) CreateTranscoderSession(ctx context.Context, baseURL string, decode string) (*TranscoderSession, error) {
+	sessionURL, err := appendPath(baseURL, "/session")
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to construct session URL")
+	}
+	sessionURL, err = withDecode(sessionURL, decode)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to construct session URL")
+	}
+	resolved, err := s.proxyURL(sessionURL)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to resolve proxy URL")
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", resolved, nil)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create request")
+	}
+	res, err := s.do(req)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create transcoder session")
+	}
+	defer func() { _ = res.Body.Close() }()
+	data, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to read session response")
+	}
+	if res.StatusCode == http.StatusUnsupportedMediaType || res.StatusCode == http.StatusServiceUnavailable {
+		return nil, &TranscoderRefusal{
+			Status:     res.StatusCode,
+			Body:       string(data),
+			Reason:     res.Header.Get("X-Video-Route-Reason"),
+			RetryAfter: res.Header.Get("Retry-After"),
+		}
+	}
+	if res.StatusCode != http.StatusOK {
+		return nil, errors.Errorf("transcoder session creation failed status=%d body=%s", res.StatusCode, string(data))
+	}
+	session := &TranscoderSession{}
+	if err := json.Unmarshal(data, session); err != nil {
+		return nil, errors.Wrapf(err, "failed to parse session response body=%s", string(data))
+	}
+	return session, nil
+}
+
+func (s *Api) DeleteTranscoderSession(ctx context.Context, baseURL string, sessionID string) error {
+	deleteURL, err := appendPath(baseURL, "/session/"+sessionID)
+	if err != nil {
+		return errors.Wrap(err, "failed to construct delete URL")
+	}
+	resolved, err := s.proxyURL(deleteURL)
+	if err != nil {
+		return errors.Wrap(err, "failed to resolve proxy URL")
+	}
+	req, err := http.NewRequestWithContext(ctx, "DELETE", resolved, nil)
+	if err != nil {
+		return errors.Wrap(err, "failed to create request")
+	}
+	res, err := s.do(req)
+	if err != nil {
+		return errors.Wrap(err, "failed to delete transcoder session")
+	}
+	_ = res.Body.Close()
+	return nil
+}
+
+func (s *Api) DownloadWithRange(ctx context.Context, u string, start int, end int) (io.ReadCloser, int, error) {
+	req, err := s.makeTorrentHTTPProxyRequest(ctx, u)
+	if err != nil {
+		log.WithError(err).Error("failed to make new request")
+		return nil, 0, err
+	}
+	if start != 0 || end != -1 {
+		startStr := strconv.Itoa(start)
+		endStr := ""
+		if end != -1 {
+			endStr = strconv.Itoa(end)
+		}
+		req.Header.Set("Range", fmt.Sprintf("bytes=%v-%v", startStr, endStr))
+	}
+	res, err := s.do(req)
+	if err != nil {
+		log.WithError(err).Error("failed to do request")
+		return nil, 0, err
+	}
+	return res.Body, res.StatusCode, nil
+}
+
+type OpenSubtitleTrack struct {
+	ID     string
+	Source string
+	// MovieHashMatch is ExtSubtitle.MovieHashMatch: the ground truth
+	// behind Source, nil when the service did not send it. Carried
+	// through rather than collapsed into Source so the ladder and phase-4
+	// measurement read the bool where there is one.
+	MovieHashMatch *bool
+	*ra.ExportTrack
+}
+
+// StatusError is an upstream answer that was not 200. It exists so the
+// status survives to the caller: the decoder's verdict on an error page,
+// a 429 or an empty 502 body is "unexpected end of JSON input", which
+// names neither the service that refused nor the reason, and that is what
+// the job log used to show a viewer whose subtitles did not load.
+//
+// RetryAfter is the raw Retry-After header when the upstream sent one.
+// It is carried and reported, never obeyed: this call runs inside a 30 s
+// job step with a viewer waiting on it, so sleeping out somebody else's
+// back-off would spend the whole budget and still answer nothing. The
+// page renders without OpenSubtitles instead, which it already knows how
+// to do.
+type StatusError struct {
+	Status     int
+	RetryAfter string
+}
+
+// Wait is RetryAfter as a duration: zero without one, or when it is not a
+// plain count of seconds (retryAfterSeconds).
+func (e *StatusError) Wait() time.Duration { return retryAfterSeconds(e.RetryAfter) }
+
+func (e *StatusError) Error() string {
+	if e.RetryAfter != "" {
+		return fmt.Sprintf("unexpected status %v (retry-after %v)", e.Status, e.RetryAfter)
+	}
+	return fmt.Sprintf("unexpected status %v", e.Status)
+}
+
+// ErrSubtitlesNotReady is the sentinel behind SubtitlesNotReadyError, so a
+// caller can ask errors.Is without caring about the seconds.
+var ErrSubtitlesNotReady = errors.New("subtitles not ready")
+
+// SubtitlesNotReadyError is a 200 that carries a Retry-After: video-info
+// answering "the search legs have not finished, ask again" -- the seeder is
+// still warming up, typically. The body is an empty list, and that is
+// exactly why this cannot be read as "this file has no subtitles": the
+// stream job caches its rendered result for ten minutes, so one empty
+// answer would take OpenSubtitles away from every viewer of that file for
+// the rest of the bucket. It is an error, and the seconds ride with it.
+//
+// RetryAfter is zero when the header is not a plain delta-seconds count
+// (an HTTP-date, or garbage): still not ready, just with no usable hint.
+type SubtitlesNotReadyError struct {
+	RetryAfter time.Duration
+}
+
+func (e *SubtitlesNotReadyError) Error() string {
+	if e.RetryAfter > 0 {
+		return fmt.Sprintf("subtitles not ready (retry-after %v)", e.RetryAfter)
+	}
+	return "subtitles not ready"
+}
+
+func (e *SubtitlesNotReadyError) Unwrap() error { return ErrSubtitlesNotReady }
+
+// retryAfterSeconds reads the delta-seconds form of Retry-After. The
+// HTTP-date form is legal and unused here, and a clock-skewed date is a
+// worse answer than none: both come back as 0, which the caller reads as
+// "no hint" rather than "do not wait".
+func retryAfterSeconds(v string) time.Duration {
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return time.Duration(n) * time.Second
+}
+
+func (s *Api) GetOpenSubtitles(ctx context.Context, u string) ([]OpenSubtitleTrack, error) {
+	req, err := s.makeTorrentHTTPProxyRequest(ctx, u)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to make new request")
+	}
+	res, err := s.do(req)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to do request")
+	}
+	b := res.Body
+	defer func(b io.ReadCloser) {
+		_ = b.Close()
+	}(b)
+	// Before the body: a non-200 carries an error page, or nothing at all,
+	// and neither is a subtitle list.
+	if res.StatusCode != http.StatusOK {
+		return nil, &StatusError{Status: res.StatusCode, RetryAfter: res.Header.Get("Retry-After")}
+	}
+	// A 200 that still asks for a back-off is "not finished", not "none":
+	// video-info answers that while a search leg is still waiting on the
+	// seeder. Read as an empty list it would be baked into the job's
+	// ten-minute cache for every viewer of the file.
+	if ra := res.Header.Get("Retry-After"); ra != "" {
+		return nil, &SubtitlesNotReadyError{RetryAfter: retryAfterSeconds(ra)}
+	}
+	var esubs []ExtSubtitle
+	var subs []OpenSubtitleTrack
+	data, err := io.ReadAll(b)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to read data")
+	}
+	// A 200 with an empty body is "this file has no subtitles", which is
+	// an ordinary answer and not a failure -- but json.Unmarshal rejects
+	// it, so it used to reach the job log as a parse error.
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil, nil
+	}
+	err = json.Unmarshal(data, &esubs)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to unmarshal data=%v", string(data))
+	}
+	for _, esub := range esubs {
+		subs = append(subs, OpenSubtitleTrack{
+			ExportTrack: &ra.ExportTrack{
+				Src:     s.makeSubtitleURL(u, esub),
+				Kind:    "subtitles",
+				SrcLang: esub.Srclang,
+				Label:   esub.Label,
+			},
+			ID:             esub.Id,
+			Source:         esub.Source,
+			MovieHashMatch: esub.MovieHashMatch,
+		})
+	}
+	return subs, nil
+}
+
+func (s *Api) GetMediaProbe(ctx context.Context, u string) (*MediaProbe, error) {
+	mp, _, err := s.GetMediaProbeRaw(ctx, u)
+	return mp, err
+}
+
+// GetMediaProbeRaw is GetMediaProbe with the body content-prober sent: the
+// ~cp path hands ffprobe's JSON through whole, every field (File info's raw
+// view). Its format.filename is the source URL, credentials and all.
+func (s *Api) GetMediaProbeRaw(ctx context.Context, u string) (*MediaProbe, []byte, error) {
+	req, err := s.makeTorrentHTTPProxyRequest(ctx, u)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "failed to make new request")
+	}
+	res, err := s.do(req)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "failed to do request")
+	}
+	b := res.Body
+	defer func(b io.ReadCloser) {
+		_ = b.Close()
+	}(b)
+	// A non-2xx answer is the probe's outcome, not JSON to parse: reading
+	// it as JSON turned every 404/429/502 into "failed to unmarshal
+	// data=404 page not found" and hid the status the caller needed.
+	if res.StatusCode < 200 || res.StatusCode > 299 {
+		body, _ := io.ReadAll(io.LimitReader(b, 256))
+		return nil, nil, errors.Errorf("media probe status=%v body=%q", res.StatusCode, strings.TrimSpace(string(body)))
+	}
+	mb := MediaProbe{}
+	data, err := io.ReadAll(b)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "failed to read data")
+	}
+	err = json.Unmarshal(data, &mb)
+	if err != nil {
+		return nil, nil, errors.Wrapf(err, "failed to unmarshal data=%v", string(data))
+	}
+	return &mb, data, nil
+}
+
+func (s *Api) Stats(ctx context.Context, u string) (chan EventData, error) {
+	req, err := s.makeTorrentHTTPProxyRequest(ctx, u)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to make new request")
+	}
+	res, err := s.do(req)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to do request")
+	}
+	if res.StatusCode == http.StatusNotFound {
+		_ = res.Body.Close()
+		return nil, errors.New("cached")
+	}
+	if res.StatusCode != http.StatusOK {
+		_ = res.Body.Close()
+		return nil, errors.Errorf("stats returned status %d", res.StatusCode)
+	}
+	ch := make(chan EventData)
+	go func() {
+		b := res.Body
+		defer func() {
+			close(ch)
+			_ = b.Close()
+		}()
+		// 4 KB read buffer for the life of the stream. Pre-allocating even
+		// 1 MB per stream was ~300 MB of off-heap arenas across all live
+		// status SSE streams; and a bufio.Scanner, which grows its buffer
+		// for the longest line and never gives it back, kept the first
+		// frame's size (4 MB at 64k pieces) for as long as the page stayed
+		// open. A longer line is put together in a buffer of its own and
+		// dropped once decoded (statsLines).
+		lines := statsLines{r: bufio.NewReaderSize(b, statsReadBuf), max: statsMaxLine}
+		t := ""
+		for {
+			line, err := lines.next()
+			if err == errStatsLineTooLong {
+				// One frame lost, not the stream: the frames after it are
+				// whole in everything but the pieces, which come as diffs
+				// the status loop's piece map folds in (a partial bar
+				// beats no status at all).
+				log.WithField("max", statsMaxLine).Warn("stats stream: frame over the line cap skipped")
+				continue
+			}
+			if err != nil {
+				if err != io.EOF && ctx.Err() == nil {
+					log.WithError(err).Warn("stats stream: read failed")
+				}
+				return
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			if rest, ok := bytes.CutPrefix(line, []byte("event: ")); ok {
+				t = string(bytes.TrimSpace(rest))
+				continue
+			}
+			data, ok := bytes.CutPrefix(line, []byte("data: "))
+			if t != "statupdate" || !ok {
+				continue
+			}
+			var event EventData
+			if err := json.Unmarshal(data, &event); err != nil {
+				log.WithError(err).WithField("bytes", len(data)).Error("failed to unmarshal a stats frame")
+				continue
+			}
+			select {
+			case ch <- event:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return ch, nil
+}
+
+// statsReadBuf is the stats stream's read buffer: every frame after the
+// first is the pieces that changed and fits it.
+const statsReadBuf = 4096
+
+var errStatsLineTooLong = errors.New("stats line over the cap")
+
+// statsLines reads an event stream a line at a time without keeping what a
+// long line needed: a line that fits the reader's buffer is returned in
+// place (valid until the next call), a longer one is put together in a
+// slice of its own that the next call lets go. A line longer than max is
+// read to its end and dropped (errStatsLineTooLong), the stream goes on.
+type statsLines struct {
+	r   *bufio.Reader
+	max int
+}
+
+func (l statsLines) next() ([]byte, error) {
+	line, err := l.r.ReadSlice('\n')
+	if err == nil || (err == io.EOF && len(line) > 0) {
+		return trimEOL(line), nil
+	}
+	if err != bufio.ErrBufferFull {
+		return nil, err
+	}
+	long := append(make([]byte, 0, 2*len(line)), line...)
+	for {
+		line, err = l.r.ReadSlice('\n')
+		if long != nil && len(long)+len(line) > l.max {
+			long = nil
+		}
+		if long != nil {
+			long = append(long, line...)
+		}
+		switch {
+		case err == bufio.ErrBufferFull:
+			continue
+		case err != nil && err != io.EOF:
+			return nil, err
+		case long == nil:
+			return nil, errStatsLineTooLong
+		}
+		return trimEOL(long), nil
+	}
+}
+
+// trimEOL drops a line's "\n" or "\r\n".
+func trimEOL(b []byte) []byte {
+	b = bytes.TrimSuffix(b, []byte("\n"))
+	return bytes.TrimSuffix(b, []byte("\r"))
+}
+
+// WarmupEvent is one frame of the seeder's ?warmup stream.
+//
+// Verified ("data:") is the bytes inside the range whose pieces passed the
+// hash check: it moves a whole piece at a time, and the stream closes when it
+// covers the range. Have and Span ("have:", "span:", torrent-web-seeder
+// since 2026-10) are about the pieces covering the range: Span is their
+// length, Have what has arrived of them chunk by chunk, unverified chunks
+// and the boundary pieces' bytes outside the range included. Have can drop
+// (a failed hash, an eviction). A seeder before them sends only "data:",
+// and both read -1.
+type WarmupEvent struct {
+	Verified, Have, Span int64
+}
+
+// Warmup opens the seeder's ?warmup SSE stream for the byte range
+// [rangeStart, rangeEnd] (rangeEnd == -1 means "to EOF"). The seeder
+// bumps PiecePriorityHigh on every piece covering the range and emits a
+// WarmupEvent once per second. Stream close = warmup complete; the
+// returned channel is closed in the same moment.
+//
+// The URL is derived from statsURL — the seeder routes ?stats and
+// ?warmup off the same path, so we reuse the rest-api-signed stats URL
+// (which already pins to the direct, non-premium domain to keep SSE
+// chunks unbuffered through nginx). statsURL must be non-empty; the
+// caller is expected to have short-circuited the Cache=true branch
+// upstream (rest-api emits an empty stats URL in that case).
+func (s *Api) Warmup(ctx context.Context, statsURL string, rangeStart int64, rangeEnd int64) (chan WarmupEvent, error) {
+	if statsURL == "" {
+		return nil, errors.New("empty stats url")
+	}
+	warmupURL := strings.Replace(statsURL, "stats=true", "warmup=true", 1)
+	req, err := s.makeTorrentHTTPProxyRequest(ctx, warmupURL)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to make warmup request")
+	}
+	if rangeStart != 0 || rangeEnd != -1 {
+		endStr := ""
+		if rangeEnd != -1 {
+			endStr = strconv.FormatInt(rangeEnd, 10)
+		}
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%s", rangeStart, endStr))
+	}
+	res, err := s.do(req)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to do warmup request")
+	}
+	// Unlike Stats, the seeder's ?warmup handler never returns 404 as a
+	// cache signal — 404 here means findFile didn't match (file path not
+	// resolvable on this pod). Bucket all non-200 as a single error;
+	// callers downgrade these to log-and-continue, since a missed warmup
+	// just means the transcoder/HTTP path will pull the bytes cold.
+	if res.StatusCode != http.StatusOK {
+		_ = res.Body.Close()
+		return nil, errors.Errorf("warmup returned status %d", res.StatusCode)
+	}
+	ch := make(chan WarmupEvent)
+	go func() {
+		b := res.Body
+		defer func() {
+			close(ch)
+			_ = b.Close()
+		}()
+		// Buffer is tiny — a frame is three "<name>: <int>" lines of at
+		// most ~24 bytes; the scanner default (64KB) is overkill but
+		// harmless.
+		scanner := bufio.NewScanner(b)
+		scanner.Split(bufio.ScanLines)
+		// have: and span: come before data:, which ends the frame.
+		ev := WarmupEvent{Have: -1, Span: -1}
+		for scanner.Scan() {
+			if ctx.Err() != nil {
+				return
+			}
+			if scanner.Err() != nil {
+				log.WithError(scanner.Err()).Error("warmup scanner error")
+				return
+			}
+			line := scanner.Text()
+			name, value, _ := strings.Cut(line, ": ")
+			var field *int64
+			switch name {
+			case "have":
+				field = &ev.Have
+			case "span":
+				field = &ev.Span
+			case "data":
+				field = &ev.Verified
+			default:
+				continue
+			}
+			n, perr := strconv.ParseInt(value, 10, 64)
+			if perr != nil {
+				log.WithError(perr).Errorf("failed to parse warmup data line=%v", line)
+				continue
+			}
+			*field = n
+			if name != "data" {
+				continue
+			}
+			select {
+			case ch <- ev:
+			case <-ctx.Done():
+				return
+			}
+			ev = WarmupEvent{Have: -1, Span: -1}
+		}
+	}()
+	return ch, nil
+}
+
+func (s *Api) makeSubtitleURL(u string, esub ExtSubtitle) string {
+	src, _ := url.Parse(u)
+	path := ""
+	pathParts := strings.Split(src.Path, "/")
+	pathParts = pathParts[:len(pathParts)-1]
+	path = strings.Join(pathParts, "/") + esub.Src
+	src.Path = path
+	res := src.String()
+	if _, ok := vttConvertibleExts[esub.Format]; ok {
+		res = s.convertToVTT(res)
+	}
+	return res
+}
+
+// vttConvertibleExts are the text-subtitle formats srt2vtt can turn into
+// WebVTT (routed through the proxy's ~vtt transform). ASS/SSA styling is
+// dropped in conversion — the cues come back as plain text.
+var vttConvertibleExts = map[string]struct{}{
+	"srt": {},
+	"ass": {},
+	"ssa": {},
+}
+
+// needsVTTConversion reports whether a URL path ends in a subtitle
+// extension the ~vtt transform understands.
+func needsVTTConversion(path string) bool {
+	ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(path)), ".")
+	_, ok := vttConvertibleExts[ext]
+	return ok
+}
+
+func (*Api) convertToVTT(u string) string {
+	parsed, _ := url.Parse(u)
+	pathParts := strings.Split(parsed.Path, "/")
+	name := pathParts[len(pathParts)-1]
+	newName := strings.TrimSuffix(name, filepath.Ext(name)) + ".vtt"
+	// parsed.EscapedPath() returns the %-encoded path verbatim when
+	// RawPath is a valid encoding of Path, so we don't lose percent
+	// sequences already present in u (e.g. %3D%3D from base64 padding).
+	out := parsed.Scheme + "://" + parsed.Host + parsed.EscapedPath() + "~vtt/" + url.PathEscape(newName)
+	if parsed.RawQuery != "" {
+		out += "?" + parsed.RawQuery
+	}
+	return out
+}
+
+func (s *Api) AttachExternalSubtitle(ei ra.ExportItem, u string) string {
+	res := s.AttachExternalFile(ei, u)
+	src, _ := url.Parse(u)
+	if needsVTTConversion(src.Path) {
+		res = s.convertToVTT(res)
+	}
+	return res
+}
+
+func (s *Api) AttachExternalFile(ei ra.ExportItem, u string) string {
+	src, _ := url.Parse(ei.URL)
+	nameParts := strings.Split(u, "/")
+	name := nameParts[len(nameParts)-1]
+	// QueryEscape is needed to keep base64's '/' and '=' path-safe,
+	// but if we then store the escaped string in url.URL.Path and call
+	// String(), Go re-percent-encodes the '%' chars (e.g. '%3D%3D' →
+	// '%253D%253D'). Building the URL by string-concat bypasses that
+	// second pass while still giving us a fully-formed, quoted URL.
+	encodedPayload := url.QueryEscape(base64.StdEncoding.EncodeToString([]byte(u)))
+	out := src.Scheme + "://" + src.Host + "/ext/" + encodedPayload + "/" + url.PathEscape(name)
+	if src.RawQuery != "" {
+		out += "?" + src.RawQuery
+	}
+	return out
+}
+
+func getRemoteAddress(c *gin.Context) string {
+	if addr := c.Request.Header.Get(gin.PlatformCloudflare); addr != "" {
+		return addr
+	}
+	return c.ClientIP()
+}
+
+type ClaimsContext struct{}
+
+func (s *Api) MakeClaimsFromContext(c *gin.Context, domain string, uc *claims.Data, sessionID string) (*Claims, error) {
+	cl := &Claims{
+		SessionID:     sessionID,
+		Domain:        domain,
+		RemoteAddress: getRemoteAddress(c),
+		Agent:         c.Request.Header.Get("User-Agent"),
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Duration(s.expire) * 24 * time.Hour)),
+		},
+	}
+	if uc != nil {
+		cl.Role = uc.Context.Tier.Name
+		rate := uc.Claims.Connection.Rate
+		if rate != nil {
+			cl.Rate = fmt.Sprintf("%dM", *rate)
+		}
+	}
+
+	return cl, nil
+}
+
+func GetClaimsFromContext(c *gin.Context) *Claims {
+	// Comma-ok: ClaimsContext is unset when the api middleware didn't run
+	// (e.g. an upstream middleware aborted on a claims/auth failure and the
+	// centralized ErrorHandler is now rendering). Returning nil instead of a
+	// panicking type assertion keeps NewContext / the error page safe.
+	cl, _ := c.Request.Context().Value(ClaimsContext{}).(*Claims)
+	return cl
+}
+
+// GenerateSessionID derives the session identity that goes into the signed
+// claims sent upstream.
+//
+// The anonymous branch hashes the session rather than returning it. It used
+// to return the cookie verbatim, so the value travelled inside a JWT that is
+// embedded in the player URL — and any job log carrying that URL therefore
+// carried a replayable session cookie, along with the IP and User-Agent
+// alongside it in the same claims. Hashing makes the value useless to
+// whoever reads it.
+//
+// What is hashed is the session's id in its store (Redis): the same across
+// saves. The cookie is not -- the store encodes it anew, with the time, on
+// every save (a track pick, a language), so its hash changed under a viewer
+// mid-episode: the status stream, reopened after an autoplay's save, looked
+// for thp's counters under another id than the player's tokens carried, and
+// the viewer's link stayed empty (2026-10-03). The embed without cookies
+// hands that id in raw (X-Session-ID, _sessionID; handlers/session), which
+// no store decodes: it is hashed as it is, and comes out the same. The
+// cookie store keeps no id: its cookie is hashed, as before.
+func GenerateSessionID(c *gin.Context) string {
+	u := auth.GetUserFromContext(c)
+	if u.Email != "" {
+		return GenerateSessionIDFromUser(u)
+	}
+	sess, _ := c.Cookie("session")
+	if sess == "" {
+		return ""
+	}
+	id := sess
+	if !sessionHandedIn(c, sess) {
+		if s, ok := c.Get(sessions.DefaultKey); ok {
+			if sid := s.(sessions.Session).ID(); sid != "" {
+				id = sid
+			}
+		}
+	}
+	h := sha1.New()
+	h.Write([]byte(id))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// sessionHandedIn: the session cookie is the id the embed handed in
+// (handlers/session puts X-Session-ID or _sessionID in as the cookie when
+// the browser sends none) -- raw, not a cookie a store decodes.
+func sessionHandedIn(c *gin.Context, sess string) bool {
+	if h := c.GetHeader("X-Session-ID"); h != "" {
+		return h == sess
+	}
+	f, _ := c.GetPostForm("_sessionID")
+	return f != "" && f == sess
+}
+
+func GenerateSessionIDFromUser(u *auth.User) string {
+	h := sha1.New()
+	h.Write([]byte(u.ID.String()))
+	hash := hex.EncodeToString(h.Sum(nil))
+	return hash
+}
+
+func (s *Api) RegisterHandler(r *gin.Engine) {
+	r.Use(func(c *gin.Context) {
+		uc := claims.GetFromContext(c)
+		c, err := s.SetClaims(c, s.domain, uc, GenerateSessionID(c))
+		if err != nil {
+			_ = c.AbortWithError(http.StatusInternalServerError, err)
+			return
+		}
+		c.Next()
+	})
+}
+
+func (s *Api) SetClaims(c *gin.Context, domain string, uc *claims.Data, sessionID string) (*gin.Context, error) {
+	ac, err := s.MakeClaimsFromContext(c, domain, uc, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), ClaimsContext{}, ac))
+	return c, nil
+}

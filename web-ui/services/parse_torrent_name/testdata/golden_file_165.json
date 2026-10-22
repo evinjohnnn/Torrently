@@ -1,0 +1,7 @@
+{
+  "input": "Some.Movie.05.notarealquality.mkv",
+  "want": {
+    "title": "Some Movie 05 notarealquality",
+    "container": "mkv"
+  }
+}

@@ -1,0 +1,277 @@
+import loadAsyncView from "./loadAsyncView";
+import { isActionForm, isBusy, markBusy, clearPress, countBusyPress } from "./actionBusy";
+import { seedInitialEntry } from "./historySeed";
+
+if (!window.__popstateFilters) window.__popstateFilters = [];
+export function addPopstateFilter(fn) {
+    window.__popstateFilters.push(fn);
+    return () => {
+        const i = window.__popstateFilters.indexOf(fn);
+        if (i >= 0) window.__popstateFilters.splice(i, 1);
+    };
+}
+
+async function asyncFetch(url, targetSelector, fetchParams, params, options) {
+    let target;
+    if (typeof targetSelector === 'string' || targetSelector instanceof String) {
+        target = document.querySelector(targetSelector);
+    } else if (targetSelector instanceof HTMLElement) {
+        target = targetSelector;
+    } else {
+        throw `Wrong type of target ${targetSelector}`;
+    }
+    let layout;
+    if (!target) {
+        target = document.querySelector(params.fallback.selector);
+        layout = params.fallback.layout;
+    } else {
+        layout = target.getAttribute('data-async-layout');
+    }
+    const updateHeaders = {};
+    const updateFields = [];
+    for (const an of target.getAttributeNames()) {
+        if (an.startsWith('data-async-update-')) {
+            const f = an.replace('data-async-update-', '');
+            const key = 'X-Update-' + f;
+            updateFields.push(f);
+            updateHeaders[key] = target.getAttribute(an);
+        }
+    }
+    if (!fetchParams) fetchParams = {};
+    if (!fetchParams.headers) fetchParams.headers = {};
+    fetchParams.headers = Object.assign(fetchParams.headers, {
+        'X-Requested-With': 'XMLHttpRequest',
+        'X-Layout': layout,
+        'X-Return-Url': window.location.pathname + window.location.search,
+    }, updateHeaders);
+    let fetchFunc = fetch;
+    if (params.fetch) {
+        const oldFetch = fetch;
+        fetchFunc = function(url, fetchParams) {
+            return params.fetch(oldFetch, url, fetchParams);
+        }
+    }
+    const res = await fetchFunc(url, fetchParams);
+    const text = await res.text();
+    // An EMPTY 401 means the session is gone, or never existed: HasAuth aborts
+    // with a bare status rather than a redirect on purpose, because following
+    // a redirect inside fetch would splice the login page into whatever
+    // element this navigation targeted. Nothing here can render an empty body
+    // either -- swapping it in blanks the page, which is what clicking the
+    // logo on the login form used to do. Hand the URL back to the browser and
+    // let the server answer a real navigation with its redirect to /login.
+    //
+    // A 401 WITH a body is a different answer and must not be hijacked: the
+    // admin login form replies 401 and renders itself again carrying "wrong
+    // password". Reloading there would throw that message away and show a
+    // blank form, so the emptiness -- not the status -- is what decides.
+    if (res.status === 401 && text.trim() === '') {
+        window.location.assign(url);
+        return res;
+    }
+    const fragments = parseFragments(text);
+    loadAsyncView(target, fragments.main ?? text, options);
+    for (const f of updateFields) {
+        params.update(f, f in fragments ? fragments[f] : null);
+    }
+    return res;
+}
+
+// Parse the AJAX response body into a {name: html} map.
+// Wire format: a series of <template data-async-fragment="NAME">…</template>
+// blocks, one per layout slot (main, title, description, nav, footer, lang…).
+// See services/template/template.go HTML() for the producer side.
+function parseFragments(text) {
+    const out = {};
+    const doc = new DOMParser().parseFromString(text, 'text/html');
+    for (const tpl of doc.querySelectorAll('template[data-async-fragment]')) {
+        out[tpl.getAttribute('data-async-fragment')] = tpl.innerHTML;
+    }
+    return out;
+}
+
+async function async(selector, params = {}, scope = null) {
+    if (!scope) {
+        scope = document;
+        window.addEventListener('popstate', async function(e) {
+            if (window.__popstateFilters.some(fn => fn(e))) return;
+            if (e.state && e.state.targetSelector && e.state.url && e.state.layout && e.state.context && params.history && e.state.context === params.history.context) {
+                await asyncFetch(
+                    e.state.url,
+                    e.state.targetSelector,
+                    e.state.fetchParams,
+                    params,
+                );
+            }
+        });
+        window.addEventListener('async', function(e) {
+            async(selector, params, e.detail.target);
+        });
+    }
+    const els = scope.querySelectorAll(selector);
+    for (const el of els) {
+        el.reload = function() {
+            let {url, fetchParams} = params.fetchParams.call(el);
+            return asyncFetch.call(el, url, el, fetchParams, params);
+        }
+        // In case if reload was already invoked
+        if (el.reloadResolve) {
+            const res = await el.reload();
+            el.reloadResolve(res);
+        }
+        if (!el.getAttribute('data-async-target')) continue;
+        // Skip already-bound elements (e.g. on rebind after Preact render)
+        if (el._asyncBound) continue;
+        el._asyncBound = true;
+        if (isActionForm(el)) el.addEventListener('click', countBusyPress);
+        el.addEventListener(params.event, async function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            // A job-start button that is already working swallows the second
+            // press (actionBusy.js). This runs HERE, where the request
+            // actually begins, and not on the submit event: Turnstile
+            // intercepts the first submit, fetches a token and re-submits the
+            // form itself, and a button disabled on that first pass would
+            // break its second one.
+            if (isActionForm(this)) {
+                // Turnstile marks an anonymous press busy before its check
+                // (lib/turnstileAction.js) and re-submits the form with the
+                // token: that second pass is the request itself, not a repeat.
+                if (isBusy(this) && !this.dataset.turnstileReady) return false;
+                markBusy(this);
+            }
+            // Read now: a swap during the request can move the press to a
+            // form rendered anew (lib/loadAsyncView.js keepJobs, carryBusy).
+            const press = this.dataset.busyPress;
+            let history = true;
+            if (el.getAttribute('data-async-push-state') && el.getAttribute('data-async-push-state') === 'false') {
+                history = false;
+            }
+            // An in-place toggle (the watched mark, a rating): it reloads the
+            // whole main content around the viewer, who stays where they are
+            // -- no scroll-to-top of `data-async-scroll-top` targets -- and a
+            // job running there goes on (lib/loadAsyncView.js keepJobs).
+            const inPlace = el.getAttribute('data-async-no-scroll') === 'true';
+            const options = { noScroll: inPlace, keepJobs: inPlace };
+            const targetSelector = this.getAttribute('data-async-target');
+            const target = document.querySelector(targetSelector);
+            const layout = target.getAttribute('data-async-layout');
+            let {url, fetchParams} = params.fetchParams.call(this);
+            const push = function(url, fetchParams) {
+                if (!history) return;
+                window.history.pushState({
+                    context: params.history.context,
+                    url,
+                    fetchParams,
+                    targetSelector,
+                    layout,
+                }, '', url);
+            }
+            const self = this;
+            const fetch = function() {
+                return asyncFetch.call(self, url, targetSelector, fetchParams, params, options)
+                    .then((res) => {
+                        // Refused before a job existed (400: Turnstile, bad
+                        // arguments, the job did not start): the answer is a
+                        // card with no job log, so nothing else would ever
+                        // release the button -- it stayed dead for the full
+                        // BUSY_MAX_MS while the card said "try again".
+                        if (isActionForm(self) && res && !res.ok) clearPress(self, press);
+                        return res;
+                    })
+                    .catch((err) => {
+                        // The job never started, so nothing will ever release
+                        // the button: the request itself is the ending here.
+                        if (isActionForm(self)) clearPress(self, press);
+                        throw err;
+                    });
+            }
+            params.history.wrap(fetch, push, url, fetchParams);
+            return false;
+        });
+    }
+}
+
+function asyncForms(p = {}) {
+    const params = Object.assign({
+        event: 'submit',
+        history: {
+            context: 'forms',
+            async wrap(fetch, push, url, fetchParams) {
+                const res = await fetch();
+                if (res.status === 200) {
+                    const u = new URL(res.url);
+                    push(u.pathname + u.search, {
+                        headers: fetchParams.headers,
+                    });
+                }
+            }
+        },
+        fetchParams() {
+            let method = 'get';
+            if (this.getAttribute('method')) {
+                method = this.getAttribute('method').toLowerCase();
+            }
+            const formData = new FormData(this);
+            switch (method) {
+                case 'post':
+                    return {url: this.action, fetchParams: {
+                            method,
+                            body: new FormData(this),
+                        }
+                    };
+                case 'get':
+                    const u = new URL(this.action);
+                    for (const pair of formData.entries()) {
+                        u.searchParams.set(pair[0], pair[1]);
+                    }
+                    return {url: u.toString(), fetchParams: {
+                            method,
+                        }
+                    };
+                default:
+                    throw new Exception(`method ${method} not supported`);
+            }
+        },
+    }, p);
+    async('form', params);
+}
+function asyncLinks(p = {}) {
+    const params = Object.assign({
+        event: 'click',
+        history: {
+            context: 'links',
+            async wrap(fetch, push, url, fetchParams) {
+                push(url, fetchParams);
+                return fetch();
+            }
+        },
+        fetchParams() {
+            const url = this.getAttribute('href');
+            return {url};
+        },
+    }, p)
+    // The entry the visit started on must be restorable too (historySeed.js).
+    seedInitialEntry(window, document, params.history.context);
+    async('a', params);
+}
+
+function asyncLayout(p = {}) {
+    const params = Object.assign({
+        fetchParams() {
+            const url = window.location.href;
+            return {url};
+        },
+    }, p)
+    async('*[data-async-layout]', params);
+}
+
+export function rebindAsync(target) {
+    window.dispatchEvent(new CustomEvent('async', { detail: { target } }));
+}
+
+export function bindAsync(params = {}) {
+    asyncLinks(params);
+    asyncForms(params);
+    asyncLayout(params);
+}
