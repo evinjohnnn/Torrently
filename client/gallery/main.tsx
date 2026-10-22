@@ -3,13 +3,11 @@ import { createRoot } from "react-dom/client";
 import "@fontsource/space-grotesk/latin-400.css";
 import "@fontsource/space-grotesk/latin-500.css";
 import "@fontsource/space-grotesk/latin-600.css";
-import "@fontsource/space-mono/latin-400.css";
 import {
   LenticularBackdrop,
   concepts,
   exportBackdrop,
   getConcept,
-  redPalette,
   type BackdropParams,
   type Concept,
   type ExportType,
@@ -36,79 +34,37 @@ function useHash() {
 }
 
 function Gallery() {
-  const [red, setRed] = useState(() => {
-    try {
-      return sessionStorage.getItem("red") === "1";
-    } catch {
-      return false;
-    }
-  });
-  useEffect(() => {
-    try {
-      sessionStorage.setItem("red", red ? "1" : "0");
-    } catch {
-      /* private mode */
-    }
-  }, [red]);
   return (
     <div className="page">
       <header className="masthead">
-        <span className="mono">Torrently · Material studies</span>
-        <h1>Lenticular glass</h1>
+        <h1>Light through reeded glass</h1>
         <p>
-          Six abstract backdrops rendered live in WebGL. Each sculpture is lit
-          in a virtual studio and seen through vertical reeded glass whose ribs
-          refract it by depth. Open a study to tune the glass and export stills.
+          Six backdrops for Torrently, each a single light source seen out of
+          focus through vertical fluted glass. They render live in your browser;
+          open one to adjust the glass, check text over it and export a still.
         </p>
-        <div
-          className="segmented palette-switch"
-          role="radiogroup"
-          aria-label="Palette"
-        >
-          <button
-            type="button"
-            role="radio"
-            aria-checked={!red}
-            onClick={() => setRed(false)}
-          >
-            Original
-          </button>
-          <button
-            type="button"
-            role="radio"
-            aria-checked={red}
-            onClick={() => setRed(true)}
-          >
-            <span className="red-dot" aria-hidden="true" />
-            Red
-          </button>
-        </div>
       </header>
       <ul className="grid">
         {concepts.map((concept) => (
           <li key={concept.id}>
-            <a className="card" href={`#${concept.id}${red ? "/red" : ""}`}>
+            <a className="card" href={`#${concept.id}`}>
               <div className="card-stage">
                 <LenticularBackdrop
                   concept={concept.id}
-                  params={red ? { palette: redPalette(concept) } : undefined}
                   maxDpr={1.5}
                   referenceWidth={1440}
                 />
               </div>
               <div className="card-meta">
-                <span className="mono">{concept.index}</span>
-                <div>
-                  <h2>{concept.name}</h2>
-                  <p>{concept.note}</p>
-                </div>
+                <h2>{concept.name}</h2>
+                <p>{concept.note}</p>
               </div>
             </a>
           </li>
         ))}
       </ul>
-      <footer className="mono">
-        Isolated preview. The application’s own backgrounds are unchanged.
+      <footer>
+        A preview only: the Torrently app still uses its current background.
       </footer>
     </div>
   );
@@ -145,12 +101,8 @@ function Slider(props: {
   );
 }
 
-function Study({ concept, red }: { concept: Concept; red: boolean }) {
-  const initial = (): BackdropParams =>
-    red
-      ? { ...concept.defaults, palette: redPalette(concept) }
-      : concept.defaults;
-  const [params, setParams] = useState<BackdropParams>(initial);
+function Study({ concept }: { concept: Concept }) {
+  const [params, setParams] = useState<BackdropParams>(concept.defaults);
   const [surface, setSurface] = useState<Surface>("none");
   const [motion, setMotion] = useState(false);
   const [size, setSize] = useState(0);
@@ -168,10 +120,10 @@ function Study({ concept, red }: { concept: Concept; red: boolean }) {
   ) => setParams((current) => ({ ...current, [key]: value }));
 
   useEffect(() => {
-    setParams(initial());
+    setParams(concept.defaults);
     setStatus("");
     scrollTo(0, 0);
-  }, [concept, red]);
+  }, [concept]);
 
   async function save() {
     const { w, h } = sizes[size];
@@ -209,18 +161,15 @@ function Study({ concept, red }: { concept: Concept; red: boolean }) {
         />
         <nav className="stage-nav">
           <a className="pill" href="#">
-            ← All studies
+            All backdrops
           </a>
-          <span className="pill mono">
-            {concept.index} / {String(concepts.length).padStart(2, "0")}
-          </span>
         </nav>
         {surface !== "none" && (
           <div className={`sample sample-${surface}`}>
-            <span className="mono">Now playing</span>
+            <span className="label">Now playing</span>
             <h3>Interstellar (2014)</h3>
             <p>
-              2160p · 4 files · 58.2 GB. Text sitting on the backdrop needs to
+              2160p, 4 files, 58.2 GB. Text sitting on the backdrop needs to
               stay legible at a glance; the veil only lifts contrast where copy
               lives.
             </p>
@@ -240,7 +189,7 @@ function Study({ concept, red }: { concept: Concept; red: boolean }) {
 
       <aside className="panel" aria-label="Glass controls">
         <section>
-          <h2 className="mono">Glass</h2>
+          <h2 className="label">Glass</h2>
           <Slider
             label="Rib width"
             value={params.ribWidth}
@@ -284,7 +233,7 @@ function Study({ concept, red }: { concept: Concept; red: boolean }) {
           </label>
         </section>
         <section>
-          <h2 className="mono">Light</h2>
+          <h2 className="label">Light</h2>
           <Slider
             label="Key angle"
             value={params.lightAngle}
@@ -304,7 +253,7 @@ function Study({ concept, red }: { concept: Concept; red: boolean }) {
           />
         </section>
         <section>
-          <h2 className="mono">Palette</h2>
+          <h2 className="label">Palette</h2>
           <div className="swatches" role="radiogroup" aria-label="Palette">
             {concept.palettes.map((palette, i) => (
               <button
@@ -326,7 +275,7 @@ function Study({ concept, red }: { concept: Concept; red: boolean }) {
           </div>
         </section>
         <section>
-          <h2 className="mono">Preview</h2>
+          <h2 className="label">Preview</h2>
           <div className="segmented" role="radiogroup" aria-label="UI surface">
             {(["none", "light", "dark"] as Surface[]).map((value) => (
               <button
@@ -351,7 +300,7 @@ function Study({ concept, red }: { concept: Concept; red: boolean }) {
           </label>
         </section>
         <section>
-          <h2 className="mono">Export</h2>
+          <h2 className="label">Export</h2>
           <div className="row">
             <select
               aria-label="Export size"
@@ -389,15 +338,15 @@ function Study({ concept, red }: { concept: Concept; red: boolean }) {
           <button
             type="button"
             className="ghost"
-            onClick={() => setParams(initial())}
+            onClick={() => setParams(concept.defaults)}
           >
             Reset
           </button>
-          <a className="ghost" href={`#${previous.id}${red ? "/red" : ""}`}>
-            ← {previous.name}
+          <a className="ghost" href={`#${previous.id}`}>
+            Previous: {previous.name}
           </a>
-          <a className="ghost" href={`#${next.id}${red ? "/red" : ""}`}>
-            {next.name} →
+          <a className="ghost" href={`#${next.id}`}>
+            Next: {next.name}
           </a>
         </div>
       </aside>
@@ -431,13 +380,9 @@ function App() {
         }
       />
     );
-  const [id, variant] = hash.split("/");
+  const [id] = hash.split("/");
   const concept = concepts.find((item) => item.id === id);
-  return concept ? (
-    <Study concept={concept} red={variant === "red"} />
-  ) : (
-    <Gallery />
-  );
+  return concept ? <Study concept={concept} /> : <Gallery />;
 }
 
 declare global {

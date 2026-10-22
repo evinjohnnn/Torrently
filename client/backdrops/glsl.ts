@@ -222,15 +222,15 @@ void main() {
     float sheen = pow(max(rl.z, 0.0), 6.0);
     float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
     float fres = pow(1.0 - hz, 3.0);
-    c = mix(c, env, fres * mix(0.12, 0.08, uTone) * (0.4 + 0.6 * field));
+    c = mix(c, env, fres * mix(0.05, 0.04, uTone) * (0.4 + 0.6 * field));
     // the valley between flutes: a faint seam, strongest where it catches light
     float seam = smoothstep(0.9, 1.0, abs(v.f.x));
-    c *= 1.0 - seam * mix(0.035, 0.12, uTone) * (0.5 + 0.5 * field);
+    c *= 1.0 - seam * mix(0.015, 0.05, uTone) * (0.5 + 0.5 * field);
     c *= 1.0 + 0.03 * (hz - 0.6) * uKeyI;
     float edge = smoothstep(0.95, 1.0, abs(v.f.x)) * step(0.0, v.f.x * cos(uKeyAng));
-    c += edge * field * mix(0.05, 0.1, uTone) * uKeyI;
+    c += edge * field * mix(0.03, 0.05, uTone) * uKeyI;
     float show = mix(1.0 - lum * 0.6, 1.0, uTone);
-    c += vec3(1.0, 0.99, 0.97) * (sharp * 0.55 + sheen * 0.012) * field * uKeyI * show;
+    c += vec3(1.0, 0.99, 0.97) * (sharp * 0.35 + sheen * 0.008) * field * uKeyI * show;
     if (v.panel > 0.5) {
       float g2 = smoothstep(0.88, 1.0, abs(v.g.x));
       c *= 1.0 - g2 * mix(0.03, 0.1, uTone);

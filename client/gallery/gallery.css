@@ -5,7 +5,6 @@
   --ink-3: rgba(17, 17, 17, 0.5);
   --line: rgba(17, 17, 17, 0.12);
   --sans: "Space Grotesk", -apple-system, "Helvetica Neue", Arial, sans-serif;
-  --mono: "Space Mono", ui-monospace, monospace;
   color-scheme: light;
   font-family: var(--sans);
   color: var(--ink);
@@ -33,11 +32,9 @@ input {
   outline: 2px solid var(--ink);
   outline-offset: 3px;
 }
-.mono {
-  font-family: var(--mono);
-  font-size: 11px;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
+.label {
+  font-size: 13px;
+  color: var(--ink-3);
 }
 
 /* ── Overview ── */
@@ -51,9 +48,6 @@ input {
   max-width: 720px;
   margin-bottom: 44px;
 }
-.masthead .mono {
-  color: var(--ink-3);
-}
 .masthead h1 {
   font-size: clamp(44px, 7vw, 88px);
   font-weight: 600;
@@ -66,20 +60,6 @@ input {
   line-height: 1.6;
   color: var(--ink-2);
   margin: 0;
-}
-.segmented.palette-switch {
-  display: inline-flex;
-  margin-top: 28px;
-  min-width: 240px;
-}
-.red-dot {
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: #d71921;
-  margin-right: 8px;
-  vertical-align: 1px;
 }
 .grid {
   list-style: none;
@@ -113,13 +93,7 @@ input {
     0 40px 70px -40px rgba(0, 0, 0, 0.55);
 }
 .card-meta {
-  display: flex;
-  gap: 16px;
   padding: 18px 4px 0;
-}
-.card-meta .mono {
-  color: var(--ink-3);
-  padding-top: 5px;
 }
 .card-meta h2 {
   font-size: 22px;
@@ -229,7 +203,7 @@ footer {
   border: 1px solid rgba(255, 255, 255, 0.1);
   box-shadow: 0 30px 60px -30px rgba(0, 0, 0, 0.7);
 }
-.sample .mono {
+.sample .label {
   opacity: 0.6;
 }
 .sample h3 {
@@ -308,7 +282,7 @@ footer {
   margin-bottom: 6px;
 }
 .control output {
-  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
   font-size: 12px;
   color: var(--ink-2);
 }
