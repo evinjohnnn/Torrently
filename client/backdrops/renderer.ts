@@ -2,27 +2,17 @@ import { GLASS, SCENE_MAIN, SCENE_PRELUDE, VERTEX } from "./glsl";
 import { getConcept, type BackdropParams, type Concept } from "./concepts";
 
 export interface RenderOptions {
-  /** multiplies the rib width; use for exports so ribs keep their look */
-  ribScale?: number;
+  /** device pixels per CSS pixel; rib width is in CSS pixels */
+  dpr?: number;
   /** seconds, drives the slow drift when motion is enabled */
   time?: number;
+  /** pointer position over the backdrop, 0..1 on each axis; 0.5 is centred */
+  pointer?: [number, number];
 }
 
 function hexToRgb(hex: string): [number, number, number] {
   const value = parseInt(hex.slice(1), 16);
   return [(value >> 16) / 255, ((value >> 8) & 255) / 255, (value & 255) / 255];
-}
-
-function compile(gl: WebGL2RenderingContext, type: number, source: string) {
-  const shader = gl.createShader(type)!;
-  gl.shaderSource(shader, source);
-  gl.compileShader(shader);
-  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-    const log = gl.getShaderInfoLog(shader);
-    gl.deleteShader(shader);
-    throw new Error(`Backdrop shader failed to compile: ${log}`);
-  }
-  return shader;
 }
 
 interface Program {
@@ -31,15 +21,16 @@ interface Program {
 }
 
 /**
- * Draws a lenticular backdrop into a canvas. Rendering is on demand: call
- * `render` when the size or parameters change; nothing runs in between.
+ * Draws a lenticular backdrop in two layers: the concept's scene into an
+ * offscreen texture, then the glass, which refracts that texture. Rendering
+ * is on demand: call `render` when size, parameters or the pointer change.
  */
 export class LenticularRenderer {
-  readonly gl: WebGL2RenderingContext;
+  readonly gl: WebGLRenderingContext;
   private programs = new Map<string, Program>();
   private glass: Program;
   private vertex: WebGLShader;
-  private vao: WebGLVertexArrayObject;
+  private quad: WebGLBuffer;
   private target: {
     fbo: WebGLFramebuffer;
     tex: WebGLTexture;
@@ -49,7 +40,7 @@ export class LenticularRenderer {
 
   static supported() {
     try {
-      return !!document.createElement("canvas").getContext("webgl2");
+      return !!document.createElement("canvas").getContext("webgl");
     } catch {
       return false;
     }
@@ -59,7 +50,7 @@ export class LenticularRenderer {
     readonly canvas: HTMLCanvasElement,
     preserveDrawingBuffer = false,
   ) {
-    const gl = canvas.getContext("webgl2", {
+    const gl = canvas.getContext("webgl", {
       antialias: false,
       alpha: false,
       depth: false,
@@ -67,19 +58,40 @@ export class LenticularRenderer {
       preserveDrawingBuffer,
       powerPreference: "low-power",
     });
-    if (!gl) throw new Error("WebGL2 is not available.");
+    if (!gl) throw new Error("WebGL is not available.");
     this.gl = gl;
-    this.vertex = compile(gl, gl.VERTEX_SHADER, VERTEX);
-    this.vao = gl.createVertexArray()!;
+    this.vertex = this.compile(gl.VERTEX_SHADER, VERTEX);
+    // one triangle that covers the viewport
+    this.quad = gl.createBuffer()!;
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.quad);
+    gl.bufferData(
+      gl.ARRAY_BUFFER,
+      new Float32Array([-1, -1, 3, -1, -1, 3]),
+      gl.STATIC_DRAW,
+    );
     this.glass = this.link(GLASS);
+  }
+
+  private compile(type: number, source: string) {
+    const gl = this.gl;
+    const shader = gl.createShader(type)!;
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      const log = gl.getShaderInfoLog(shader);
+      gl.deleteShader(shader);
+      throw new Error(`Backdrop shader failed to compile: ${log}`);
+    }
+    return shader;
   }
 
   private link(fragment: string): Program {
     const gl = this.gl;
     const program = gl.createProgram()!;
-    const shader = compile(gl, gl.FRAGMENT_SHADER, fragment);
+    const shader = this.compile(gl.FRAGMENT_SHADER, fragment);
     gl.attachShader(program, this.vertex);
     gl.attachShader(program, shader);
+    gl.bindAttribLocation(program, 0, "a");
     gl.linkProgram(program);
     gl.deleteShader(shader);
     if (!gl.getProgramParameter(program, gl.LINK_STATUS))
@@ -117,7 +129,7 @@ export class LenticularRenderer {
     gl.texImage2D(
       gl.TEXTURE_2D,
       0,
-      gl.RGBA8,
+      gl.RGBA,
       w,
       h,
       0,
@@ -158,17 +170,25 @@ export class LenticularRenderer {
     const angle = (params.lightAngle * Math.PI) / 180;
     const key = [Math.cos(angle) * 0.62, Math.sin(angle) * 0.62, 0.78];
     const len = Math.hypot(key[0], key[1], key[2]);
-    const colors = palette.colors.flatMap(hexToRgb);
+    const [mx, my] = options.pointer ?? [0.5, 0.5];
+    const dpr = options.dpr ?? w / Math.max(this.canvas.clientWidth || w, 1);
 
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.quad);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+    // layer 1: the scene behind the glass, shifted by the pointer
     const target = this.ensureTarget(w, h);
     const scene = this.scene(concept);
-    gl.bindVertexArray(this.vao);
     gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo);
     gl.viewport(0, 0, w, h);
     gl.useProgram(scene.program);
     gl.uniform2f(this.loc(scene, "uRes"), w, h);
     gl.uniform1f(this.loc(scene, "uTime"), options.time ?? 0);
-    gl.uniform3fv(this.loc(scene, "uPal"), colors);
+    // scenes read up to five colours; unused slots repeat the last one
+    const colors: string[] = [...palette.colors];
+    while (colors.length < 5) colors.push(colors[colors.length - 1]);
+    gl.uniform3fv(this.loc(scene, "uPal[0]"), colors.flatMap(hexToRgb));
     gl.uniform3f(
       this.loc(scene, "uKey"),
       key[0] / len,
@@ -176,10 +196,12 @@ export class LenticularRenderer {
       key[2] / len,
     );
     gl.uniform1f(this.loc(scene, "uKeyI"), params.light);
+    // screen y runs down, scene y runs up
+    gl.uniform2f(this.loc(scene, "uPar"), (mx - 0.5) * 0.14, (0.5 - my) * 0.07);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
+    // layer 2: the glass, refracting whatever the scene drew
     const glass = this.glass;
-    const dpr = w / Math.max(this.canvas.clientWidth || w, 1);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, w, h);
     gl.useProgram(glass.program);
@@ -187,24 +209,12 @@ export class LenticularRenderer {
     gl.bindTexture(gl.TEXTURE_2D, target.tex);
     gl.uniform1i(this.loc(glass, "uScene"), 0);
     gl.uniform2f(this.loc(glass, "uRes"), w, h);
-    gl.uniform1f(
-      this.loc(glass, "uRibW"),
-      Math.max(3, params.ribWidth * (options.ribScale ?? dpr)),
-    );
-    gl.uniform1f(this.loc(glass, "uDistort"), params.distortion);
+    gl.uniform1f(this.loc(glass, "uDpr"), dpr);
+    gl.uniform1f(this.loc(glass, "uRib"), Math.max(4, params.ribWidth));
+    gl.uniform1f(this.loc(glass, "uDist"), params.distortion);
     gl.uniform1f(this.loc(glass, "uBlur"), params.blur);
+    gl.uniform1f(this.loc(glass, "uLight"), params.light);
     gl.uniform1f(this.loc(glass, "uDisp"), params.dispersion);
-    gl.uniform1f(this.loc(glass, "uKeyAng"), angle);
-    gl.uniform1f(this.loc(glass, "uKeyI"), params.light);
-    gl.uniform1f(this.loc(glass, "uTone"), palette.tone === "dark" ? 1 : 0);
-    const [x0, x1, scale] = concept.panelSpan;
-    gl.uniform4f(
-      this.loc(glass, "uPanel"),
-      x0,
-      x1,
-      scale,
-      params.panel ? 1 : 0,
-    );
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 
@@ -214,7 +224,7 @@ export class LenticularRenderer {
     for (const entry of this.programs.values()) gl.deleteProgram(entry.program);
     gl.deleteProgram(this.glass.program);
     gl.deleteShader(this.vertex);
-    gl.deleteVertexArray(this.vao);
+    gl.deleteBuffer(this.quad);
     if (this.target) {
       gl.deleteFramebuffer(this.target.fbo);
       gl.deleteTexture(this.target.tex);
@@ -248,7 +258,7 @@ export async function exportBackdrop(
   try {
     if (width > max || height > max)
       throw new Error(`This device can export up to ${max}px per side.`);
-    renderer.render(conceptId, params, { ribScale: width / referenceWidth });
+    renderer.render(conceptId, params, { dpr: width / referenceWidth });
     return await new Promise<Blob>((resolve, reject) =>
       canvas.toBlob(
         (blob) => (blob ? resolve(blob) : reject(new Error("Export failed."))),

@@ -6,9 +6,9 @@ const page = (name: string) => resolve(import.meta.dirname, `${name}.html`);
 
 export default defineConfig(({ mode }) => ({
   plugins: [react()],
-  // `--mode preview` builds only the self-contained design preview (the app
-  // on sample data), with relative paths so it can be hosted anywhere. It is
-  // never part of the production build.
+  // `--mode preview` builds only the self-contained previews (the app on
+  // sample data, and the Natively notepad hero), with relative paths so they
+  // can be hosted anywhere. They are never part of the production build.
   base: mode === "preview" ? "./" : "/",
   build: {
     outDir: mode === "preview" ? "dist/preview" : "dist/client",
@@ -16,7 +16,7 @@ export default defineConfig(({ mode }) => ({
     rollupOptions: {
       input:
         mode === "preview"
-          ? { preview: page("preview") }
+          ? { preview: page("preview"), notepad: page("notepad") }
           : {
               main: page("index"),
               // gallery.html is an isolated preview of the backdrop studies

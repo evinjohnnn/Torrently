@@ -53,6 +53,7 @@ function Gallery() {
                   concept={concept.id}
                   maxDpr={1.5}
                   referenceWidth={1440}
+                  pointer="parent"
                 />
               </div>
               <div className="card-meta">
@@ -223,14 +224,6 @@ function Study({ concept }: { concept: Concept }) {
             step={0.01}
             onChange={(v) => set("dispersion", v)}
           />
-          <label className="toggle">
-            <input
-              type="checkbox"
-              checked={params.panel}
-              onChange={(e) => set("panel", e.target.checked)}
-            />
-            Second glass sheet
-          </label>
         </section>
         <section>
           <h2 className="label">Light</h2>

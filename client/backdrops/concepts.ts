@@ -22,14 +22,14 @@ export interface BackdropParams {
   light: number;
   /** index into the concept's palettes */
   palette: number;
-  /** second, finer glass sheet */
-  panel: boolean;
 }
 
 export interface Palette {
   name: string;
   tone: "light" | "dark";
-  colors: [string, string, string, string];
+  /** four colours, or five for scenes with an extra object colour */
+  colors:
+    [string, string, string, string] | [string, string, string, string, string];
 }
 
 export interface Concept {
@@ -37,8 +37,8 @@ export interface Concept {
   name: string;
   note: string;
   defaults: BackdropParams;
-  /** where the second glass sheet sits, as fractions of the width */
-  panelSpan: [number, number, number];
+  /** where the light sits in the frame, for the CSS fallback (x%, y%) */
+  glow: [number, number];
   palettes: Palette[];
   scene: string;
 }
@@ -60,14 +60,13 @@ const graphite: Palette = {
 };
 
 const glass = {
-  ribWidth: 28,
-  distortion: 0.9,
-  blur: 0.22,
-  dispersion: 0.3,
+  ribWidth: 24,
+  distortion: 1.1,
+  blur: 0.15,
+  dispersion: 0.2,
   lightAngle: 120,
-  light: 1,
+  light: 1.1,
   palette: 0,
-  panel: false,
 };
 
 const signal = `
@@ -174,13 +173,45 @@ vec4 scene(vec2 p) {
   return vec4(col, 0.88);
 }`;
 
+// The Natively notepad hero: a slab, an arc and a disc in lavender, with
+// shadows tinted violet rather than grey. Scene units here span -1..1.
+const monolith = `
+const vec3 SHADE = vec3(0.95, 1.08, 0.62);
+float softEdge(float d, float e) { return 1.0 - smoothstep(0.0, e, d); }
+float sdCircle(vec2 p, vec2 c, float r) { return length(p - c) - r; }
+float sdBox(vec2 p, vec2 c, vec2 b, float r) {
+  vec2 q = abs(p - c) - b + r;
+  return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+}
+float shadow(float d, float r) { return softEdge(d, r) * 0.22; }
+vec4 scene(vec2 sp) {
+  vec2 p = sp * 2.0;
+  float t = uTime;
+  vec3 col = mix(uPal[1], uPal[0], smoothstep(-1.0, 1.0, p.y + 0.1 * p.x));
+  vec2 pd = p - vec2(0.03 * sin(t * 0.2), 0.0);
+  float disc = sdCircle(pd, vec2(1.38, -0.5), 0.6);
+  float slab = sdBox(p, vec2(-0.78, -0.05), vec2(0.15, 0.78), 0.14);
+  float arc = abs(sdCircle(p, vec2(-0.2, -0.95), 0.75)) - 0.07;
+  col *= 1.0 - SHADE * shadow(sdCircle(pd + vec2(-0.05, 0.1), vec2(1.38, -0.5), 0.6), 0.22);
+  col *= 1.0 - SHADE * shadow(sdBox(p + vec2(-0.04, 0.08), vec2(-0.78, -0.05), vec2(0.15, 0.78), 0.14), 0.18);
+  col *= 1.0 - SHADE * shadow(abs(sdCircle(p + vec2(-0.03, 0.06), vec2(-0.2, -0.95), 0.75)) - 0.07, 0.14) * 0.8;
+  vec3 discCol = uPal[2] * (0.9 + 0.18 * smoothstep(-0.5, 0.65, pd.y));
+  discCol += uPal[3] * 0.08 * smoothstep(0.55, 0.6, length(pd - vec2(1.38, -0.5)));
+  col = mix(col, discCol, softEdge(disc, 0.006));
+  vec3 slabCol = mix(uPal[3], uPal[1], 0.35 * smoothstep(-0.9, 0.9, -p.y)) * (1.0 - 0.1 * smoothstep(-0.93, -0.63, p.x));
+  col = mix(col, slabCol, softEdge(slab, 0.006));
+  vec3 arcCol = uPal[4] * (0.92 + 0.12 * smoothstep(-1.0, 0.0, p.y));
+  col = mix(col, arcCol, softEdge(arc, 0.006));
+  return vec4(col, 1.0);
+}`;
+
 export const concepts: Concept[] = [
   {
     id: "signal",
     name: "Signal",
     note: "A single red tube light, its glow repeated across the flutes and down a dark floor.",
     defaults: { ...glass },
-    panelSpan: [0.58, 0.86, 0.5],
+    glow: [61, 45],
     palettes: [red, paper, graphite],
     scene: signal,
   },
@@ -189,7 +220,7 @@ export const concepts: Concept[] = [
     name: "Horizon",
     note: "A low band of red light under a graphite sky, mirrored in the ground below.",
     defaults: { ...glass, ribWidth: 22, blur: 0.3 },
-    panelSpan: [0.1, 0.38, 0.5],
+    glow: [40, 58],
     palettes: [red, paper, graphite],
     scene: horizon,
   },
@@ -198,7 +229,7 @@ export const concepts: Concept[] = [
     name: "Ember",
     note: "Two lights far out of focus: one large and red, one small and warm white.",
     defaults: { ...glass, ribWidth: 34, distortion: 1 },
-    panelSpan: [0.6, 0.88, 0.45],
+    glow: [32, 58],
     palettes: [red, paper, graphite],
     scene: ember,
   },
@@ -207,7 +238,7 @@ export const concepts: Concept[] = [
     name: "Bleed",
     note: "Red light spilling across warm paper from outside the frame, crossed by one soft shadow.",
     defaults: { ...glass, ribWidth: 26, blur: 0.28 },
-    panelSpan: [0.08, 0.36, 0.5],
+    glow: [100, 62],
     palettes: [paper, red, graphite],
     scene: bleed,
   },
@@ -216,7 +247,7 @@ export const concepts: Concept[] = [
     name: "Doorway",
     note: "An arched opening of warm light in a red room, spilling out across the floor.",
     defaults: { ...glass, ribWidth: 30 },
-    panelSpan: [0.56, 0.84, 0.45],
+    glow: [42, 55],
     palettes: [red, paper, graphite],
     scene: doorway,
   },
@@ -225,9 +256,29 @@ export const concepts: Concept[] = [
     name: "Halo",
     note: "A ring of red light, brightest along its upper arc, broken into slivers by the glass.",
     defaults: { ...glass, ribWidth: 24 },
-    panelSpan: [0.08, 0.34, 0.5],
+    glow: [64, 47],
     palettes: [red, paper, graphite],
     scene: halo,
+  },
+  {
+    id: "monolith",
+    name: "Monolith",
+    note: "A slab, an arc and a violet disc behind fluted glass, from the Natively notepad hero.",
+    defaults: { ...glass },
+    glow: [90, 75],
+    palettes: [
+      {
+        name: "Lavender",
+        tone: "light",
+        colors: ["#F4EFFD", "#E2D6F9", "#9C6FF3", "#FFFFFF", "#CDBBFB"],
+      },
+      {
+        name: "Red on paper",
+        tone: "light",
+        colors: ["#fffaf6", "#eee4dc", "#e3121b", "#ffffff", "#f2b8b2"],
+      },
+    ],
+    scene: monolith,
   },
 ];
 

@@ -1,12 +1,23 @@
-import { useEffect, useRef, useState, type CSSProperties } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type RefObject,
+} from "react";
 import { getConcept, type BackdropParams } from "./concepts";
-import { fallbackFor } from "./fallbacks";
+import { ribCombGradient } from "./glsl";
 import { LenticularRenderer } from "./renderer";
 
 export interface LenticularBackdropProps {
   concept: string;
   /** overrides for the concept's defaults */
   params?: Partial<BackdropParams>;
+  /**
+   * What the scene follows behind the glass: the whole window, the backdrop's
+   * own parent, a given element, or nothing.
+   */
+  pointer?: "window" | "parent" | "none" | RefObject<HTMLElement | null>;
   /** slow drift; ignored when the viewer prefers reduced motion */
   motion?: boolean;
   /** caps the backing-store resolution, in device pixels per CSS pixel */
@@ -22,14 +33,6 @@ export interface LenticularBackdropProps {
   style?: CSSProperties;
 }
 
-// device pixels per CSS pixel, shrunk when previewing a wider screen
-function ribScale(element: HTMLCanvasElement, referenceWidth?: number) {
-  const dpr = element.width / Math.max(element.clientWidth, 1);
-  return referenceWidth
-    ? dpr * Math.min(1, element.clientWidth / referenceWidth)
-    : dpr;
-}
-
 function prefersReducedMotion() {
   return (
     typeof matchMedia === "function" &&
@@ -38,13 +41,15 @@ function prefersReducedMotion() {
 }
 
 /**
- * Fills its positioned parent with a lenticular glass backdrop. Renders once
- * per size or parameter change; with WebGL2 unavailable or the context lost,
- * it shows the concept's pre-rendered image instead.
+ * Fills its positioned parent with a scene seen through lenticular glass.
+ * The scene and the glass are separate layers: the scene drifts behind the
+ * ribs as the pointer moves, eased, and drawing stops once it settles.
+ * Without WebGL the same two layers are approximated in CSS.
  */
 export function LenticularBackdrop({
   concept,
   params,
+  pointer = "window",
   motion = false,
   maxDpr = 2,
   referenceWidth,
@@ -52,14 +57,12 @@ export function LenticularBackdrop({
   className,
   style,
 }: LenticularBackdropProps) {
+  const host = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
-  const renderer = useRef<LenticularRenderer | null>(null);
   const redraw = useRef<() => void>(() => {});
   const [failed, setFailed] = useState(() => !LenticularRenderer.supported());
-  const resolved: BackdropParams = {
-    ...getConcept(concept).defaults,
-    ...params,
-  };
+  const definition = getConcept(concept);
+  const resolved: BackdropParams = { ...definition.defaults, ...params };
   const key = JSON.stringify(resolved);
   const latest = useRef({ concept, params: resolved, referenceWidth });
   latest.current = { concept, params: resolved, referenceWidth };
@@ -67,25 +70,47 @@ export function LenticularBackdrop({
   useEffect(() => {
     const element = canvas.current;
     if (!element || failed) return;
-    let frame = 0;
-    let disposed = false;
+    let renderer: LenticularRenderer;
     try {
-      renderer.current = new LenticularRenderer(element);
+      renderer = new LenticularRenderer(element);
     } catch {
       setFailed(true);
       return;
     }
-    const draw = (time = 0) => {
-      if (disposed || !renderer.current) return;
+    const still = prefersReducedMotion();
+    const eased: [number, number] = [0.5, 0.5];
+    const target: [number, number] = [0.5, 0.5];
+    let frame = 0;
+    let disposed = false;
+    let time = 0;
+
+    const draw = () => {
+      if (disposed) return;
+      const dpr = element.width / Math.max(element.clientWidth, 1);
+      const { referenceWidth: ref } = latest.current;
       try {
-        renderer.current.render(latest.current.concept, latest.current.params, {
+        renderer.render(latest.current.concept, latest.current.params, {
+          dpr: ref ? dpr * Math.min(1, element.clientWidth / ref) : dpr,
           time,
-          ribScale: ribScale(element, latest.current.referenceWidth),
+          pointer: eased,
         });
       } catch (error) {
         console.error(error);
         setFailed(true);
       }
+    };
+    const tick = () => {
+      frame = 0;
+      eased[0] += (target[0] - eased[0]) * 0.08;
+      eased[1] += (target[1] - eased[1]) * 0.08;
+      draw();
+      const moving =
+        Math.abs(target[0] - eased[0]) > 0.0005 ||
+        Math.abs(target[1] - eased[1]) > 0.0005;
+      if (moving) frame = requestAnimationFrame(tick);
+    };
+    const wake = () => {
+      if (!frame) frame = requestAnimationFrame(tick);
     };
     const resize = () => {
       const dpr = Math.min(window.devicePixelRatio || 1, maxDpr);
@@ -95,61 +120,73 @@ export function LenticularBackdrop({
         element.width = w;
         element.height = h;
       }
-      draw(performance.now() / 1000);
+      draw();
     };
-    const observer = new ResizeObserver(() => {
-      cancelAnimationFrame(frame);
-      frame = requestAnimationFrame(resize);
-    });
+    const observer = new ResizeObserver(() => requestAnimationFrame(resize));
     observer.observe(element);
+
+    // pointer parallax, eased; nothing runs once the scene has settled
+    const area: HTMLElement | Window | null =
+      still || pointer === "none"
+        ? null
+        : pointer === "window"
+          ? window
+          : pointer === "parent"
+            ? (host.current?.parentElement ?? null)
+            : pointer.current;
+    const onMove = (event: PointerEvent) => {
+      const r =
+        area === window
+          ? { left: 0, top: 0, width: innerWidth, height: innerHeight }
+          : (area as HTMLElement).getBoundingClientRect();
+      target[0] = Math.min(1, Math.max(0, (event.clientX - r.left) / r.width));
+      target[1] = Math.min(1, Math.max(0, (event.clientY - r.top) / r.height));
+      wake();
+    };
+    const onLeave = () => {
+      target[0] = 0.5;
+      target[1] = 0.5;
+      wake();
+    };
+    area?.addEventListener("pointermove", onMove as EventListener);
+    const leaveTarget = area === window ? document.documentElement : area;
+    leaveTarget?.addEventListener("pointerleave", onLeave);
+
+    // optional slow drift of the scene itself
+    let drift = 0;
+    if (motion && !still) {
+      let last = 0;
+      const step = (now: number) => {
+        drift = requestAnimationFrame(step);
+        if (now - last < 1000 / 30 || document.hidden) return;
+        last = now;
+        time = now / 1000;
+        draw();
+      };
+      drift = requestAnimationFrame(step);
+    }
+
     const lost = (event: Event) => {
       event.preventDefault();
       setFailed(true);
     };
     element.addEventListener("webglcontextlost", lost);
-    redraw.current = () => draw(performance.now() / 1000);
+    redraw.current = draw;
     return () => {
       disposed = true;
       cancelAnimationFrame(frame);
+      cancelAnimationFrame(drift);
       observer.disconnect();
+      area?.removeEventListener("pointermove", onMove as EventListener);
+      leaveTarget?.removeEventListener("pointerleave", onLeave);
       element.removeEventListener("webglcontextlost", lost);
       redraw.current = () => {};
-      renderer.current?.dispose();
-      renderer.current = null;
+      renderer.dispose();
     };
-  }, [failed, maxDpr]);
+  }, [failed, maxDpr, motion, pointer]);
 
   // Redraw on parameter changes without rebuilding the renderer.
   useEffect(() => redraw.current(), [concept, key, referenceWidth]);
-
-  // Optional drift at a modest frame rate.
-  useEffect(() => {
-    if (!motion || failed || prefersReducedMotion()) return;
-    let frame = 0;
-    let last = 0;
-    const tick = (now: number) => {
-      frame = requestAnimationFrame(tick);
-      if (now - last < 1000 / 30 || document.hidden) return;
-      last = now;
-      try {
-        const element = canvas.current;
-        renderer.current?.render(
-          latest.current.concept,
-          latest.current.params,
-          {
-            time: now / 1000,
-            ribScale: element
-              ? ribScale(element, latest.current.referenceWidth)
-              : undefined,
-          },
-        );
-      } catch {
-        cancelAnimationFrame(frame);
-      }
-    };
-    frame = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(frame);
-  }, [motion, failed]);
 
   const fill: CSSProperties = {
     position: "absolute",
@@ -158,21 +195,29 @@ export function LenticularBackdrop({
     height: "100%",
     display: "block",
   };
+  const colors = (
+    definition.palettes[resolved.palette] ?? definition.palettes[0]
+  ).colors;
+  const [gx, gy] = definition.glow;
+  // the CSS stand-in keeps the same two layers: a rib comb over the light
+  const fallback: CSSProperties = {
+    ...fill,
+    backgroundColor: colors[1],
+    backgroundImage: [
+      ribCombGradient(resolved.ribWidth),
+      `radial-gradient(closest-side at ${gx}% ${gy}%, ${colors[3]}, transparent 35%)`,
+      `radial-gradient(closest-side at ${gx}% ${gy}%, ${colors[2]}, transparent)`,
+      `linear-gradient(to bottom, ${colors[0]}, ${colors[1]})`,
+    ].join(", "),
+  };
   return (
     <div
+      ref={host}
       className={className}
       style={{ position: "absolute", inset: 0, overflow: "hidden", ...style }}
       aria-hidden="true"
     >
-      {failed ? (
-        <img
-          src={fallbackFor(concept)}
-          alt=""
-          style={{ ...fill, objectFit: "cover" }}
-        />
-      ) : (
-        <canvas ref={canvas} style={fill} />
-      )}
+      {failed ? <div style={fallback} /> : <canvas ref={canvas} style={fill} />}
       {scrim !== "none" && (
         <div
           style={{
