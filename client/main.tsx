@@ -25,7 +25,7 @@ import {
 } from "./api";
 import { Icon, type IconName } from "./icons";
 import { AppBackdrop } from "./AppBackdrop";
-import { NavGlass } from "./NavGlass";
+import { LiquidGlass } from "./LiquidGlass";
 const Player = lazy(() =>
   import("./Player").then((module) => ({ default: module.Player })),
 );
@@ -365,6 +365,7 @@ function App() {
         <Logo />
         <div className="workspace-label">YOUR WORKSPACE</div>
         <nav aria-label="Main navigation">
+          <LiquidGlass className="dock-glass" bezel={14} refraction={14} />
           {sections.map((item) => (
             <button
               key={item.id}
@@ -429,7 +430,7 @@ function App() {
       </aside>
       <div className="main-shell">
         <header className="topbar">
-          <NavGlass />
+          <LiquidGlass />
           <span className="breadcrumb">
             Workspace <span>/</span>{" "}
             {page === "resource"
@@ -822,7 +823,7 @@ function Login({
   return (
     <div className="login-layout">
       <div className="login-top">
-        <NavGlass />
+        <LiquidGlass />
         <Logo />
         <span className="private-label">Private instance</span>
       </div>

@@ -2137,46 +2137,77 @@ footer > span {
   }
 }
 
-/* ───────── Fluid glass navbar (React Bits) ───────── */
+/* ───────── Liquid glass navbar ───────── */
 
+/* the layer bends whatever is beneath it; the bar's own glass steps aside */
+.liquid-glass {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background-color: rgba(255, 255, 255, 0.22);
+  background-size: 100% 100%;
+  background-repeat: no-repeat;
+  box-shadow:
+    0 14px 34px -22px rgba(30, 32, 16, 0.45),
+    0 2px 6px -3px rgba(30, 32, 16, 0.18);
+  /* where refraction is unavailable, frost instead */
+  -webkit-backdrop-filter: blur(14px) saturate(1.6);
+  backdrop-filter: blur(14px) saturate(1.6);
+}
+.liquid-glass svg {
+  pointer-events: none;
+}
 .topbar,
 .login-top {
   isolation: isolate;
-}
-.login-top {
-  position: relative;
-}
-.nav-glass {
-  position: absolute;
-  inset: -12px;
-  z-index: 0;
-  pointer-events: none;
-}
-.topbar > :not(.nav-glass),
-.login-top > :not(.nav-glass) {
-  position: relative;
-  z-index: 1;
-}
-/* the fluid glass replaces the CSS glass when it can render */
-:root[data-nav-glass] .topbar,
-:root[data-nav-glass] .login-top {
   background: none;
   border-color: transparent;
   box-shadow: none;
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
 }
+.login-top {
+  position: relative;
+}
+.topbar > :not(.liquid-glass),
+.login-top > :not(.liquid-glass) {
+  position: relative;
+  z-index: 1;
+}
+.sidebar nav > .dock-glass {
+  display: none;
+}
+:root[data-surface="dark"] .liquid-glass {
+  background-color: rgba(18, 20, 10, 0.26);
+}
 /* on a dark backdrop the clear glass needs light ink */
-:root[data-nav-glass][data-surface="dark"] .topbar,
-:root[data-nav-glass][data-surface="dark"] .login-top {
+:root[data-surface="dark"] .topbar,
+:root[data-surface="dark"] .login-top {
   --text: #f7f2f0;
   --text-2: rgba(247, 242, 240, 0.8);
   --text-3: rgba(247, 242, 240, 0.66);
   color: var(--text);
 }
-:root[data-nav-glass][data-surface="dark"] .topbar .private-label,
-:root[data-nav-glass][data-surface="dark"] .login-top .private-label {
+:root[data-surface="dark"] .private-label {
   --text: #1c1f14;
   --text-2: rgba(28, 31, 20, 0.76);
   color: var(--text-2);
+}
+@media (max-width: 760px) {
+  .sidebar nav > .dock-glass {
+    display: block;
+  }
+  .sidebar nav {
+    background: none;
+    border-color: transparent;
+    box-shadow: none;
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+  .sidebar nav > :not(.liquid-glass) {
+    position: relative;
+    z-index: 1;
+  }
 }

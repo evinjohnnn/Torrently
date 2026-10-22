@@ -7,7 +7,6 @@ import {
 } from "react";
 import { getConcept, type BackdropParams } from "./concepts";
 import { ribCombGradient } from "./glsl";
-import { BACKDROP_FRAME, shareBackdropCanvas } from "./surface";
 import { LenticularRenderer } from "./renderer";
 
 export interface LenticularBackdropProps {
@@ -30,11 +29,6 @@ export interface LenticularBackdropProps {
   referenceWidth?: number;
   /** readability veil for UI laid over the backdrop */
   scrim?: "none" | "light" | "dark";
-  /**
-   * Publish this canvas for glass elsewhere on the page to refract (the
-   * navbar), announcing each redraw. Only one backdrop should share.
-   */
-  share?: boolean;
   className?: string;
   style?: CSSProperties;
 }
@@ -60,7 +54,6 @@ export function LenticularBackdrop({
   maxDpr = 2,
   referenceWidth,
   scrim = "none",
-  share = false,
   className,
   style,
 }: LenticularBackdropProps) {
@@ -79,8 +72,7 @@ export function LenticularBackdrop({
     if (!element || failed) return;
     let renderer: LenticularRenderer;
     try {
-      // a shared canvas keeps its drawing buffer so another context can read it
-      renderer = new LenticularRenderer(element, share);
+      renderer = new LenticularRenderer(element);
     } catch {
       setFailed(true);
       return;
@@ -102,7 +94,6 @@ export function LenticularBackdrop({
           time,
           pointer: eased,
         });
-        if (share) dispatchEvent(new Event(BACKDROP_FRAME));
       } catch (error) {
         console.error(error);
         setFailed(true);
@@ -181,7 +172,6 @@ export function LenticularBackdrop({
     };
     element.addEventListener("webglcontextlost", lost);
     redraw.current = draw;
-    if (share) shareBackdropCanvas(element);
     return () => {
       disposed = true;
       cancelAnimationFrame(frame);
@@ -191,10 +181,9 @@ export function LenticularBackdrop({
       leaveTarget?.removeEventListener("pointerleave", onLeave);
       element.removeEventListener("webglcontextlost", lost);
       redraw.current = () => {};
-      if (share) shareBackdropCanvas(null);
       renderer.dispose();
     };
-  }, [failed, maxDpr, motion, pointer, share]);
+  }, [failed, maxDpr, motion, pointer]);
 
   // Redraw on parameter changes without rebuilding the renderer.
   useEffect(() => redraw.current(), [concept, key, referenceWidth]);

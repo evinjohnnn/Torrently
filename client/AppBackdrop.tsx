@@ -28,7 +28,7 @@ export function AppBackdrop() {
   return (
     <div className="backdrop-gl" aria-hidden="true">
       <Suspense fallback={null}>
-        <Lenticular concept={concept} params={{ palette }} share />
+        <Lenticular concept={concept} params={{ palette }} />
       </Suspense>
     </div>
   );
