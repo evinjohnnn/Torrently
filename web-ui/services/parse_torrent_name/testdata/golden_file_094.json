@@ -1,0 +1,10 @@
+{
+  "input": "Le Hobbit - 1 - Un Voyage Inattendu - 1080p.mkv",
+  "want": {
+    "title": "Le Hobbit",
+    "episode": 1,
+    "resolution": "1080p",
+    "container": "mkv",
+    "extra": "Un Voyage Inattendu"
+  }
+}

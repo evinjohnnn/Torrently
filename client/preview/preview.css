@@ -1,0 +1,118 @@
+.pv {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 60;
+  width: min(300px, calc(100vw - 32px));
+  font-family: var(--font-sans);
+  color: #0e0e0e;
+}
+.pv-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 46px;
+  padding: 0 18px;
+  border-radius: 999px;
+  border: 1px solid rgba(14, 14, 14, 0.1);
+  background: rgba(255, 255, 255, 0.86);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  box-shadow: 0 18px 40px -20px rgba(0, 0, 0, 0.45);
+  font-size: 14px;
+  font-weight: 500;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pv-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #5f6f2c;
+  flex-shrink: 0;
+}
+.pv-panel {
+  margin-bottom: 8px;
+  padding: 16px;
+  border-radius: 22px;
+  border: 1px solid rgba(14, 14, 14, 0.1);
+  background: rgba(255, 255, 255, 0.92);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  box-shadow: 0 24px 50px -24px rgba(0, 0, 0, 0.5);
+  max-height: min(70vh, 560px);
+  overflow-y: auto;
+}
+.pv[data-open="true"] {
+  display: flex;
+  flex-direction: column-reverse;
+}
+.pv-note {
+  margin: 0 0 12px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: rgba(14, 14, 14, 0.62);
+}
+.pv-list {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+.pv-list button:first-child {
+  grid-column: 1 / -1;
+}
+.pv-list button,
+.pv-palettes button {
+  min-height: 40px;
+  padding: 0 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(14, 14, 14, 0.1);
+  background: #fff;
+  font-size: 14px;
+  text-align: left;
+}
+.pv-list button[aria-checked="true"],
+.pv-palettes button[aria-checked="true"] {
+  background: #0e0e0e;
+  color: #fff;
+  border-color: #0e0e0e;
+}
+.pv-palettes {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+.pv-palettes button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.pv-chips {
+  display: flex;
+}
+.pv-chips span {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  margin-right: -5px;
+  border: 1.5px solid #fff;
+}
+.pv-link {
+  font-size: 13px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  color: rgba(14, 14, 14, 0.7);
+  padding: 4px 0;
+}
+.pv-link:hover {
+  color: #0e0e0e;
+}
+@media (max-width: 760px) {
+  .pv {
+    bottom: 92px;
+  }
+}

@@ -1,0 +1,245 @@
+package i18n
+
+import (
+	"encoding/json"
+	"fmt"
+	"html/template"
+	"regexp"
+	"strings"
+
+	"github.com/nicksnyder/go-i18n/v2/i18n"
+	log "github.com/sirupsen/logrus"
+)
+
+// resolve turns a (message, error) pair from go-i18n into the string to show.
+//
+// The subtlety it exists for: go-i18n v2 (v2.6.1, i18n/localizer.go
+// getMessageTemplate) reports *MessageNotFoundErr whenever the requested
+// language has no entry for the key — including the case where it went on to
+// find the key in the bundle's default language and rendered that template
+// successfully. LocalizeWithTag says so itself: "It may return a best effort
+// localized message even if an error happens."
+//
+// So `err != nil` does not mean "nothing to show". Treating it that way is
+// what turned a locale missing a key into a page full of raw identifiers
+// (notifications.title, nav.notifications) when the English copy was sitting
+// right there. Prefer whatever non-empty string came back; fall back to the
+// key only when the key is genuinely absent from every locale, in which case
+// go-i18n returns an empty message alongside the error.
+func resolve(msg string, err error, key string, lang string) string {
+	if msg != "" {
+		if err != nil {
+			log.WithError(err).WithField("key", key).WithField("lang", lang).
+				Debug("i18n key missing in locale, fell back to default language")
+		}
+		return msg
+	}
+	if err != nil {
+		log.WithError(err).WithField("key", key).WithField("lang", lang).
+			Debug("i18n key missing")
+	}
+	return key
+}
+
+// TranslateWithLocalizer translates a key using the given Localizer.
+// Falls back to the default language when the requested locale lacks the key,
+// and returns the key itself only when no locale has it at all.
+func TranslateWithLocalizer(loc *i18n.Localizer, key string) string {
+	if loc == nil {
+		return key
+	}
+	msg, err := loc.Localize(&i18n.LocalizeConfig{MessageID: key})
+	return resolve(msg, err, key, "")
+}
+
+// TranslateWithLocalizerPlural translates a key whose message carries CLDR
+// plural forms ("one"/"few"/"many"/"other" objects in the locale file), picking
+// the form by count under the locale's own rules — "2 сида" and "5 сидов" are
+// different messages, and only the bundle knows which languages tell them
+// apart. count is also injected as Count for the template.
+func TranslateWithLocalizerPlural(loc *i18n.Localizer, key string, count int, data map[string]any) string {
+	if data == nil {
+		data = map[string]any{}
+	}
+	data["Count"] = count
+	msg, err := loc.Localize(&i18n.LocalizeConfig{
+		MessageID:    key,
+		PluralCount:  count,
+		TemplateData: data,
+	})
+	return resolve(msg, err, key, "")
+}
+
+// TranslateWithLocalizerData translates a parameterized key using the given
+// Localizer and template data. Use for messages like `{{.Bytes}}` / `{{.Peers}}`.
+// Falls back to the default language when the requested locale lacks the key,
+// and returns the key itself only when no locale has it at all.
+func TranslateWithLocalizerData(loc *i18n.Localizer, key string, data map[string]any) string {
+	if loc == nil {
+		return key
+	}
+	msg, err := loc.Localize(&i18n.LocalizeConfig{
+		MessageID:    key,
+		TemplateData: data,
+	})
+	return resolve(msg, err, key, "")
+}
+
+// Helper exposes i18n translation functions as template helpers.
+// Registered via template.Manager.WithHelper().
+type Helper struct {
+	svc *Service
+}
+
+func NewHelper(svc *Service) *Helper {
+	return &Helper{svc: svc}
+}
+
+// T translates a message by key for the given language.
+// A locale missing the key degrades to the default-language (English) text,
+// not to the raw key — see resolve.
+// Template usage: {{ t $.Lang "nav.discover" }}
+func (h *Helper) T(lang string, key string) string {
+	loc := h.svc.Localizer(lang)
+	msg, err := loc.Localize(&i18n.LocalizeConfig{MessageID: key})
+	return resolve(msg, err, key, lang)
+}
+
+// THTML translates a message and returns template.HTML (unescaped).
+// Use for translations containing trusted HTML (links, <strong>, etc.).
+// Template usage: {{ tHTML $.Lang "instructions.stremio.heading" }}
+func (h *Helper) THTML(lang string, key string) template.HTML {
+	return template.HTML(h.T(lang, key))
+}
+
+// Tp translates a message with template data.
+// Template usage: {{ tp $.Lang "footer.copyright" "Year" 2025 }}
+func (h *Helper) Tp(lang string, key string, args ...any) string {
+	loc := h.svc.Localizer(lang)
+	data := make(map[string]any, len(args)/2)
+	for i := 0; i+1 < len(args); i += 2 {
+		data[fmt.Sprintf("%v", args[i])] = args[i+1]
+	}
+	msg, err := loc.Localize(&i18n.LocalizeConfig{
+		MessageID:    key,
+		TemplateData: data,
+	})
+	return resolve(msg, err, key, lang)
+}
+
+// Tn translates a pluralised message: the count picks the CLDR form under the
+// language's rules and is available as {{.Count}}; further args are key/value
+// template data like Tp.
+// Template usage: {{ tn $.Lang "resource.status.seeders" .Seeders }}
+func (h *Helper) Tn(lang string, key string, count int, args ...any) string {
+	data := make(map[string]any, len(args)/2+1)
+	for i := 0; i+1 < len(args); i += 2 {
+		data[fmt.Sprintf("%v", args[i])] = args[i+1]
+	}
+	return TranslateWithLocalizerPlural(h.svc.Localizer(lang), key, count, data)
+}
+
+// TpHTML translates a message with template data and returns template.HTML (unescaped).
+// Use for translations containing trusted HTML with dynamic parameters.
+// Template usage: {{ tpHTML $.Lang "instructions.stremio.step1" "ProfileURL" (langPath $.Lang "/profile") }}
+func (h *Helper) TpHTML(lang string, key string, args ...any) template.HTML {
+	return template.HTML(h.Tp(lang, key, args...))
+}
+
+// faqStripTagsRe removes any HTML tags from translated FAQ answer text
+// before it goes into the schema.org/FAQPage JSON-LD payload. Google
+// expects Answer.text to be plain text — leaving <strong>…</strong>
+// in there does not break parsing but shows the literal tags in rich
+// results. Our FAQ answers occasionally embed <strong> via tHTML.
+var faqStripTagsRe = regexp.MustCompile(`<[^>]+>`)
+
+// FaqSchema renders a schema.org/FAQPage JSON-LD block from the given
+// (question_key, answer_key) pairs. Each variadic argument is a single
+// string in the form "qkey|akey" so templates can pass an arbitrary
+// number of pairs without nested map literals. Use `|` (not `:`) because
+// some answer keys carry colons in their values and using `|` keeps the
+// separator outside the i18n key namespace as well.
+//
+// more is a page's own {qkey, akey} list (Tool.FaqPairs via toolFaq),
+// appended after the literal pairs: a Go template cannot spread a slice
+// into a variadic, so the dynamic part is a parameter of its own. nil
+// on pages without one.
+//
+// An empty pair is skipped without a warning: a template drops a shared
+// question from one page by passing "" in its place (about.html leaves a
+// how-to item off the guide that answers it in full).
+//
+// Template usage:
+//
+//	{{ faqSchema $.Lang (toolFaq $.Data.Tool)
+//	  "about.faq.free.q|about.faq.free.a"
+//	  "about.faq.vpn.q|about.faq.vpn.a" }}
+//
+// Output is a ready-to-embed <script type="application/ld+json"> tag.
+// Google ignores blocks where Question.name is empty, so missing
+// translations degrade gracefully rather than emitting broken schema.
+func (h *Helper) FaqSchema(lang string, more [][2]string, pairs ...string) template.HTML {
+	type answer struct {
+		Type string `json:"@type"`
+		Text string `json:"text"`
+	}
+	type question struct {
+		Type           string `json:"@type"`
+		Name           string `json:"name"`
+		AcceptedAnswer answer `json:"acceptedAnswer"`
+	}
+	type faqPage struct {
+		Context    string     `json:"@context"`
+		Type       string     `json:"@type"`
+		MainEntity []question `json:"mainEntity"`
+	}
+
+	items := make([]question, 0, len(pairs)+len(more))
+	// A fresh slice: appending to the variadic parameter could write into
+	// a Go caller's backing array when it passes slice... with spare capacity.
+	all := make([]string, 0, len(pairs)+len(more))
+	all = append(all, pairs...)
+	for _, p := range more {
+		all = append(all, p[0]+"|"+p[1])
+	}
+	for _, p := range all {
+		if p == "" {
+			continue
+		}
+		parts := strings.SplitN(p, "|", 2)
+		if len(parts) != 2 {
+			log.WithField("pair", p).Warn("faqSchema: malformed pair, want \"qkey|akey\"")
+			continue
+		}
+		q := strings.TrimSpace(h.T(lang, parts[0]))
+		a := strings.TrimSpace(h.T(lang, parts[1]))
+		if q == "" || q == parts[0] || a == "" || a == parts[1] {
+			// Missing translation — i18n.Helper.T returns the key itself
+			// in that case. Skip the entry rather than emit a JSON-LD
+			// item that points at a non-existent question.
+			continue
+		}
+		a = faqStripTagsRe.ReplaceAllString(a, "")
+		items = append(items, question{
+			Type: "Question",
+			Name: q,
+			AcceptedAnswer: answer{
+				Type: "Answer",
+				Text: a,
+			},
+		})
+	}
+	if len(items) == 0 {
+		return ""
+	}
+	payload, err := json.Marshal(faqPage{
+		Context:    "https://schema.org",
+		Type:       "FAQPage",
+		MainEntity: items,
+	})
+	if err != nil {
+		log.WithError(err).Error("faqSchema: marshal failed")
+		return ""
+	}
+	return template.HTML(`<script type="application/ld+json">` + string(payload) + `</script>`)
+}

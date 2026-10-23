@@ -1,0 +1,26 @@
+package j
+
+import (
+	"context"
+	"net/http"
+	"time"
+
+	"github.com/webtor-io/web-ui/jobs/scripts"
+	"github.com/webtor-io/web-ui/models"
+	"github.com/webtor-io/web-ui/services/embed"
+	"github.com/webtor-io/web-ui/services/web"
+
+	"github.com/webtor-io/web-ui/services/job"
+)
+
+// purge: run the job again instead of replaying the stored one (the player's
+// stream restart, handlers/embed post.go).
+func (s *Jobs) Embed(c *web.Context, cl *http.Client, settings *models.EmbedSettings, dsd *embed.DomainSettingsData, decl models.DecodeRequest, purge bool) (j *job.Job, err error) {
+	es, hash, err := scripts.Embed(s.tb, cl, c, s.api, s.i18n, s.enricher, settings, "", dsd, s.warmup, decl)
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	j = s.q.GetOrCreate("embded").Enqueue(ctx, cancel, hash, es, purge, s.errorFormatter(c))
+	return
+}

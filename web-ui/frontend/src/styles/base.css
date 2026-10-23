@@ -1,0 +1,496 @@
+/* Torrently — paper, ink and olive, seen through reeded glass. */
+
+@import "@fontsource/doto/900.css";
+@import "@fontsource/space-grotesk/400.css";
+@import "@fontsource/space-grotesk/500.css";
+@import "@fontsource/space-grotesk/600.css";
+@import "@fontsource/space-mono/400.css";
+@import "@fontsource/space-mono/700.css";
+
+:root {
+  color-scheme: light;
+  --font-logo: "Doto", "Space Mono", ui-monospace, monospace;
+  --font-sans:
+    "Space Grotesk", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial,
+    sans-serif;
+  --font-mono: "Space Mono", "SFMono-Regular", Consolas, monospace;
+
+  /* palette */
+  --paper: #f4f0e5;
+  --paper-deep: #ebe5d4;
+  --ink: #1c1f14;
+  --ink-2: rgba(28, 31, 20, 0.76);
+  --ink-3: rgba(28, 31, 20, 0.62);
+  --cream: #fffdf6;
+  --olive: #5f6f2c;
+  --olive-ink: #4b5823;
+  --olive-wash: rgba(95, 111, 44, 0.12);
+  --honey: #94650f;
+  --honey-wash: rgba(176, 124, 26, 0.14);
+  --brick: #a3341f;
+  --brick-wash: rgba(163, 52, 31, 0.1);
+
+  /* glass */
+  --glass: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.8),
+    rgba(255, 255, 255, 0.56)
+  );
+  --glass-line: rgba(28, 31, 20, 0.1);
+  --glass-edge: inset 0 1px 0 rgba(255, 255, 255, 0.95);
+  --glass-drop: 0 30px 60px -34px rgba(48, 46, 20, 0.35);
+  --hairline: rgba(28, 31, 20, 0.1);
+  --hover: rgba(28, 31, 20, 0.05);
+  --well: rgba(255, 255, 255, 0.66);
+
+  /* type scale, 1.25 from a 16px body */
+  --step--1: 13px;
+  --step-0: 16px;
+  --step-1: 20px;
+  --step-2: 25px;
+  --step-3: 31px;
+  --step-4: clamp(34px, 4.2vw, 49px);
+  --step-5: clamp(42px, 6.4vw, 84px);
+
+  --r-xl: 30px;
+  --r-lg: 22px;
+  --r-md: 16px;
+  --r-sm: 12px;
+  --pill: 999px;
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --nav-h: 76px;
+
+  font-family: var(--font-sans);
+  font-size: var(--step-0);
+  line-height: 1.55;
+  color: var(--ink);
+  background: var(--paper);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+* {
+  box-sizing: border-box;
+}
+html {
+  scroll-padding-top: calc(var(--nav-h) + 16px);
+  touch-action: manipulation;
+}
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--paper);
+}
+#app {
+  position: relative;
+  z-index: 1;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+img,
+svg,
+video {
+  display: block;
+  max-width: 100%;
+}
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+@media (hover: none) and (pointer: coarse) {
+  input,
+  select,
+  textarea {
+    font-size: max(16px, 1em) !important;
+  }
+}
+button {
+  cursor: pointer;
+  border: 0;
+  background: none;
+  padding: 0;
+}
+button:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+/* The classic stylesheet, loaded next to hosted classic pieces (the
+   player), resets the browser's defaults in its base layer. These
+   unlayered rules put back the ones this design relies on. */
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-size: revert;
+}
+ul,
+ol {
+  list-style: revert;
+  padding-inline-start: revert;
+}
+dialog {
+  margin: auto;
+}
+
+a {
+  color: var(--olive-ink);
+  text-decoration-line: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+a:hover {
+  color: var(--ink);
+}
+:focus-visible {
+  outline: 2px solid var(--olive);
+  outline-offset: 3px;
+  border-radius: 6px;
+}
+::selection {
+  background: rgba(95, 111, 44, 0.25);
+}
+code,
+kbd,
+.mono {
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+}
+h1,
+h2,
+h3,
+h4 {
+  font-weight: 600;
+  letter-spacing: -0.03em;
+  line-height: 1.08;
+  margin: 0;
+  text-wrap: balance;
+}
+p {
+  margin: 0;
+  text-wrap: pretty;
+}
+.visually-hidden {
+  position: absolute !important;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+.skip-link {
+  position: fixed;
+  left: 16px;
+  top: -60px;
+  z-index: 100;
+  padding: 10px 16px;
+  border-radius: var(--pill);
+  background: var(--ink);
+  color: var(--cream);
+}
+.skip-link:focus {
+  top: 16px;
+}
+
+/* ───────── Layout ───────── */
+
+.wrap {
+  width: 100%;
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 0 24px;
+}
+.wrap.narrow {
+  max-width: 780px;
+}
+main {
+  flex: 1;
+  padding-top: calc(var(--nav-h) + 24px);
+}
+.section {
+  padding: 96px 0;
+}
+.section + .section {
+  padding-top: 0;
+}
+.section-head {
+  max-width: 640px;
+  margin-bottom: 40px;
+}
+.section-head h2 {
+  font-size: var(--step-4);
+  letter-spacing: -0.04em;
+}
+.section-head p {
+  margin-top: 14px;
+  color: var(--ink-2);
+  font-size: 17px;
+  line-height: 1.6;
+}
+.lede {
+  font-size: 18px;
+  line-height: 1.6;
+  color: var(--ink-2);
+}
+.muted {
+  color: var(--ink-3);
+}
+.fine {
+  font-size: var(--step--1);
+  line-height: 1.6;
+  color: var(--ink-3);
+}
+
+/* ───────── Surfaces ───────── */
+
+/* The one surface everything sits on: a pane of frosted glass. */
+.glass {
+  background: var(--glass);
+  border: 1px solid var(--glass-line);
+  box-shadow: var(--glass-edge), var(--glass-drop);
+  -webkit-backdrop-filter: blur(22px) saturate(1.4);
+  backdrop-filter: blur(22px) saturate(1.4);
+  border-radius: var(--r-lg);
+}
+.panel {
+  padding: 28px;
+}
+@media (max-width: 640px) {
+  .panel {
+    padding: 20px;
+  }
+}
+.rule {
+  border: 0;
+  border-top: 1px solid var(--hairline);
+  margin: 0;
+}
+
+/* ───────── Controls ───────── */
+
+.button {
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 10px 18px;
+  border-radius: var(--pill);
+  border: 1px solid var(--glass-line);
+  background: rgba(255, 255, 255, 0.6);
+  color: var(--ink);
+  font-size: 15px;
+  line-height: 1.2;
+  font-weight: 500;
+  white-space: nowrap;
+  text-decoration: none;
+  transition:
+    background-color 200ms var(--ease),
+    border-color 200ms var(--ease),
+    color 200ms var(--ease);
+}
+.button:hover {
+  color: var(--ink);
+  background: rgba(255, 255, 255, 0.95);
+  border-color: rgba(28, 31, 20, 0.2);
+}
+.button.primary {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--cream);
+  font-weight: 600;
+}
+.button.primary:hover {
+  background: var(--olive);
+  border-color: var(--olive);
+  color: #fff;
+}
+.button.accent {
+  background: var(--olive);
+  border-color: var(--olive);
+  color: #fff;
+  font-weight: 600;
+}
+.button.accent:hover {
+  background: var(--olive-ink);
+  border-color: var(--olive-ink);
+  color: #fff;
+}
+.button.quiet {
+  background: transparent;
+  border-color: transparent;
+}
+.button.quiet:hover {
+  background: var(--hover);
+}
+.button.danger {
+  color: var(--brick);
+}
+.button.small {
+  min-height: 36px;
+  padding: 7px 14px;
+  font-size: 14px;
+}
+.button.large {
+  min-height: 52px;
+  padding: 14px 24px;
+  font-size: 16px;
+}
+.button svg {
+  flex: none;
+}
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  min-height: 44px;
+  border-radius: 50%;
+  color: var(--ink-2);
+  transition:
+    background-color 200ms var(--ease),
+    color 200ms var(--ease);
+}
+.icon-button:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.field > label,
+.field > .label {
+  font-size: 14px;
+  font-weight: 500;
+}
+.input,
+.select,
+.textarea {
+  width: 100%;
+  min-height: 48px;
+  padding: 12px 16px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--glass-line);
+  background: var(--well);
+  color: var(--ink);
+  transition: border-color 200ms var(--ease);
+}
+.textarea {
+  min-height: 120px;
+  resize: vertical;
+}
+.input:focus,
+.select:focus,
+.textarea:focus {
+  outline: 0;
+  border-color: rgba(28, 31, 20, 0.45);
+}
+.input::placeholder,
+.textarea::placeholder {
+  color: var(--ink-3);
+}
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+}
+.check input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--olive);
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  padding: 3px 10px;
+  border-radius: var(--pill);
+  background: var(--hover);
+  color: var(--ink-2);
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.chip.olive {
+  background: var(--olive-wash);
+  color: var(--olive-ink);
+}
+.chip.honey {
+  background: var(--honey-wash);
+  color: var(--honey);
+}
+.chip.brick {
+  background: var(--brick-wash);
+  color: var(--brick);
+}
+.notice {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 14px 16px;
+  border-radius: var(--r-md);
+  background: var(--olive-wash);
+  color: var(--ink);
+  font-size: 15px;
+  line-height: 1.55;
+}
+.notice.error {
+  background: var(--brick-wash);
+}
+.notice.error svg {
+  color: var(--brick);
+}
+.notice.warn {
+  background: var(--honey-wash);
+}
+.notice svg {
+  flex: none;
+  margin-top: 2px;
+  color: var(--olive-ink);
+}
+.spinner {
+  width: 18px;
+  height: 18px;
+  border: 2px solid rgba(28, 31, 20, 0.15);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.progress {
+  height: 6px;
+  border-radius: var(--pill);
+  background: var(--hover);
+  overflow: hidden;
+}
+.progress > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--olive);
+  transition: width 250ms var(--ease);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    scroll-behavior: auto !important;
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "input": "1 Min Sample.mkv",
+  "want": {
+    "title": "1 Min",
+    "container": "mkv",
+    "sample": true
+  }
+}

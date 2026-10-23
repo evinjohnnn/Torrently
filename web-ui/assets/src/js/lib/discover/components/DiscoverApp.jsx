@@ -1,0 +1,1811 @@
+import { useReducer, useRef, useEffect, useCallback, useMemo, useState } from 'preact/hooks';
+import { StremioClient, CINEMETA_BASE } from '../client';
+import {
+    discoverReducer, initialState,
+    getCatalogsForType, getTypes,
+    getSearchTypes, getSearchResultsForType,
+    overlayLocalized,
+} from './discoverReducer';
+import { StreamModal } from './StreamModal';
+import { dedupeStreamsByHash, interleaveBySource } from '../stream';
+import { withCached } from '../availabilityClient';
+import { AddonWizard } from './AddonWizard';
+import { loadPrefs, savePrefs, getViewMode } from '../prefs';
+import { useDiscoverUrl } from './useDiscoverUrl';
+import { restoreModalFromUrl, loadManifests, fetchUserStatuses, toggleWatched, rateVideo, unrateVideo, catalogChipClass, watchlistChipClass, viewModeChipClass, reviewsTab } from './discoverUtils';
+import { fetchWatchlistIds, fetchWatchlist, addToWatchlist, removeFromWatchlist } from '../watchlistClient';
+import { fetchSubscriptionIds, subscribe, unsubscribe, subscriptionKey } from '../subscriptionsClient';
+import { subscriptionTargetFor } from '../seasonStatus';
+import { fetchLocalized, getCachedLocalized, withLocalized, localizedTitle } from '../localizeClient';
+import { RatingDialog } from './RatingDialog';
+import { SearchBar } from './SearchBar';
+import { ItemGrid } from './ItemGrid';
+import { CalendarView } from './CalendarView';
+import { TypeTabs, SearchTabs, CatalogSelector } from './Tabs';
+import { LoadMore, LoadingSpinner, NoAddons, NoCatalogs, ErrorState, NoResults, CatalogUnavailable } from './EmptyStates';
+import { AddonHealthChip } from './AddonHealthChip';
+import { AISection } from './ai/AISection';
+import { t, langPath } from '../i18n';
+import { fetchTorznabStreams, hasIndexers, indexerLabel } from '../torznabClient';
+import { startProbe, decodedTokens, declaredTokens, takesPart } from '../../player/decode-declaration';
+import { usePlaybackContext } from '../usePlaybackContext';
+
+// The declaration module as the stream modal's switches ask it
+// (usePlaybackContext): one object, so the context is not gathered again on
+// every render of the page.
+const DECODE = { startProbe, decodedTokens, declaredTokens, takesPart };
+
+// episodesModalFromBack rebuilds the episodes-view modal from the
+// backToEpisodes snapshot carried by an episode-streams modal. Shared by
+// the "‹ Episodes" button and the popstate restore path so the two can't
+// drift apart.
+function episodesModalFromBack(back, { tab, defaultSeason } = {}) {
+    return {
+        view: 'episodes',
+        title: back.title,
+        poster: back.poster,
+        meta: back.meta,
+        itemId: back.itemId,
+        itemType: back.itemType,
+        year: back.year,
+        releaseInfo: back.releaseInfo,
+        imdbRating: back.imdbRating,
+        description: back.description,
+        tab,
+        defaultSeason: defaultSeason != null ? defaultSeason : (back.season != null ? Number(back.season) : undefined),
+    };
+}
+
+// modalIdentity extracts the fields every SHOW_MODAL recreation must
+// carry forward — the watched/rate buttons and the reviews tab are gated
+// on them (see ModalBody in StreamModal.jsx). Dropping any of these on a
+// rebuilt modal silently hides those surfaces.
+function modalIdentity(m) {
+    return {
+        metaId: m?.metaId,
+        itemId: m?.itemId,
+        itemType: m?.itemType,
+        year: m?.year,
+        releaseInfo: m?.releaseInfo,
+        imdbRating: m?.imdbRating,
+        description: m?.description,
+    };
+}
+
+export function DiscoverApp({ addonUrls, addonSeeds, hasCustomAddons }) {
+    const [state, dispatch] = useReducer(discoverReducer, initialState);
+    const [showWizard, setShowWizard] = useState(false);
+    const [addonsInstalled, setAddonsInstalled] = useState(false);
+    const [ratingTarget, setRatingTarget] = useState(null);
+    const clientRef = useRef(null);
+    const abortRef = useRef(null);
+    // Stream loads are generation-guarded: closing the modal or opening
+    // another title invalidates the run in flight, so its late dispatch
+    // cannot re-open a modal the user closed or overwrite a newer one.
+    const streamGenRef = useRef(0);
+    const streamAbortRef = useRef(null);
+    const searchGenRef = useRef(0);
+    const searchAfterInit = useRef(null);
+    const restoredPageRef = useRef(0);
+    const modalItemIdRef = useRef(null);
+    const modalEpisodeRef = useRef(null); // { season, episode }
+    const modalSeasonRef = useRef(null); // season-only (no episode) from URL
+    const restoreInProgressRef = useRef(false);
+    const stateRef = useRef(null); // latest state snapshot for popstate handler
+    const modalRef = useRef(null); // current modal for popstate handler
+    const openModalByIdRef = useRef(null); // latest openModalById for popstate handler
+    const performSearchRef = useRef(null); // latest performSearch for popstate handler
+    const pendingStreamRef = useRef(null); // stream to reload after wizard
+
+    const url = useDiscoverUrl('/discover');
+
+    // What the stream modal's video switches go by (lib/discover/playback.js),
+    // gathered from the page's first render, so the browser's probe has
+    // answered by the time a modal opens (usePlaybackContext).
+    const playback = usePlaybackContext(window, DECODE);
+
+    // Create client once
+    if (!clientRef.current) {
+        clientRef.current = new StremioClient(addonUrls, addonSeeds);
+    }
+    const client = clientRef.current;
+
+    function abortCatalog() {
+        if (abortRef.current) {
+            abortRef.current.abort();
+            abortRef.current = null;
+        }
+    }
+
+    // --- Load catalog ---
+    const loadCatalog = useCallback(async (catalog, skip, currentItems) => {
+        if (!catalog) return;
+        // Skip the fetch for catalogs whose addon is currently down — the
+        // UI renders CatalogUnavailable for these so users see why nothing
+        // loads. Without this short-circuit we'd hit the network and the
+        // generic "Failed to load catalog" toast would mask the real cause.
+        if (catalog.disabled) return;
+        dispatch({ type: 'CATALOG_LOADING' });
+        abortCatalog();
+        abortRef.current = new AbortController();
+        const { signal } = abortRef.current;
+
+        try {
+            const data = await client.fetchCatalog(catalog.baseUrl, catalog.type, catalog.id, skip, { signal });
+            let metas = data.metas || [];
+            if (skip > 0) {
+                const existingIds = new Set(currentItems.map(i => i.id));
+                metas = metas.filter(m => !existingIds.has(m.id));
+            }
+            dispatch({ type: 'CATALOG_LOADED', items: skip > 0 ? metas : metas, append: skip > 0, hasMore: (data.metas || []).length > 0 });
+            window.umami?.track('discover-catalog-loaded', { type: catalog.type, catalog: catalog.id });
+            // Fire-and-forget user status query for the newly arrived batch.
+            fetchUserStatuses(metas.map(m => m.id)).then(statuses => {
+                if (Object.keys(statuses).length) dispatch({ type: 'USER_STATUSES_MERGED', statuses });
+            });
+        } catch (e) {
+            if (e.name === 'AbortError') return;
+            dispatch({ type: 'CATALOG_ERROR', message: t('discover.catalogLoadError') });
+        }
+    }, [client]);
+
+    // --- Init (with URL state restoration) ---
+    useEffect(() => {
+        let cancelled = false;
+        (async () => {
+            try {
+                const { manifests, catalogs, types, addons } = await loadManifests(client);
+                if (cancelled) return;
+
+                if (!types.length) {
+                    dispatch({ type: 'ADDONS_UPDATED', addons });
+                    dispatch({ type: 'SET_PHASE', phase: 'no-catalogs' });
+                    return;
+                }
+
+                // Restore state from URL params and history.state
+                const urlParams = new URLSearchParams(window.location.search);
+                const urlType = urlParams.get('type');
+                const urlSearch = urlParams.get('search');
+                const urlSearchType = urlParams.get('search-type');
+                const urlPage = parseInt(urlParams.get('page'), 10) || 0;
+                const urlId = urlParams.get('id');
+                const urlSeason = urlParams.get('season');
+                const urlEpisode = urlParams.get('episode');
+                const urlCatalogBase = urlParams.get('catalog-base');
+                const urlCatalogId = urlParams.get('catalog-id');
+
+                const prefs = loadPrefs();
+                let selectedType = types[0];
+                let selectedCatalog;
+
+                // Type: URL > localStorage > default
+                if (urlType && types.includes(urlType)) {
+                    selectedType = urlType;
+                } else if (prefs.type && types.includes(prefs.type)) {
+                    selectedType = prefs.type;
+                }
+
+                selectedCatalog = getCatalogsForType(catalogs, selectedType)[0] || null;
+
+                // Catalog: URL > localStorage > default
+                if (urlCatalogBase && urlCatalogId) {
+                    const match = getCatalogsForType(catalogs, selectedType)
+                        .find(c => c.baseUrl === urlCatalogBase && c.id === urlCatalogId);
+                    if (match) selectedCatalog = match;
+                } else if (prefs.catalogBase && prefs.catalogId) {
+                    const match = getCatalogsForType(catalogs, selectedType)
+                        .find(c => c.baseUrl === prefs.catalogBase && c.id === prefs.catalogId);
+                    if (match) selectedCatalog = match;
+                }
+
+                dispatch({ type: 'INIT_SUCCESS', manifests, catalogs, selectedType, selectedCatalog, addons, viewMode: getViewMode() });
+
+                // Store page/modal restore targets
+                if (urlPage > 0) restoredPageRef.current = urlPage;
+                if (urlId) modalItemIdRef.current = urlId;
+                if (urlSeason != null && urlEpisode != null) {
+                    modalEpisodeRef.current = { season: urlSeason, episode: urlEpisode };
+                } else if (urlSeason != null) {
+                    modalSeasonRef.current = urlSeason;
+                }
+
+                // Enter search mode if URL has search param
+                if (urlSearch) {
+                    dispatch({ type: 'SEARCH_START', query: urlSearch });
+                    if (urlSearchType && urlSearchType !== 'all') {
+                        dispatch({ type: 'SELECT_SEARCH_TYPE', searchType: urlSearchType });
+                    }
+                    // Trigger actual search
+                    searchAfterInit.current = urlSearch;
+                } else if (urlParams.get('watchlist') === '1') {
+                    // Restore watchlist mode from URL. Items load via the
+                    // mount-time prefetch effect below + a lazy fetch on
+                    // first open; doing the fetch from here would race the
+                    // INIT_SUCCESS dispatch above.
+                    dispatch({ type: 'WATCHLIST_FILTER_SET', enabled: true });
+                    const wlType = urlParams.get('watchlist-type');
+                    if (wlType && wlType !== 'all') {
+                        dispatch({ type: 'SELECT_WATCHLIST_TYPE', watchlistType: wlType });
+                    }
+                }
+            } catch (e) {
+                if (!cancelled) {
+                    dispatch({ type: 'INIT_ERROR', message: t('discover.manifestLoadError') });
+                }
+            }
+        })();
+        return () => { cancelled = true; abortCatalog(); };
+    }, [client]);
+
+    // Load catalog when selection changes after init
+    const prevCatalogRef = useRef(null);
+    useEffect(() => {
+        if (state.phase !== 'ready' || state.isSearchMode) return;
+        if (!state.selectedCatalog) return;
+        const key = `${state.selectedCatalog.baseUrl}::${state.selectedCatalog.id}::${state.selectedType}`;
+        if (prevCatalogRef.current === key && state.skip > 0) return;
+        prevCatalogRef.current = key;
+        loadCatalog(state.selectedCatalog, 0, []);
+    }, [state.phase, state.selectedCatalog, state.selectedType, state.isSearchMode, loadCatalog]);
+
+    // Batch-localize whatever grid surface is on screen through the server
+    // enrichment pipeline (POST /discover/localize). localizeClient holds a
+    // per-id session cache, so pagination, tab switches and re-renders only
+    // request unseen ids; English sessions short-circuit inside
+    // fetchLocalized without touching the network.
+    useEffect(() => {
+        const src = state.isSearchMode
+            ? state.searchResults
+            : state.watchlistFilterEnabled ? state.watchlistItems : state.items;
+        if (!src.length) return;
+        fetchLocalized(src.map(i => ({ id: i.id, type: i.type || state.selectedType }))).then(found => {
+            if (Object.keys(found).length) dispatch({ type: 'LOCALIZED_MERGED', localized: found });
+        });
+    }, [state.items, state.searchResults, state.watchlistItems, state.isSearchMode, state.watchlistFilterEnabled, state.selectedType]);
+
+    // --- Type/Catalog selection ---
+    const selectType = useCallback((type) => {
+        abortCatalog();
+        savePrefs({ type });
+        const catalogs = getCatalogsForType(state.catalogs, type);
+        const catalog = catalogs[0] || null;
+        url.push({
+            type, 'catalog-base': catalog?.baseUrl, 'catalog-id': catalog?.id,
+            id: null, season: null, episode: null, search: null, 'search-type': null,
+        });
+        dispatch({ type: 'SELECT_TYPE', selectedType: type });
+    }, [state.catalogs]);
+
+    const selectCatalog = useCallback((catalog) => {
+        abortCatalog();
+        savePrefs({ catalogBase: catalog.baseUrl, catalogId: catalog.id });
+        url.push({
+            'catalog-base': catalog.baseUrl, 'catalog-id': catalog.id,
+            id: null, season: null, episode: null,
+        });
+        dispatch({ type: 'SELECT_CATALOG', catalog });
+    }, []);
+
+    // --- Load more ---
+    const loadMore = useCallback(() => {
+        loadCatalog(state.selectedCatalog, state.items.length, state.items);
+    }, [state.selectedCatalog, state.items, loadCatalog]);
+
+    // --- Search ---
+    const exitSearch = useCallback(() => {
+        abortCatalog();
+        if (!url.isPopstate.current) {
+            const types = getTypes(state.catalogs);
+            const type = types[0] || null;
+            const catalog = type ? getCatalogsForType(state.catalogs, type)[0] : null;
+            url.push({
+                type, 'catalog-base': catalog?.baseUrl, 'catalog-id': catalog?.id,
+                search: null, 'search-type': null, id: null, season: null, episode: null,
+            });
+        }
+        dispatch({ type: 'EXIT_SEARCH' });
+    }, [state.catalogs]);
+
+    const performSearch = useCallback(async (query) => {
+        query = query.trim();
+        if (query.length < 2) {
+            if (state.isSearchMode) {
+                exitSearch();
+            }
+            return;
+        }
+
+        // Push history entry when first entering search mode (not during popstate)
+        if (!state.isSearchMode && !url.isPopstate.current) {
+            url.push({ search: query, 'search-type': null, type: null, 'catalog-base': null, 'catalog-id': null, id: null, season: null, episode: null });
+        }
+
+        const gen = ++searchGenRef.current;
+        dispatch({ type: 'SEARCH_START', query });
+        abortCatalog();
+        abortRef.current = new AbortController();
+        const { signal } = abortRef.current;
+
+        const searchCatalogs = client.getSearchCatalogs();
+        const sources = [];
+        const hasCinemetaMovie = searchCatalogs.some(sc => sc.baseUrl === CINEMETA_BASE && sc.type === 'movie' && sc.id === 'top');
+        const hasCinemetaSeries = searchCatalogs.some(sc => sc.baseUrl === CINEMETA_BASE && sc.type === 'series' && sc.id === 'top');
+        if (!hasCinemetaMovie) sources.push({ baseUrl: CINEMETA_BASE, type: 'movie', id: 'top' });
+        if (!hasCinemetaSeries) sources.push({ baseUrl: CINEMETA_BASE, type: 'series', id: 'top' });
+        sources.push(...searchCatalogs);
+
+        const results = await Promise.allSettled(
+            sources.map(src => client.searchCatalog(src.baseUrl, src.type, src.id, query, { signal }))
+        );
+
+        if (gen !== searchGenRef.current) return;
+
+        const seen = new Set();
+        const merged = [];
+        for (let k = 0; k < results.length; k++) {
+            if (results[k].status !== 'fulfilled') continue;
+            const srcType = sources[k].type;
+            for (const item of results[k].value) {
+                if (!item.type) item.type = srcType;
+                if (!seen.has(item.id)) {
+                    seen.add(item.id);
+                    merged.push(item);
+                }
+            }
+        }
+
+        dispatch({ type: 'SEARCH_RESULTS', results: merged });
+        window.umami?.track('discover-search', { query, count: merged.length });
+        fetchUserStatuses(merged.map(m => m.id)).then(statuses => {
+            if (Object.keys(statuses).length) dispatch({ type: 'USER_STATUSES_MERGED', statuses });
+        });
+    }, [client, state.isSearchMode, exitSearch]);
+
+    // Trigger search restored from URL after init
+    useEffect(() => {
+        if (state.phase !== 'ready') return;
+        if (!searchAfterInit.current) return;
+        const query = searchAfterInit.current;
+        searchAfterInit.current = null;
+        performSearch(query);
+    }, [state.phase, performSearch]);
+
+    // --- Card click & streams (defined before restore effects that use them) ---
+    const loadStreams = useCallback(async (type, id, item, modalExtra = {}) => {
+        const gen = ++streamGenRef.current;
+        if (streamAbortRef.current) streamAbortRef.current.abort();
+        streamAbortRef.current = new AbortController();
+        const streamSignal = streamAbortRef.current.signal;
+        const current = () => streamGenRef.current === gen;
+
+        const title = item.name || item.title;
+        const poster = item.poster;
+        const metaId = id.split(':')[0];
+        const itemType = type;
+        const year = item.year;
+        const releaseInfo = item.releaseInfo;
+        const imdbRating = item.imdbRating;
+        const description = item.description;
+        const addons = client.getStreamAddons();
+        // Seed the tab from the URL so deep links / reloads with
+        // ?tab=reviews land on the reviews tab — a freshly built modal
+        // object otherwise defaults to the primary tab.
+        // What a subscription from this modal would be about. An episode id
+        // (tt…:S:E) means the season; a movie means the film. Anything else —
+        // a series opened without an episode, a library item whose id no
+        // external source can resolve — offers nothing, and the empty states
+        // render without the CTA.
+        const subTarget = subscriptionTargetFor(type, id, metaId, modalExtra?.backToEpisodes?.meta);
+        const itemMeta = { year, releaseInfo, imdbRating, description, tab: reviewsTab(), subTarget };
+
+        // Addons we couldn't even probe for streams because their manifest
+        // is unreachable or returned a 4xx. Without surfacing these, an
+        // empty stream list reads as "no content" when the real cause is
+        // an outage on the user's stream addon.
+        const inferredFailures = (client.addonStatuses || [])
+            .filter(a => a.status !== 'ok')
+            .filter(a => {
+                if (!a.manifest) return true; // unknown capabilities — assume it might serve streams
+                const resources = a.manifest.resources || [];
+                return resources.some(r =>
+                    (typeof r === 'string' && r === 'stream') ||
+                    (r && r.name === 'stream')
+                );
+            })
+            .map(a => {
+                let host;
+                try { host = new URL(a.baseUrl).hostname; } catch { host = a.baseUrl; }
+                return { name: a.manifest?.name || host, host, status: 'error', kind: a.status };
+            });
+
+        // Torznab indexers are fetched through the server (see
+        // lib/discover/torznabClient.js) and appear in this list as one
+        // extra source, so a user with only indexers still gets streams.
+        const useIndexers = hasIndexers();
+
+        if (!addons.length && !useIndexers) {
+            if (current()) {
+                dispatch({ type: 'SHOW_MODAL', modal: { view: 'streams', title, poster, metaId, itemType, ...itemMeta, streams: [], failedAddons: inferredFailures, ...modalExtra } });
+            }
+            return;
+        }
+
+        const addonStatuses = addons.map(a => {
+            let host;
+            try { host = new URL(a.baseUrl).hostname; } catch { host = a.baseUrl; }
+            return { name: a.manifest.name || host, host, status: 'fetching' };
+        });
+
+        const indexerIdx = useIndexers ? addonStatuses.length : -1;
+        if (useIndexers) {
+            // host, not just name: FetchingView labels every progress row
+            // from `host`, so leaving it empty renders a nameless row.
+            const label = indexerLabel();
+            addonStatuses.push({ name: label, host: label, status: 'fetching' });
+        }
+
+        if (current()) {
+            dispatch({ type: 'SHOW_MODAL', modal: { view: 'fetching', title, poster, metaId, itemType, ...itemMeta, addons: [...addonStatuses], ...modalExtra } });
+        }
+
+        // Per-source buckets rather than one shared array: the merge order
+        // has to be deterministic (addons before indexers) so that the
+        // dedup below keeps the addon copy of a shared torrent, which is
+        // the one carrying a file index. Completion order would hand that
+        // to whichever source answered first.
+        const bySource = addonStatuses.map(() => []);
+        const promises = addons.map(async (addon, i) => {
+            try {
+                const streams = await client.fetchStreamFromAddon(addon, type, id, { signal: streamSignal });
+                addonStatuses[i] = { ...addonStatuses[i], status: 'done', count: streams.length };
+                bySource[i] = streams;
+            } catch (e) {
+                addonStatuses[i] = { ...addonStatuses[i], status: 'error' };
+            }
+            if (current()) {
+                dispatch({ type: 'SHOW_MODAL', modal: { view: 'fetching', title, poster, metaId, itemType, ...itemMeta, addons: [...addonStatuses], ...modalExtra } });
+            }
+        });
+
+        if (useIndexers) {
+            promises.push((async () => {
+                try {
+                    const streams = await fetchTorznabStreams(type, id, { signal: streamSignal });
+                    // Relabel: the response carries the indexer's current
+                    // name, which the first search of a freshly added
+                    // indexer is what teaches. Without this the row keeps
+                    // the name the page was loaded with while the results
+                    // under it already carry the new one.
+                    const done = indexerLabel();
+                    addonStatuses[indexerIdx] = { ...addonStatuses[indexerIdx], name: done, host: done, status: 'done', count: streams.length };
+                    bySource[indexerIdx] = streams;
+                } catch (e) {
+                    addonStatuses[indexerIdx] = { ...addonStatuses[indexerIdx], status: 'error' };
+                }
+                if (current()) {
+                    dispatch({ type: 'SHOW_MODAL', modal: { view: 'fetching', title, poster, metaId, itemType, ...itemMeta, addons: [...addonStatuses], ...modalExtra } });
+                }
+            })());
+        }
+
+        await Promise.allSettled(promises);
+        if (!current()) return;
+        // Dedup first (order decides which copy wins), then interleave so
+        // every source is visible near the top rather than whichever one
+        // returned the most results.
+        // ...and what Webtor already holds goes above all of it, marked (see
+        // availabilityClient.js). Awaited, so the order is final when shown.
+        const allStreams = await withCached(interleaveBySource(dedupeStreamsByHash(bySource.flat())));
+        if (!current()) return;
+        // Carry per-addon statuses into the streams view so the modal can
+        // surface "Torrentio failed" instead of degrading silently to the
+        // generic "no streams" empty-state. Combines fetch-time errors
+        // with addons whose manifest was already unreachable when we
+        // started — both are equally meaningful to the user.
+        const failedFromFetch = addonStatuses.filter(s => s.status === 'error');
+        const failedAddons = [...failedFromFetch, ...inferredFailures];
+        dispatch({ type: 'SHOW_MODAL', modal: { view: 'streams', title, poster, metaId, itemType, ...itemMeta, streams: allStreams, addons: [...addonStatuses], failedAddons, ...modalExtra } });
+        window.umami?.track('discover-streams-loaded', { type, id, count: allStreams.length, cached: allStreams.filter(s => s.cached).length, failedAddons: failedAddons.length });
+    }, [client]);
+
+    const cardClick = useCallback(async (item) => {
+        const type = item.type || state.selectedType;
+        const id = item.id;
+        const restoreSeason = modalSeasonRef.current;
+        modalSeasonRef.current = null;
+
+        // Grid items arrive already overlaid via displayItems, but deep-links
+        // (openModalById fallback) don't — apply the cached translation here
+        // so every downstream modal dispatch sees the localized
+        // name/description. On a cold cache (direct link before any grid
+        // batch ran), fetch this one id and patch the open modal in place.
+        if (getCachedLocalized(id)) {
+            item = withLocalized(item);
+        } else {
+            fetchLocalized([{ id, type }]).then(found => {
+                if (!Object.keys(found).length) return;
+                dispatch({ type: 'LOCALIZED_MERGED', localized: found });
+                const l = found[id];
+                const cur = stateRef.current?.modal;
+                if (l && cur && (cur.metaId === id || cur.itemId === id) && !cur.backToEpisodes) {
+                    dispatch({ type: 'SHOW_MODAL', modal: { ...cur, title: l.title || cur.title, description: l.plot || cur.description } });
+                }
+            });
+        }
+
+        // Watchlist conversion telemetry: a click that originates from the
+        // watchlist view is the only signal we have today that "saved → opened
+        // to stream" — without this we cannot answer whether Watchlist drives
+        // any retention. Fired before any async work so a fetch failure still
+        // counts the intent.
+        if (stateRef.current?.watchlistFilterEnabled) {
+            window.umami?.track?.('stream-from-watchlist');
+        }
+
+        if (url.isPopstate.current) {
+            url.replace({ id, season: restoreSeason ?? null, episode: null });
+        } else {
+            url.push({ id, season: null, episode: null });
+        }
+
+        // Build metadata from catalog item; fetchMeta will fill in missing fields.
+        const cardMeta = { year: item.year, releaseInfo: item.releaseInfo, imdbRating: item.imdbRating, description: item.description };
+
+        // Enrich cardMeta from Stremio meta response (has description, imdbRating, etc.)
+        function enrichFromMeta(meta) {
+            if (!meta) return;
+            if (!cardMeta.description && meta.description) cardMeta.description = meta.description;
+            if (!cardMeta.imdbRating && meta.imdbRating) cardMeta.imdbRating = meta.imdbRating;
+            if (!cardMeta.releaseInfo && meta.releaseInfo) cardMeta.releaseInfo = meta.releaseInfo;
+            if (!cardMeta.year && meta.year) cardMeta.year = meta.year;
+        }
+
+        if (type === 'series') {
+            dispatch({ type: 'SHOW_MODAL', modal: { view: 'loading', title: item.name, poster: item.poster, subtitle: t('discover.loadingEpisodes'), itemType: type, itemId: id, ...cardMeta } });
+            try {
+                const meta = await client.fetchMeta(type, id);
+                enrichFromMeta(meta);
+                if (meta?.videos?.length > 0) {
+                    // Cinemeta's meta.name is the freshest English title, but a
+                    // localized title beats it; re-read the cache at dispatch
+                    // time so the parallel cold-cache fetch above is covered.
+                    // Tab seeded from the URL so a ?tab=reviews deep link lands
+                    // on the reviews tab of the episodes view.
+                    dispatch({ type: 'SHOW_MODAL', modal: {
+                        view: 'episodes', title: localizedTitle(id, meta.name, item.name), poster: meta.poster || item.poster, meta, itemId: id, itemType: type, ...cardMeta, tab: reviewsTab(),
+                        defaultSeason: restoreSeason != null ? Number(restoreSeason) : undefined,
+                    } });
+                } else {
+                    await loadStreams(type, id, { ...item, ...cardMeta });
+                }
+            } catch (e) {
+                await loadStreams(type, id, { ...item, ...cardMeta });
+            }
+        } else {
+            // Fetch meta in parallel with streams to enrich modal with description/rating.
+            const metaPromise = client.fetchMeta(type, id).catch(() => null);
+            const streamsPromise = loadStreams(type, id, { ...item, ...cardMeta });
+            const meta = await metaPromise;
+            await streamsPromise;
+            if (meta) {
+                enrichFromMeta(meta);
+                const cur = stateRef.current?.modal;
+                if (cur && cur.metaId === id.split(':')[0]) {
+                    dispatch({ type: 'SHOW_MODAL', modal: { ...cur, ...cardMeta, title: localizedTitle(id, meta.name, cur.title), poster: meta.poster || cur.poster } });
+                }
+            }
+        }
+    }, [client, state.selectedType, loadStreams]);
+
+    // Bridge from an AI recommendation card to the existing stream-loading
+    // flow. AI items carry video_id (IMDB) / title / poster / plot / reason
+    // / rating, which we shape into the catalog-item contract cardClick
+    // expects.
+    const handleAICardClick = useCallback((aiItem) => {
+        if (!aiItem?.video_id) return;
+        cardClick({
+            id: aiItem.video_id,
+            name: aiItem.title,
+            poster: aiItem.poster,
+            type: aiItem.type || 'movie',
+            year: aiItem.year,
+            imdbRating: aiItem.rating,
+            description: aiItem.plot,
+        });
+    }, [cardClick]);
+
+    const openModalById = useCallback(async (id) => {
+        // Try to find the item in loaded items or search results
+        const item = state.items.find(i => i.id === id)
+            || state.searchResults.find(i => i.id === id);
+        const ep = modalEpisodeRef.current;
+        modalEpisodeRef.current = null;
+
+        if (ep) {
+            // Restore directly to streams for a specific episode, fetching meta for back-nav
+            const type = item?.type || state.selectedType || 'series';
+            const epId = `${id}:${ep.season}:${ep.episode}`;
+            const name = item?.name || id;
+            const epName = `${name} - ${Number(ep.season) === 0 ? 'Specials' : `S${ep.season}`} E${ep.episode}`;
+            const poster = item?.poster;
+            if (url.isPopstate.current) {
+                url.replace({ id, season: ep.season, episode: ep.episode });
+            } else {
+                url.push({ season: ep.season, episode: ep.episode });
+            }
+
+            // Fetch meta in parallel with stream loading so we can offer "back to episodes"
+            const metaPromise = client.fetchMeta(type, id).catch(() => null);
+
+            await loadStreams(type, epId, { name: epName, poster, year: item?.year, releaseInfo: item?.releaseInfo, imdbRating: item?.imdbRating, description: item?.description }, {});
+
+            const meta = await metaPromise;
+            if (meta?.videos?.length > 0) {
+                const backToEpisodes = { title: name, poster, meta, itemId: id, itemType: type, season: ep.season, year: item?.year, releaseInfo: item?.releaseInfo, imdbRating: item?.imdbRating, description: item?.description };
+                const cur = stateRef.current?.modal;
+                if (cur) dispatch({ type: 'SHOW_MODAL', modal: { ...cur, backToEpisodes } });
+            }
+        } else if (item) {
+            cardClick(item);
+        } else {
+            // Item not in loaded data — open with minimal info, modal will load via API
+            cardClick({ id, name: id, type: state.selectedType });
+        }
+    }, [client, state.items, state.searchResults, state.selectedType, cardClick, loadStreams]);
+
+    const onEpisodeSelect = useCallback(async (episode, item) => {
+        const type = item.itemType || 'series';
+        const epId = episode.id || `${item.itemId}:${episode.season}:${episode.episode}`;
+        const epName = `${item.title} - ${Number(episode.season) === 0 ? 'Specials' : `S${episode.season || '?'}`} E${episode.episode || '?'}`;
+        // tab: null — drilling into an episode leaves the reviews tab of the
+        // episodes view behind; the episode's streams open on the primary tab.
+        url.push({ season: episode.season, episode: episode.episode, tab: null });
+
+        const backToEpisodes = {
+            title: item.title,
+            poster: item.poster,
+            meta: item.meta,
+            itemId: item.itemId,
+            itemType: item.itemType,
+            season: episode.season,
+            year: item.year,
+            releaseInfo: item.releaseInfo,
+            imdbRating: item.imdbRating,
+            description: item.description,
+        };
+
+        await loadStreams(type, epId, { name: epName, poster: item.poster, year: item.year, releaseInfo: item.releaseInfo, imdbRating: item.imdbRating, description: item.description }, { backToEpisodes });
+    }, [loadStreams]);
+
+    // Direct jump to the episodes view — NOT history.back(): the history
+    // may contain tab-switch entries (?tab=reviews), and the button
+    // promises "Episodes", not "previous step". Pushes a proper episodes
+    // URL so browser-back from there returns to these streams.
+    const onBackToEpisodes = useCallback(() => {
+        const back = modalRef.current?.backToEpisodes;
+        if (!back) {
+            window.history.back();
+            return;
+        }
+        url.push({ episode: null, tab: null });
+        dispatch({ type: 'SHOW_MODAL', modal: episodesModalFromBack(back) });
+    }, []);
+
+    const onSeasonChange = useCallback((season) => {
+        url.push({ season, episode: null });
+    }, []);
+
+    const handleStreamClick = useCallback(async (infoHash, fileIdx) => {
+        const currentTitle = state.modal?.title;
+        const currentPoster = state.modal?.poster;
+        const currentBackToEpisodes = state.modal?.backToEpisodes;
+        const currentIdentity = modalIdentity(state.modal);
+
+        dispatch({ type: 'SHOW_MODAL', modal: {
+            view: 'progress', title: currentTitle, poster: currentPoster, ...currentIdentity, logUrl: null, fileIdx: fileIdx != null ? fileIdx : null,
+        }});
+
+        try {
+            const formData = new FormData();
+            formData.append('resource', infoHash);
+            formData.append('_csrf', window._CSRF);
+            const metaId = state.modal?.metaId;
+            if (metaId) formData.append('hint_video_id', metaId);
+            const response = await fetch(langPath('/'), {
+                method: 'POST',
+                body: formData,
+                headers: {
+                    'Accept': 'application/json',
+                    'X-CSRF-TOKEN': window._CSRF,
+                },
+            });
+
+            if (!response.ok) throw new Error('POST failed');
+            const data = await response.json();
+            const logUrl = data.job_log_url;
+            if (!logUrl) throw new Error('No job log URL');
+
+            dispatch({ type: 'SHOW_MODAL', modal: {
+                view: 'progress', title: currentTitle, poster: currentPoster, ...currentIdentity, logUrl, fileIdx: fileIdx != null ? fileIdx : null,
+            }});
+        } catch (e) {
+            dispatch({ type: 'SHOW_MODAL', modal: {
+                view: 'streams', title: currentTitle, poster: currentPoster, ...currentIdentity, streams: [],
+                error: t('discover.resourcePrepError'),
+                backToEpisodes: currentBackToEpisodes,
+            }});
+        }
+    }, [state.modal]);
+
+    const closeModal = useCallback(() => {
+        streamGenRef.current++;
+        if (streamAbortRef.current) {
+            streamAbortRef.current.abort();
+            streamAbortRef.current = null;
+        }
+        dispatch({ type: 'CLOSE_MODAL' });
+        url.replace({ id: null, season: null, episode: null, tab: null });
+    }, []);
+
+    // Primary ⇄ reviews tab inside the stream modal. The tab lives in the
+    // ?tab= URL param (pushed, so browser back/forward walks the tabs) and
+    // mirrors into modal.tab for rendering — stored as 'reviews' or
+    // undefined, never a primary marker.
+    const handleModalTabChange = useCallback((tab) => {
+        const m = modalRef.current;
+        if (!m) return;
+        const reviews = tab === 'reviews';
+        dispatch({ type: 'SHOW_MODAL', modal: { ...m, tab: reviews ? 'reviews' : undefined } });
+        url.push({ tab: reviews ? 'reviews' : null });
+        if (reviews) window.umami?.track('discover-reviews-expand', { id: m.metaId || m.itemId });
+    }, []);
+
+    const selectSearchType = useCallback((searchType) => {
+        url.push({ 'search-type': searchType === 'all' ? null : searchType });
+        dispatch({ type: 'SELECT_SEARCH_TYPE', searchType });
+    }, []);
+
+    // Keep refs in sync for popstate handler
+    modalRef.current = state.modal;
+    openModalByIdRef.current = openModalById;
+    performSearchRef.current = performSearch;
+    stateRef.current = state;
+
+    // --- Browser back/forward ---
+    url.onPopstate((urlParams) => {
+        const id = urlParams.get('id');
+        const season = urlParams.get('season');
+        const episode = urlParams.get('episode');
+        const type = urlParams.get('type');
+        const catalogBase = urlParams.get('catalog-base');
+        const catalogId = urlParams.get('catalog-id');
+        const search = urlParams.get('search');
+        const searchType = urlParams.get('search-type');
+        const watchlist = urlParams.get('watchlist') === '1';
+        const watchlistType = urlParams.get('watchlist-type');
+
+        const cur = stateRef.current;
+
+        // Tab-only history steps (primary ⇄ reviews within the same open
+        // modal view) must not re-open the modal — just sync the tab. The
+        // view-shape check (episode param ↔ modal view) keeps this from
+        // swallowing steps that also cross the episodes ⇄ streams boundary.
+        const urlTab = reviewsTab(urlParams);
+        const curModal = modalRef.current;
+        const sameModalView = curModal && (
+            curModal.view === 'streams'
+                ? (!!episode || !curModal.backToEpisodes)
+                : (curModal.view === 'episodes' && !episode)
+        );
+        if (id && sameModalView &&
+            (curModal.metaId === id || curModal.itemId === id) &&
+            (curModal.tab === 'reviews' ? 'reviews' : undefined) !== urlTab) {
+            dispatch({ type: 'SHOW_MODAL', modal: { ...curModal, tab: urlTab } });
+            return;
+        }
+
+        // Handle watchlist mode toggle. We do this before search so back
+        // navigation from a search-while-watchlist-open lands correctly.
+        if (watchlist !== cur.watchlistFilterEnabled) {
+            url.withPopstate(() => setMode(watchlist ? 'watchlist' : 'catalog', { skipUrl: true }));
+        }
+        if (watchlist) {
+            const targetWlType = watchlistType || 'all';
+            if (targetWlType !== (cur.watchlistType || 'all')) {
+                dispatch({ type: 'SELECT_WATCHLIST_TYPE', watchlistType: targetWlType });
+            }
+            // No catalog/search restoration applies to the watchlist view —
+            // bail out so the rest of the handler doesn't try.
+            if (id && modalRef.current?.itemId !== id) {
+                url.withPopstate(() => openModalByIdRef.current(id));
+            } else if (!id && modalRef.current) {
+                dispatch({ type: 'CLOSE_MODAL' });
+            }
+            return;
+        }
+
+        // Handle search mode
+        if (search) {
+            if (!cur.isSearchMode || cur.searchQuery !== search) {
+                url.withPopstate(() => performSearchRef.current(search));
+            }
+            const targetType = searchType || 'all';
+            if (targetType !== (cur.searchType || 'all')) {
+                dispatch({ type: 'SELECT_SEARCH_TYPE', searchType: targetType });
+            }
+            // Handle modal within search results
+            if (id && season && episode) {
+                modalEpisodeRef.current = { season, episode };
+                url.withPopstate(() => openModalByIdRef.current(id));
+            } else if (id) {
+                url.withPopstate(() => openModalByIdRef.current(id));
+            } else if (modalRef.current) {
+                dispatch({ type: 'CLOSE_MODAL' });
+            }
+            return;
+        }
+
+        // If no search param but currently in search mode — exit search
+        if (cur.isSearchMode) {
+            url.withPopstate(() => { abortCatalog(); dispatch({ type: 'EXIT_SEARCH' }); });
+        }
+
+        // Handle type change
+        if (type && cur && type !== cur.selectedType) {
+            const types = getTypes(cur.catalogs);
+            if (types.includes(type)) {
+                savePrefs({ type });
+                dispatch({ type: 'SELECT_TYPE', selectedType: type });
+            }
+        }
+
+        // Handle catalog change
+        if (catalogBase && catalogId && cur) {
+            const curCat = cur.selectedCatalog;
+            if (!curCat || curCat.baseUrl !== catalogBase || curCat.id !== catalogId) {
+                const match = getCatalogsForType(cur.catalogs, type || cur.selectedType)
+                    .find(c => c.baseUrl === catalogBase && c.id === catalogId);
+                if (match) {
+                    savePrefs({ catalogBase: match.baseUrl, catalogId: match.id });
+                    dispatch({ type: 'SELECT_CATALOG', catalog: match });
+                }
+            }
+        }
+
+        // Handle modal state
+        if (!id) {
+            if (modalRef.current) {
+                dispatch({ type: 'CLOSE_MODAL' });
+            }
+            return;
+        }
+
+        if (id && season && episode) {
+            modalEpisodeRef.current = { season, episode };
+            url.withPopstate(() => openModalByIdRef.current(id));
+        } else if (id) {
+            const currentModal = modalRef.current;
+            if (currentModal?.view === 'episodes' && currentModal?.itemId === id) {
+                // Same series, navigating between seasons — force remount via _seasonKey
+                dispatch({
+                    type: 'SHOW_MODAL',
+                    modal: {
+                        ...currentModal,
+                        defaultSeason: season != null ? Number(season) : undefined,
+                        _seasonKey: Date.now(),
+                    },
+                });
+            } else if (currentModal?.backToEpisodes) {
+                dispatch({
+                    type: 'SHOW_MODAL',
+                    modal: episodesModalFromBack(currentModal.backToEpisodes, {
+                        tab: urlTab,
+                        defaultSeason: season != null ? Number(season) : undefined,
+                    }),
+                });
+            } else {
+                url.withPopstate(() => openModalByIdRef.current(id));
+            }
+        }
+    });
+
+    // --- Restore pages from URL: after each catalog load, if pages remain, trigger another loadMore ---
+    useEffect(() => {
+        if (state.phase !== 'ready') return;
+        if (state.catalogLoading) return;
+        if (state.isSearchMode) return;
+        if (state.items.length === 0) return;
+
+        if (restoredPageRef.current > 0 && state.hasMore) {
+            restoredPageRef.current--;
+            restoreInProgressRef.current = true;
+            loadCatalog(state.selectedCatalog, state.items.length, state.items);
+            return;
+        }
+
+        // Pages done (or were 0). Restore modal if needed.
+        if (restoreInProgressRef.current) {
+            restoreInProgressRef.current = false;
+        }
+        if (modalItemIdRef.current) {
+            const id = modalItemIdRef.current;
+            modalItemIdRef.current = null;
+            restoreModalFromUrl(id, url, openModalById, modalEpisodeRef);
+        }
+    }, [state.phase, state.catalogLoading, state.isSearchMode, state.items.length, loadCatalog, openModalById]);
+
+    // Restore modal from URL after search results load
+    useEffect(() => {
+        if (state.phase !== 'ready') return;
+        if (!state.isSearchMode) return;
+        if (state.searchLoading) return;
+        if (!modalItemIdRef.current) return;
+        if (state.searchResults.length === 0) return;
+
+        const id = modalItemIdRef.current;
+        modalItemIdRef.current = null;
+        restoreModalFromUrl(id, url, openModalById, modalEpisodeRef);
+    }, [state.phase, state.isSearchMode, state.searchLoading, state.searchResults.length, openModalById]);
+
+    // Sync state to URL
+    useEffect(() => {
+        if (state.phase !== 'ready') return;
+        // Don't overwrite URL during page/modal restore
+        if (restoreInProgressRef.current) return;
+
+        const params = {};
+        if (state.isSearchMode) {
+            if (state.searchQuery) params.search = state.searchQuery;
+            if (state.searchType && state.searchType !== 'all') params['search-type'] = state.searchType;
+        } else if (state.watchlistFilterEnabled) {
+            params.watchlist = '1';
+            if (state.watchlistType && state.watchlistType !== 'all') params['watchlist-type'] = state.watchlistType;
+        } else {
+            if (state.selectedType) params.type = state.selectedType;
+            if (state.selectedCatalog) {
+                params['catalog-base'] = state.selectedCatalog.baseUrl;
+                params['catalog-id'] = state.selectedCatalog.id;
+            }
+            if (state.page > 0) params.page = state.page;
+        }
+
+        // Preserve modal params if present
+        const cur = new URLSearchParams(window.location.search);
+        ['id', 'season', 'episode', 'tab'].forEach(k => { const v = cur.get(k); if (v != null) params[k] = v; });
+
+        url.replaceAll(params);
+    }, [state.phase, state.selectedType, state.selectedCatalog, state.isSearchMode, state.searchQuery, state.searchType, state.watchlistFilterEnabled, state.watchlistType, state.page]);
+
+    const retry = useCallback(() => {
+        dispatch({ type: 'SET_PHASE', phase: 'loading' });
+        client.manifests = null;
+        prevCatalogRef.current = null;
+        (async () => {
+            try {
+                const { manifests, catalogs, types, addons } = await loadManifests(client);
+                if (!types.length) {
+                    dispatch({ type: 'ADDONS_UPDATED', addons });
+                    dispatch({ type: 'SET_PHASE', phase: 'no-catalogs' });
+                    return;
+                }
+                const selectedType = types[0];
+                const selectedCatalog = getCatalogsForType(catalogs, selectedType)[0] || null;
+                dispatch({ type: 'INIT_SUCCESS', manifests, catalogs, selectedType, selectedCatalog, addons, viewMode: getViewMode() });
+            } catch (e) {
+                dispatch({ type: 'INIT_ERROR', message: t('discover.manifestLoadError') });
+            }
+        })();
+    }, [client]);
+
+    // Re-fetches streams for the currently-open modal. Used by the
+    // "Retry" button in StreamModal when one or more addons failed during
+    // the initial fetch. We refresh manifests first so newly-recovered
+    // addons are picked up; then re-issue loadStreams using the same
+    // identifiers we got from the URL on first load.
+    const retryStreams = useCallback(async () => {
+        const m = stateRef.current?.modal;
+        if (!m) return;
+        try {
+            const { manifests, catalogs, types, addons } = await loadManifests(client);
+            // Update health surfaces; keep current page selection.
+            dispatch({ type: 'ADDONS_UPDATED', addons });
+        } catch { /* ignore — retry can still hit live addons */ }
+
+        const params = new URLSearchParams(window.location.search);
+        const id = params.get('id');
+        const season = params.get('season');
+        const episode = params.get('episode');
+        if (!id) return;
+        const streamId = (season != null && episode != null) ? `${id}:${season}:${episode}` : id;
+        const type = m.backToEpisodes?.itemType || m.itemType || stateRef.current?.selectedType;
+        const item = {
+            id: streamId,
+            name: m.title,
+            poster: m.poster,
+            year: m.year,
+            releaseInfo: m.releaseInfo,
+            imdbRating: m.imdbRating,
+            description: m.description,
+        };
+        await loadStreams(type, streamId, item, m.backToEpisodes ? { backToEpisodes: m.backToEpisodes } : {});
+    }, [client]);
+
+    // Lightweight retry triggered from the AddonHealthChip — does NOT drop
+    // the user back into the loading view. Re-fetches manifests, updates
+    // addon health + catalog disabled flags, and (if a previously selected
+    // catalog comes back online) reloads it. Used when one or more addons
+    // were down and the user clicks "Retry" inline.
+    const retryAddons = useCallback(async () => {
+        try {
+            client.manifests = null;
+            const { manifests, catalogs, types, addons } = await loadManifests(client);
+            // Preserve the user's current type/catalog selection if it
+            // still exists in the new catalog list, otherwise fall back
+            // to the first available.
+            const cur = stateRef.current;
+            let selectedType = cur?.selectedType;
+            if (!selectedType || !types.includes(selectedType)) selectedType = types[0] || null;
+            let selectedCatalog = cur?.selectedCatalog;
+            if (selectedCatalog) {
+                const match = catalogs.find(c => c.baseUrl === selectedCatalog.baseUrl && c.id === selectedCatalog.id && c.type === selectedType);
+                selectedCatalog = match || (selectedType ? getCatalogsForType(catalogs, selectedType)[0] || null : null);
+            } else if (selectedType) {
+                selectedCatalog = getCatalogsForType(catalogs, selectedType)[0] || null;
+            }
+            if (!types.length) {
+                dispatch({ type: 'ADDONS_UPDATED', addons });
+                dispatch({ type: 'SET_PHASE', phase: 'no-catalogs' });
+                return;
+            }
+            // Force a fresh catalog load when the previous selection
+            // becomes available again or changes.
+            prevCatalogRef.current = null;
+            dispatch({ type: 'INIT_SUCCESS', manifests, catalogs, selectedType, selectedCatalog, addons, viewMode: stateRef.current?.viewMode });
+        } catch (e) {
+            // Keep the page rendered as-is; chip retains failure state.
+        }
+    }, [client]);
+
+    // --- Wizard callbacks ---
+    const onWizardComplete = useCallback(async (savedUrls, result) => {
+        setShowWizard(false);
+        setAddonsInstalled(true);
+        if (result && window.toast) {
+            const msg = `${result.added} addon${result.added !== 1 ? 's' : ''} added${result.skipped > 0 ? `, ${result.skipped} skipped` : ''}${result.limitReached ? ' (free tier limit reached)' : ''}`;
+            window.toast.success(msg);
+        }
+        // Add new URLs to client (strip /manifest.json suffix)
+        for (const u of savedUrls) {
+            const base = u.replace(/\/manifest\.json$/, '');
+            if (!client.addonUrls.includes(base)) {
+                client.addonUrls.push(base);
+            }
+        }
+
+        const pending = pendingStreamRef.current;
+        pendingStreamRef.current = null;
+
+        if (pending) {
+            // Came from "Set up addons" in stream modal — silently refresh manifests,
+            // keep current type/catalog, just reload streams
+            try {
+                const manifests = await client.fetchAllManifests();
+                client.manifests = manifests;
+            } catch (e) { /* streams may still work */ }
+
+            // Same identity-carry as handleStreamClick: pending.modal holds
+            // the full pre-wizard modal, so the recreated modal keeps the
+            // watched/rate buttons and reviews tab alive.
+            const pendingIdentity = {
+                ...modalIdentity(pending.modal),
+                itemType: pending.modal?.itemType || pending.type,
+            };
+            dispatch({ type: 'SHOW_MODAL', modal: { view: 'loading', title: pending.title, poster: pending.poster, ...pendingIdentity, subtitle: 'Loading streams...' } });
+            let streams = [];
+            for (let attempt = 0; attempt < 3; attempt++) {
+                try {
+                    streams = await client.fetchStreams(pending.type, pending.streamId);
+                } catch (e) {
+                    streams = [];
+                }
+                if (streams.length > 0) break;
+                if (attempt < 2) await new Promise(r => setTimeout(r, 2000));
+            }
+            streams = await withCached(streams);
+            dispatch({ type: 'SHOW_MODAL', modal: {
+                view: 'streams', title: pending.title, poster: pending.poster, ...pendingIdentity, streams,
+                backToEpisodes: pending.backToEpisodes,
+            } });
+            // Restore URL params so browser back returns to this modal
+            url.push({ id: pending.id, season: pending.season, episode: pending.episode });
+        } else {
+            // Initial wizard (page load) — full re-init to populate catalogs
+            client.manifests = null;
+            prevCatalogRef.current = null;
+            dispatch({ type: 'SET_PHASE', phase: 'loading' });
+            try {
+                const { manifests, catalogs, types, addons } = await loadManifests(client);
+                if (!types.length) {
+                    dispatch({ type: 'ADDONS_UPDATED', addons });
+                    dispatch({ type: 'SET_PHASE', phase: 'no-catalogs' });
+                    return;
+                }
+                const selectedType = types[0];
+                const selectedCatalog = getCatalogsForType(catalogs, selectedType)[0] || null;
+                dispatch({ type: 'INIT_SUCCESS', manifests, catalogs, selectedType, selectedCatalog, addons, viewMode: getViewMode() });
+            } catch (e) {
+                dispatch({ type: 'INIT_ERROR', message: t('discover.manifestLoadError') });
+            }
+        }
+    }, [client]);
+
+    const onWizardSkip = useCallback(() => {
+        setShowWizard(false);
+        const pending = pendingStreamRef.current;
+        if (pending) {
+            pendingStreamRef.current = null;
+            dispatch({ type: 'SHOW_MODAL', modal: pending.modal });
+            url.push({ id: pending.id, season: pending.season, episode: pending.episode });
+        }
+    }, []);
+
+    const onSetupAddons = useCallback(() => {
+        const params = new URLSearchParams(window.location.search);
+        const id = params.get('id');
+        if (id) {
+            const season = params.get('season');
+            const episode = params.get('episode');
+            // For episodes, stream ID is "tt123:season:episode"
+            const streamId = (season != null && episode != null) ? `${id}:${season}:${episode}` : id;
+            const type = state.modal?.backToEpisodes?.itemType || state.selectedType;
+            pendingStreamRef.current = {
+                streamId,
+                type,
+                title: state.modal?.title,
+                poster: state.modal?.poster,
+                backToEpisodes: state.modal?.backToEpisodes,
+                id,
+                season,
+                episode,
+                modal: state.modal,
+            };
+        }
+        closeModal();
+        setShowWizard(true);
+    }, [state.modal, state.selectedType, closeModal]);
+
+    // --- Watched / Rating ---
+    const handleToggleWatched = useCallback(async (item) => {
+        const type = item.type || state.selectedType;
+        const currentlyWatched = state.userStatuses[item.id]?.watched || false;
+        const prev = state.userStatuses[item.id];
+
+        if (currentlyWatched) {
+            // Unmark: clear watched + rating (server deletes entire status row)
+            dispatch({ type: 'USER_STATUSES_MERGED', statuses: {
+                [item.id]: { watched: false, rating: 0 },
+            }});
+            const result = await toggleWatched(item.id, type, true);
+            if (!result) {
+                dispatch({ type: 'USER_STATUSES_MERGED', statuses: { [item.id]: { ...prev } } });
+            }
+        } else {
+            // Mark watched, then prompt for rating
+            dispatch({ type: 'USER_STATUSES_MERGED', statuses: {
+                [item.id]: { ...prev, watched: true },
+            }});
+            const result = await toggleWatched(item.id, type, false);
+            if (result) {
+                if (result.rateForm) setRatingTarget({ item, type, currentRating: 0 });
+            } else {
+                dispatch({ type: 'USER_STATUSES_MERGED', statuses: { [item.id]: { ...prev } } });
+            }
+        }
+    }, [state.selectedType, state.userStatuses]);
+
+    const handleOpenRating = useCallback((item) => {
+        const type = item.type || state.selectedType;
+        const currentRating = state.userStatuses[item.id]?.rating || 0;
+        setRatingTarget({ item, type, currentRating });
+    }, [state.selectedType, state.userStatuses]);
+
+    // AI shims for watched / rating. Defined AFTER handleToggleWatched and
+    // handleOpenRating because those const useCallbacks live in the same
+    // function scope and JavaScript's temporal dead zone would otherwise
+    // throw on first render — the upstream declarations are further down
+    // the file.
+    const handleAIToggleWatched = useCallback((aiItem) => {
+        if (!aiItem?.video_id) return;
+        handleToggleWatched({
+            id: aiItem.video_id,
+            type: aiItem.type || 'movie',
+        });
+    }, [handleToggleWatched]);
+
+    const handleAIOpenRating = useCallback((aiItem) => {
+        if (!aiItem?.video_id) return;
+        handleOpenRating({
+            id: aiItem.video_id,
+            type: aiItem.type || 'movie',
+        });
+    }, [handleOpenRating]);
+
+    // --- Watchlist ---
+    // Cheap prefetch on mount: ids only, for bookmark-badge highlighting on
+    // every IMDB card across catalog / search / AI grids. We don't pull the
+    // full items here — that's lazy on toggle-on (loadWatchlistItems below).
+    useEffect(() => {
+        let cancelled = false;
+        fetchWatchlistIds().then(({ ids, limit }) => {
+            if (cancelled) return;
+            dispatch({ type: 'WATCHLIST_IDS_LOADED', ids, limit });
+        });
+        return () => { cancelled = true; };
+    }, []);
+
+    // Same cheap prefetch for subscriptions: which bells are already filled.
+    // Keys only — the rows themselves belong to the profile page.
+    useEffect(() => {
+        let cancelled = false;
+        fetchSubscriptionIds().then(({ keys }) => {
+            if (cancelled) return;
+            dispatch({ type: 'SUBSCRIPTIONS_LOADED', keys });
+        });
+        return () => { cancelled = true; };
+    }, []);
+
+    const loadWatchlistItems = useCallback(async () => {
+        const data = await fetchWatchlist();
+        dispatch({ type: 'WATCHLIST_ITEMS_LOADED', items: data.items, ids: data.ids, limit: data.limit });
+    }, []);
+
+    // If the watchlist view is active (either via direct URL or popstate)
+    // and items aren't loaded yet, fetch them. Covers the init-from-URL
+    // path where setMode wasn't the trigger.
+    useEffect(() => {
+        if (!state.watchlistFilterEnabled) return;
+        if (state.watchlistItemsLoaded) return;
+        loadWatchlistItems();
+    }, [state.watchlistFilterEnabled, state.watchlistItemsLoaded, loadWatchlistItems]);
+
+    // setMode flips between the catalog grid and the watchlist grid. It is
+    // the single entry point used by the Catalog | Watchlist switcher and
+    // by popstate (so back/forward navigation restores the correct view).
+    // Lazy-loads watchlist items the first time the user opens the view;
+    // subsequent switches just flip the boolean.
+    //
+    // skipUrl is set by the popstate handler so we don't push a redundant
+    // history entry while we're consuming the URL state.
+    const setMode = useCallback((mode, { skipUrl = false } = {}) => {
+        const wantWatchlist = mode === 'watchlist';
+        if (wantWatchlist === state.watchlistFilterEnabled) return;
+        window.umami?.track?.('watchlist-mode-changed', { mode });
+        if (!skipUrl) {
+            // Switching modes is a navigation event — push history so back
+            // returns to the previous view. Clear catalog and modal params
+            // when entering watchlist (they don't apply); on the way out
+            // they get restored from prefs by the catalog effect.
+            url.push(wantWatchlist
+                ? { watchlist: '1', 'catalog-base': null, 'catalog-id': null, type: null, page: null, id: null, season: null, episode: null }
+                : { watchlist: null, id: null, season: null, episode: null });
+        }
+        dispatch({ type: 'WATCHLIST_FILTER_SET', enabled: wantWatchlist });
+        if (wantWatchlist && !state.watchlistItemsLoaded) {
+            loadWatchlistItems();
+        }
+    }, [state.watchlistFilterEnabled, state.watchlistItemsLoaded, loadWatchlistItems]);
+
+    // handleToggleWatchlist accepts a Cinemeta-shape item ({id, type, name,
+    // poster, ...}) OR an AI shape ({video_id, title, poster, type, ...})
+    // and normalises before calling the server. Both shapes flow through
+    // the same code path because catalog + AI cards use the same toggle
+    // affordance.
+    const handleToggleWatchlist = useCallback(async (rawItem) => {
+        if (!rawItem) return;
+        const videoId = rawItem.id || rawItem.video_id;
+        if (!videoId || !videoId.startsWith('tt')) return;
+        const type = rawItem.type || state.selectedType || 'movie';
+        if (type !== 'movie' && type !== 'series') return;
+
+        const inList = state.watchlistIds.has(videoId);
+        // Determine source bucket for analytics: AI cards have video_id,
+        // catalog/search cards have id.
+        const source = rawItem.video_id ? 'ai' : (state.isSearchMode ? 'search' : 'catalog');
+
+        // Toast text always comes from the server response — server-side
+        // i18n.T(c, key) keeps the locale aligned with the page even when
+        // the user changes language mid-session. We only fall back to a
+        // generic English message when the server didn't respond at all
+        // (network failure → empty message), which mirrors the apiPost
+        // pattern in discoverUtils.js.
+        if (inList) {
+            const snapshot = state.watchlistItems.find(it => it.id === videoId);
+            dispatch({ type: 'WATCHLIST_REMOVE', videoId });
+            window.umami?.track?.('watchlist-removed', { id: videoId, source });
+            const result = await removeFromWatchlist(videoId, type);
+            if (!result.ok) {
+                if (snapshot) dispatch({ type: 'WATCHLIST_ADD', item: snapshot });
+                if (window.toast) window.toast.error(result.message || t('discover.networkError'));
+            } else if (window.toast && result.message) {
+                window.toast.success(result.message);
+            }
+        } else {
+            const item = {
+                id: videoId,
+                type,
+                name: rawItem.name || rawItem.title || '',
+                year: rawItem.year,
+                poster: rawItem.poster || `/lib/${type}/poster/${videoId}/500.jpg`,
+                imdbRating: rawItem.imdbRating != null ? rawItem.imdbRating : (rawItem.rating || undefined),
+            };
+            dispatch({ type: 'WATCHLIST_ADD', item });
+            window.umami?.track?.('watchlist-added', { id: videoId, source });
+            const result = await addToWatchlist(videoId, type, source);
+            if (!result.ok) {
+                dispatch({ type: 'WATCHLIST_REMOVE', videoId });
+                if (window.toast) window.toast.error(result.message || t('discover.networkError'));
+            } else if (window.toast && result.message) {
+                window.toast.success(result.message);
+            }
+        }
+    }, [state.watchlistIds, state.watchlistItems, state.selectedType, state.isSearchMode]);
+
+    // handleToggleSubscription drives every subscribe affordance in the
+    // modal: the bell next to an airing season, and the two empty states.
+    // The target is {kind, videoId, season, source}; the key it maps to is
+    // what the Set holds.
+    //
+    // subscriptionToggling holds the keys with a request in flight. Unlike
+    // the watchlist toggle, a bell race has an ongoing side effect: a
+    // double-click whose DELETE overtakes its own POST leaves the server
+    // subscribed (the DELETE finds nothing yet still answers success, by
+    // design) while the bell shows off — and the emails keep coming.
+    // Dropping the second click until the first settles is the whole fix.
+    const subscriptionToggling = useRef(new Set());
+    const handleToggleSubscription = useCallback(async (target) => {
+        if (!target || !target.videoId || !target.videoId.startsWith('tt')) return;
+        const key = subscriptionKey(target.kind, target.videoId, target.season);
+        if (subscriptionToggling.current.has(key)) return;
+        subscriptionToggling.current.add(key);
+        try {
+            const subscribed = state.subscriptionKeys.has(key);
+
+            if (subscribed) {
+                dispatch({ type: 'SUBSCRIPTION_REMOVE', key });
+                window.umami?.track?.('release-sub-removed', { kind: target.kind, id: target.videoId, source: target.source });
+                const result = await unsubscribe(target);
+                if (!result.ok) {
+                    dispatch({ type: 'SUBSCRIPTION_ADD', key });
+                    if (window.toast) window.toast.error(result.message || t('discover.networkError'));
+                } else if (window.toast && result.message) {
+                    window.toast.success(result.message);
+                }
+                return;
+            }
+
+            dispatch({ type: 'SUBSCRIPTION_ADD', key });
+            window.umami?.track?.('release-sub-created', { kind: target.kind, id: target.videoId, source: target.source });
+            const result = await subscribe(target);
+            if (!result.ok) {
+                // Rolled back on every refusal — the cap, a season that turned
+                // out to be over, a network failure. The message is the
+                // server's, so it explains which.
+                dispatch({ type: 'SUBSCRIPTION_REMOVE', key });
+                if (result.code === 'limit_exceeded') {
+                    window.umami?.track?.('release-sub-limit-hit', { limit: result.limit });
+                }
+                if (window.toast) window.toast.error(result.message || t('discover.networkError'));
+            } else if (window.toast && result.message) {
+                window.toast.success(result.message);
+            }
+        } finally {
+            subscriptionToggling.current.delete(key);
+        }
+    }, [state.subscriptionKeys]);
+
+    const handleRate = useCallback(async (rating) => {
+        if (!ratingTarget) return;
+        const { item, type } = ratingTarget;
+        setRatingTarget(null);
+        const prevStatus = state.userStatuses[item.id];
+        dispatch({ type: 'USER_STATUSES_MERGED', statuses: {
+            [item.id]: { ...prevStatus, watched: true, rating },
+        }});
+        const ok = await rateVideo(item.id, type, rating);
+        if (!ok) {
+            dispatch({ type: 'USER_STATUSES_MERGED', statuses: { [item.id]: { ...prevStatus } } });
+        }
+    }, [ratingTarget, state.userStatuses]);
+
+    const handleUnrate = useCallback(async () => {
+        if (!ratingTarget) return;
+        const { item, type } = ratingTarget;
+        setRatingTarget(null);
+        const prev = state.userStatuses[item.id];
+        dispatch({ type: 'USER_STATUSES_MERGED', statuses: {
+            [item.id]: { ...prev, rating: 0 },
+        }});
+        const ok = await unrateVideo(item.id, type);
+        if (!ok) {
+            dispatch({ type: 'USER_STATUSES_MERGED', statuses: { [item.id]: { ...prev } } });
+        }
+    }, [ratingTarget, state.userStatuses]);
+
+    const handleCloseRating = useCallback(() => {
+        setRatingTarget(null);
+    }, []);
+
+    // --- Derived data ---
+    const types = useMemo(() => getTypes(state.catalogs), [state.catalogs]);
+    const catalogsForType = useMemo(() => getCatalogsForType(state.catalogs, state.selectedType), [state.catalogs, state.selectedType]);
+
+    const searchTypes = useMemo(() => getSearchTypes(state.searchResults), [state.searchResults]);
+    const watchlistTypes = useMemo(() => getSearchTypes(state.watchlistItems), [state.watchlistItems]);
+
+    const displayItems = useMemo(() => {
+        let items;
+        if (state.isSearchMode) {
+            items = state.searchType === 'all'
+                ? state.searchResults
+                : getSearchResultsForType(state.searchResults, state.searchType);
+        } else if (state.watchlistFilterEnabled) {
+            items = state.watchlistType === 'all'
+                ? state.watchlistItems
+                : getSearchResultsForType(state.watchlistItems, state.watchlistType);
+        } else {
+            items = state.items;
+        }
+        return overlayLocalized(items, state.localized);
+    }, [state.isSearchMode, state.items, state.searchResults, state.searchType,
+        state.watchlistFilterEnabled, state.watchlistItems, state.watchlistType,
+        state.localized]);
+
+    const showBadges = useMemo(() => {
+        if (state.isSearchMode) return state.searchType === 'all';
+        if (state.watchlistFilterEnabled) return state.watchlistType === 'all';
+        return false;
+    }, [state.isSearchMode, state.searchType, state.watchlistFilterEnabled, state.watchlistType]);
+
+    const selectWatchlistType = useCallback((wt) => {
+        dispatch({ type: 'SELECT_WATCHLIST_TYPE', watchlistType: wt });
+    }, []);
+
+    // Calendar view: a per-user series-only mode. Persisted globally (one
+    // preference for every series catalog) so the user picks once and the
+    // setting follows them. The Calendar button stays visible on non-
+    // series catalogs as a discoverability cue; the handler no-ops the
+    // click while still letting the native title tooltip fire on hover.
+    const selectViewMode = useCallback((mode) => {
+        if (mode !== 'grid' && mode !== 'calendar') return;
+        if (mode === state.viewMode) return;
+        savePrefs({ viewMode: mode });
+        window.umami?.track?.(mode === 'calendar' ? 'discover-view-mode-calendar' : 'discover-view-mode-grid');
+        dispatch({ type: 'SET_VIEW_MODE', viewMode: mode });
+    }, [state.viewMode]);
+
+    // Bridges a CalendarView episode click into the same stream-loading
+    // flow the episodes-modal uses (onEpisodeSelect). We get to skip the
+    // intermediate "Select an episode" view since the user already picked
+    // a specific S/E from the timeline. Meta is forwarded from the
+    // CalendarView fetch so backToEpisodes works without a refetch.
+    const openEpisodeFromCalendar = useCallback(async (item, video, meta) => {
+        const type = item.type || 'series';
+        const id = item.id;
+        const season = video.season;
+        const episode = video.episode;
+        const epId = video.id || `${id}:${season}:${episode}`;
+        const seriesName = localizedTitle(id, meta?.name, item.name) || id;
+        const epLabel = Number(season) === 0
+            ? t('discover.specials')
+            : `S${season} E${episode}`;
+        const epName = `${seriesName} - ${epLabel}`;
+
+        // Mirror the cardClick → onEpisodeSelect flow's history shape:
+        // entry 1 = just `id` (would render the episodes modal), entry 2
+        // = + season/episode (renders streams). Single combined push
+        // would collapse both steps so "< Серии" back-navigation would
+        // exit the modal entirely instead of falling back to the episode
+        // list at the right season.
+        url.push({ id, season: null, episode: null });
+        url.push({ season, episode });
+
+        const cardMeta = {
+            year: item.year,
+            releaseInfo: item.releaseInfo,
+            imdbRating: item.imdbRating,
+            description: item.description,
+        };
+        const backToEpisodes = meta?.videos?.length > 0 ? {
+            title: seriesName,
+            poster: meta?.poster || item.poster,
+            meta,
+            itemId: id,
+            itemType: type,
+            season,
+            ...cardMeta,
+        } : undefined;
+
+        await loadStreams(
+            type, epId,
+            { name: epName, poster: meta?.poster || item.poster, ...cardMeta },
+            backToEpisodes ? { backToEpisodes } : {},
+        );
+    }, [loadStreams]);
+
+    // Click on a collapsed "Season N · X episodes" card from the calendar.
+    // Bypasses the per-episode picker — opens the episodes modal at the
+    // right season so the user can pick which one to play. Meta is
+    // forwarded so no refetch happens.
+    const openSeasonFromCalendar = useCallback((item, season, meta) => {
+        const id = item.id;
+        const type = item.type || 'series';
+        url.push({ id, season, episode: null });
+        dispatch({
+            type: 'SHOW_MODAL',
+            modal: {
+                view: 'episodes',
+                title: localizedTitle(id, meta?.name, item.name),
+                poster: meta?.poster || item.poster,
+                meta,
+                itemId: id,
+                itemType: type,
+                defaultSeason: Number(season),
+                year: item.year,
+                releaseInfo: item.releaseInfo,
+                imdbRating: item.imdbRating,
+                description: item.description,
+            },
+        });
+    }, []);
+
+    // Calendar toggle is always shown in catalog/watchlist mode (we still
+    // hide it in search mode where the result set is mixed and not the
+    // user's chosen catalog). Calendar is meaningful only for series, so
+    // we disable the button rather than hide it — that keeps the UI
+    // affordance discoverable for users coming from a movie catalog who
+    // might not realise switching to series unlocks the timeline.
+    const showCalendarToggle = !state.isSearchMode;
+    const calendarAvailable = useMemo(() => {
+        if (state.isSearchMode) return false;
+        if (state.watchlistFilterEnabled) return state.watchlistType === 'series';
+        return state.selectedType === 'series';
+    }, [state.isSearchMode, state.watchlistFilterEnabled, state.watchlistType, state.selectedType]);
+
+    const isCalendarMode = calendarAvailable && state.viewMode === 'calendar';
+
+    // --- Render ---
+    if (state.phase === 'loading') {
+        return <LoadingSpinner />;
+    }
+
+    if (state.phase === 'no-addons') {
+        return <NoAddons />;
+    }
+
+    if (state.phase === 'no-catalogs') {
+        return <NoCatalogs />;
+    }
+
+    if (state.phase === 'error' && state.items.length === 0) {
+        return <ErrorState message={state.errorMessage} onRetry={retry} />;
+    }
+
+    return (
+        <div>
+            {/* AI recommendations section — self-contained, hides itself when
+                the feature flag is off (phase === 'disabled'). Rendered above
+                the search bar as a top-of-page spotlight. */}
+            <AISection
+                aiState={state.ai}
+                dispatch={dispatch}
+                onCardClick={handleAICardClick}
+                userStatuses={state.userStatuses}
+                watchlistIds={state.watchlistIds}
+                onToggleWatched={handleAIToggleWatched}
+                onRate={handleAIOpenRating}
+                onToggleWatchlist={handleToggleWatchlist}
+            />
+
+            <SearchBar
+                onSearch={performSearch}
+                onExit={exitSearch}
+                isSearchMode={state.isSearchMode}
+                initialQuery={state.searchQuery}
+            />
+
+            {/* Sticky tab bar — stays below navbar (72px) on scroll */}
+            <div class="sticky top-[72px] z-10 -mx-3 sm:-mx-6 px-3 sm:px-6 py-3 bg-w-bg/90 backdrop-blur-lg border-b border-w-line/30">
+                <AddonHealthChip addons={state.addons} onRetry={retryAddons} />
+                {state.isSearchMode ? (
+                    <SearchTabs
+                        searchResults={state.searchResults}
+                        searchTypes={searchTypes}
+                        searchType={state.searchType}
+                        onSelect={selectSearchType}
+                    />
+                ) : (
+                    <>
+                        {/* Type tabs on the left, mode switcher on the right.
+                            justify-between keeps them on opposite ends; on
+                            tight screens flex-wrap drops the switcher to a
+                            new line where it stays right-aligned via
+                            ml-auto on its row. */}
+                        <div class="flex items-center gap-2 flex-wrap">
+                            <div class="min-w-0">
+                                {state.watchlistFilterEnabled ? (
+                                    <SearchTabs
+                                        searchResults={state.watchlistItems}
+                                        searchTypes={watchlistTypes}
+                                        searchType={state.watchlistType}
+                                        onSelect={selectWatchlistType}
+                                    />
+                                ) : (
+                                    <TypeTabs types={types} selectedType={state.selectedType} onSelect={selectType} />
+                                )}
+                            </div>
+                            <div class="ml-auto flex items-center gap-2">
+                            <div class="join">
+                                <button
+                                    type="button"
+                                    onClick={() => setMode('catalog')}
+                                    class={catalogChipClass(!state.watchlistFilterEnabled)}
+                                    title={t('discover.modeCatalog')}
+                                    aria-label={t('discover.modeCatalog')}
+                                >
+                                    <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                                        <path d="M3.75 6A2.25 2.25 0 0 1 6 3.75h2.25A2.25 2.25 0 0 1 10.5 6v2.25a2.25 2.25 0 0 1-2.25 2.25H6a2.25 2.25 0 0 1-2.25-2.25V6ZM3.75 15.75A2.25 2.25 0 0 1 6 13.5h2.25a2.25 2.25 0 0 1 2.25 2.25V18a2.25 2.25 0 0 1-2.25 2.25H6A2.25 2.25 0 0 1 3.75 18v-2.25ZM13.5 6a2.25 2.25 0 0 1 2.25-2.25H18A2.25 2.25 0 0 1 20.25 6v2.25A2.25 2.25 0 0 1 18 10.5h-2.25a2.25 2.25 0 0 1-2.25-2.25V6ZM13.5 15.75a2.25 2.25 0 0 1 2.25-2.25H18a2.25 2.25 0 0 1 2.25 2.25V18A2.25 2.25 0 0 1 18 20.25h-2.25A2.25 2.25 0 0 1 13.5 18v-2.25Z" />
+                                    </svg>
+                                    <span class="hidden sm:inline">{t('discover.modeCatalog')}</span>
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => setMode('watchlist')}
+                                    class={watchlistChipClass(state.watchlistFilterEnabled)}
+                                    title={t('discover.watchlist.label')}
+                                    aria-label={t('discover.watchlist.label')}
+                                >
+                                    <svg class="w-4 h-4" viewBox="0 0 24 24" fill={state.watchlistFilterEnabled ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                                        <path d="M21 8.25c0-2.485-2.099-4.5-4.688-4.5-1.935 0-3.597 1.126-4.312 2.733-.715-1.607-2.377-2.733-4.313-2.733C5.1 3.75 3 5.765 3 8.25c0 7.22 9 12 9 12s9-4.78 9-12Z" />
+                                    </svg>
+                                    <span class="hidden sm:inline">{t('discover.watchlist.label')}</span>
+                                    {state.watchlistIds.size > 0 && (
+                                        <span class="text-xs opacity-70 ml-1 tabular-nums">{state.watchlistIds.size}</span>
+                                    )}
+                                </button>
+                            </div>
+                            {showCalendarToggle && (
+                                <div class="join" role="group" aria-label={t('discover.view.grid')}>
+                                    <button
+                                        type="button"
+                                        onClick={() => selectViewMode('grid')}
+                                        class={viewModeChipClass(!isCalendarMode)}
+                                        title={t('discover.view.grid')}
+                                        aria-label={t('discover.view.grid')}
+                                        aria-pressed={!isCalendarMode}
+                                    >
+                                        {/* 3 vertical columns icon — visually distinct from the
+                                            Catalog-mode chip's 2×2 squares, which matters on
+                                            mobile where both chips drop their labels. */}
+                                        <svg class="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+                                            <path d="M3 4.5h4.5v15H3v-15ZM9.75 4.5h4.5v15h-4.5v-15ZM16.5 4.5H21v15h-4.5v-15Z" />
+                                        </svg>
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => calendarAvailable && selectViewMode('calendar')}
+                                        class={`${viewModeChipClass(isCalendarMode)} ${!calendarAvailable ? 'opacity-50 hover:bg-transparent hover:text-w-sub' : ''}`}
+                                        title={calendarAvailable ? t('discover.view.calendar') : t('discover.view.calendarSeriesOnly')}
+                                        aria-label={calendarAvailable ? t('discover.view.calendar') : t('discover.view.calendarSeriesOnly')}
+                                        aria-pressed={isCalendarMode}
+                                        aria-disabled={!calendarAvailable}
+                                    >
+                                        <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                                            <path d="M6.75 3v2.25M17.25 3v2.25M3 18.75V7.5a2.25 2.25 0 0 1 2.25-2.25h13.5A2.25 2.25 0 0 1 21 7.5v11.25m-18 0A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75m-18 0v-7.5A2.25 2.25 0 0 1 5.25 9h13.5A2.25 2.25 0 0 1 21 11.25v7.5" />
+                                        </svg>
+                                    </button>
+                                </div>
+                            )}
+                            </div>
+                        </div>
+                        {!state.watchlistFilterEnabled && catalogsForType.length > 1 && (
+                            <div class="mt-2">
+                                <CatalogSelector catalogs={catalogsForType} selectedCatalog={state.selectedCatalog} onSelect={selectCatalog} />
+                            </div>
+                        )}
+                    </>
+                )}
+            </div>
+
+            {(state.catalogLoading || state.searchLoading) && <LoadingSpinner />}
+
+            {!state.catalogLoading && !state.searchLoading && state.isSearchMode && state.searchResults.length === 0 && state.searchQuery && (
+                <NoResults query={state.searchQuery} />
+            )}
+
+            {!state.catalogLoading && !state.searchLoading && !state.isSearchMode && !state.watchlistFilterEnabled && state.items.length === 0 && state.phase === 'ready' && state.selectedCatalog?.disabled && (
+                <CatalogUnavailable catalog={state.selectedCatalog} onRetry={retryAddons} />
+            )}
+
+            {!state.catalogLoading && !state.searchLoading && !state.isSearchMode && !state.watchlistFilterEnabled && state.items.length === 0 && state.phase === 'ready' && !state.hasMore && !state.selectedCatalog?.disabled && (
+                <p class="text-w-muted text-center col-span-full py-8">No items found.</p>
+            )}
+
+            {!state.isSearchMode && state.watchlistFilterEnabled && state.watchlistItemsLoaded && state.watchlistItems.length === 0 && (
+                <div class="text-center py-12 max-w-md mx-auto">
+                    <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-w-pink/10 text-w-pinkL mb-4">
+                        <svg class="w-8 h-8" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M21 8.25c0-2.485-2.099-4.5-4.688-4.5-1.935 0-3.597 1.126-4.312 2.733-.715-1.607-2.377-2.733-4.313-2.733C5.1 3.75 3 5.765 3 8.25c0 7.22 9 12 9 12s9-4.78 9-12Z" />
+                        </svg>
+                    </div>
+                    <h3 class="text-base font-semibold text-w-text mb-2">{t('discover.watchlist.emptyTitle')}</h3>
+                    <p class="text-sm text-w-muted">{t('discover.watchlist.emptyHint')}</p>
+                </div>
+            )}
+
+            {isCalendarMode ? (
+                <CalendarView
+                    items={displayItems}
+                    client={client}
+                    watchlistIds={state.watchlistIds}
+                    onEpisodeClick={openEpisodeFromCalendar}
+                    onSeasonDropClick={openSeasonFromCalendar}
+                    onToggleWatchlist={handleToggleWatchlist}
+                />
+            ) : (
+                <ItemGrid
+                    items={displayItems}
+                    showBadges={showBadges}
+                    userStatuses={state.userStatuses}
+                    watchlistIds={state.watchlistIds}
+                    onClick={cardClick}
+                    onToggleWatched={handleToggleWatched}
+                    onRate={handleOpenRating}
+                    onToggleWatchlist={handleToggleWatchlist}
+                />
+            )}
+
+            {!state.isSearchMode && !state.watchlistFilterEnabled && !state.catalogLoading && state.hasMore && state.items.length > 0 && (
+                <LoadMore onLoadMore={loadMore} />
+            )}
+
+            {state.modal && (
+                <StreamModal
+                    modal={state.modal}
+                    onClose={closeModal}
+                    onEpisodeSelect={onEpisodeSelect}
+                    onStreamClick={handleStreamClick}
+                    onBackToEpisodes={state.modal.backToEpisodes ? onBackToEpisodes : undefined}
+                    onSeasonChange={onSeasonChange}
+                    hasCustomAddons={hasCustomAddons || addonsInstalled}
+                    onSetupAddons={onSetupAddons}
+                    onRetryStreams={retryStreams}
+                    userStatuses={state.userStatuses}
+                    watchlistIds={state.watchlistIds}
+                    onToggleWatched={handleToggleWatched}
+                    onRate={handleOpenRating}
+                    onToggleWatchlist={handleToggleWatchlist}
+                    onTabChange={handleModalTabChange}
+                    subscriptionKeys={state.subscriptionKeys}
+                    onToggleSubscription={handleToggleSubscription}
+                    hasSources={hasCustomAddons || addonsInstalled || hasIndexers()}
+                    playback={playback}
+                />
+            )}
+
+            {showWizard && state.phase === 'ready' && (
+                <AddonWizard onComplete={onWizardComplete} onSkip={onWizardSkip} />
+            )}
+
+            {ratingTarget && (
+                <RatingDialog
+                    currentRating={ratingTarget.currentRating}
+                    onRate={handleRate}
+                    onUnrate={handleUnrate}
+                    onClose={handleCloseRating}
+                />
+            )}
+
+        </div>
+    );
+}

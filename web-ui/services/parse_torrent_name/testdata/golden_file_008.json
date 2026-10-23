@@ -1,0 +1,12 @@
+{
+  "input": "WWE Hell in a Cell 2014 PPV WEB-DL x264-WD -={SPARROW}=-",
+  "want": {
+    "title": "WWE Hell in a Cell",
+    "year": 2014,
+    "quality": "WEB-DL",
+    "codec": "x264",
+    "group": "WD -={SPARROW}=-",
+    "sport": true,
+    "ppv": true
+  }
+}

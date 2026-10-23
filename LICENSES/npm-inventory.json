@@ -9,6 +9,33 @@
     "source": "https://github.com/electric-sql/pglite"
   },
   {
+    "name": "@fontsource/doto",
+    "version": "5.3.0",
+    "license": "OFL-1.1",
+    "noticeFiles": [
+      "LICENSE"
+    ],
+    "source": "git+https://github.com/fontsource/font-files.git"
+  },
+  {
+    "name": "@fontsource/space-grotesk",
+    "version": "5.3.0",
+    "license": "OFL-1.1",
+    "noticeFiles": [
+      "LICENSE"
+    ],
+    "source": "git+https://github.com/fontsource/font-files.git"
+  },
+  {
+    "name": "@fontsource/space-mono",
+    "version": "5.3.0",
+    "license": "OFL-1.1",
+    "noticeFiles": [
+      "LICENSE"
+    ],
+    "source": "git+https://github.com/fontsource/font-files.git"
+  },
+  {
     "name": "accepts",
     "version": "2.0.0",
     "license": "MIT",

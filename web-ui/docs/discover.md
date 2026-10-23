@@ -1,0 +1,634 @@
+# Discover
+
+The Discover page (`/discover`) lets users browse and search movies and series from Cinemeta and their configured Stremio addons. It also hosts the AI-powered recommendation section at the top — see [ai_recommendations.md](./ai_recommendations.md) for the full spec of that feature (Claude-backed chips + free-form query + per-card reasons, opt-in via `AI_RECOMMENDATIONS_ENABLED`).
+
+Auth model: `/discover` requires auth. Anonymous visitors are redirected to `/login?from=discover&return-url=/discover?<RawQuery>` (both lang-prefixed via `i18n.LangPath`) — the handler preserves the original query string so a deep link like `/ru/discover?id=tt12042730&type=movie` round-trips intact through sign-in. The login page renders a contextual info card built from `discover.signInCard.intro` + `discover.signInCard.feature1..4` keys; library and vault use the same pattern. The card descriptor is selected server-side in `handlers/auth/handler.go::loginCardFor`. Client-side, popstate inside the Discover SPA also strips the lang prefix (see `assets/src/js/lib/discover/components/useDiscoverUrl.js`) so back/forward navigation works on /ru/discover.
+
+## Architecture
+
+Pure frontend feature — no Go backend changes needed for browsing. All catalog and search fetches happen directly from the browser to addon URLs. Addon management uses Go backend endpoints.
+
+Streams from all sources are deduped by infohash before rendering (`dedupeStreamsByHash` in `lib/discover/stream.js`). Sources are merged in a fixed order — addons first, indexers after — so the surviving copy is the one carrying a `fileIdx`; the sources that also returned the same torrent are listed on that row as `+ <name>` chips, because "did my indexer find this?" is the question the list is read for.
+
+**One exception: Torznab indexers.** They cannot be fetched from the browser — Jackett and Prowlarr send no CORS headers, and a self-hosted indexer on plain `http` is blocked as mixed content from this `https` page anyway. So the stream modal posts to `POST /discover/torznab/streams` and merges the server's answer into the streams it fetched itself. The indexers appear as one extra row in the per-source fetch progress list. See [torznab.md](./torznab.md).
+
+The UI is built with **Preact** (lightweight React alternative) using hooks (`useReducer`, `useState`, `useMemo`, `useEffect`, `useCallback`). State is managed via a single reducer for predictable updates. The API client and utility modules remain plain JS.
+
+### React page (Torrently)
+
+With `WEB_UI=react` the same view (`discover/index`) is drawn by the React app
+(see [react_ui.md](./react_ui.md)):
+
+- `handlers/spa/discover.go` turns the handler's `IndexData` into the page's
+  JSON: `addons`, `indexers`, `streamPrefs`, `aiEnabled`, `passthrough` — what
+  the template put on `window._addons` etc. for the Preact app.
+- `frontend/src/pages/discover/` is the port, module for module:
+  `lib/` holds TypeScript copies of the clients and rules above
+  (`client`, `stream`, `lang`, `playback`, `release-video`, `seasonStatus`,
+  `streamPrefs`, the `*Client` wrappers), `components/` the screens
+  (`DiscoverApp`, `StreamModal`, `CalendarView`, `AddonWizard`, `ai/*`).
+  `lib/env.ts` replaces the window globals (CSRF, language, seed data,
+  translator); the page fills it from its state. The player's
+  `decode-declaration.js` is imported as it is, not copied.
+- The stream modal's load job is followed with `frontend/src/jobs`
+  (`useJobLog`, `JobSteps`); its `redirect` opens the torrent page through
+  the app's router, with `?file-idx=` as before. The dead-magnet card offers
+  the ten-minute retry in place.
+- The page keeps its own history entries (`?id`, `?search`, `?tab`, …) and
+  claims them from the router (`claimHistory` in `frontend/src/app/router.tsx`),
+  so back and forward between them stay on the page.
+- The pure-logic tests are ported next to the modules
+  (`frontend/src/pages/discover/**/*.test.js`, run by `npm test`). The
+  component tests (`DiscoverApp.playback`, `StreamModal.switches`,
+  `usePlaybackContext`) cover the Preact tree only.
+- `lib/lang.ts` copies `lang.js`, which `TestLangJSMirrorsTheGoTable` checks
+  against `services/stremio/lang.go`; a row added there belongs in both.
+
+### Files
+
+- `templates/views/discover/index.html` — page template with static header and `#discover-mount` div
+- `templates/partials/discover.html` — homepage ribbon with poster cards linking to `/discover`
+- `handlers/discover/handler.go` — serves the page, passes `AddonUrls` from user profile
+- `handlers/stremio/stremio_addon_url/handler.go` — addon URL management including batch-add endpoint
+- `assets/src/js/app/discover.js` — entry point (mounts Preact app)
+- `assets/src/js/lib/discover/client.js` — `StremioClient` (API calls, LRU caching, AbortController support)
+- `assets/src/js/lib/discover/lang.js` — `LANG_MAP`, `extractLanguages()` (language detection for stream titles)
+- `assets/src/js/lib/discover/stream.js` — `parseStreamName()`, `extractInfoHash()` (stream name parsing)
+- `assets/src/js/lib/discover/release-video.js` — what a release's name says about its video (codec, HDR, Dolby Vision profile 5); see "Video switches"
+- `assets/src/js/lib/discover/playback.js` — the video switches' rules: defaults, the 4K gate, what each switch hides, the empty-state text
+- `assets/src/js/lib/discover/usePlaybackContext.js` — the switches' inputs as DiscoverApp gathers them: the browser's probe started on mount, the context gathered again when it answers (`DiscoverApp.playback.test.js` checks the wiring to the modal)
+- `assets/src/js/lib/discover/release-check.js` — the record a click on a release leaves for the player, and the player's `discover-release-check`
+- `assets/src/js/lib/discover/components/discoverReducer.js` — state reducer, initial state, helper functions
+- `assets/src/js/lib/discover/components/DiscoverApp.jsx` — root Preact component orchestrating all sub-components
+- `assets/src/js/lib/discover/components/StreamModal.jsx` — stream modal, episode picker, stream filters
+- `assets/src/js/lib/discover/components/AddonWizard.jsx` — guided addon discovery and installation wizard
+- `assets/src/js/lib/discover/components/useDiscoverUrl.js` — URL/history management hook
+- `assets/src/js/lib/discover/components/discoverUtils.js` — shared utility functions
+- `assets/src/js/lib/discover/components/SearchBar.jsx` — search input component
+- `assets/src/js/lib/discover/components/ItemGrid.jsx` — card grid display
+- `assets/src/js/lib/discover/components/Tabs.jsx` — type tabs, search tabs, catalog selector
+- `assets/src/js/lib/discover/components/EmptyStates.jsx` — loading, error, no-results, **catalog-unavailable** states
+- `assets/src/js/lib/discover/components/AddonHealthChip.jsx` — page-level addon health surface (warning chip + per-addon status drawer + retry)
+- `assets/src/js/lib/discover/manifestCache.js` — `localStorage` fallback for manifests, used to render disabled catalogs from currently-unreachable addons
+- `assets/src/js/lib/discover/addonsApi.js` — fetch wrapper around `/stremio/addon-url/:id/refresh-snapshot` (lazy backfill + profile refresh)
+- `assets/src/js/lib/discover/torznabClient.js` — fetch wrapper around `POST /discover/torznab/streams` (+ `hasIndexers()`, which skips the round-trip when the user has none)
+- `handlers/discover/torznab.go` — Go handler for the server-side indexer stream fetch
+- `migrations/52_add_addon_manifest_snapshot.up.sql` — snapshot columns on `stremio_addon_url`
+- `assets/src/js/lib/discover/prefs.js` — localStorage persistence for user selections
+- `assets/src/js/lib/discover/aiClient.js` — thin fetch wrapper for `/discover/ai/*` endpoints (AI recommendations)
+- `assets/src/js/lib/discover/components/ai/` — AI recommendations UI: `AISection.jsx`, `AIChipsRow.jsx`, `AIQueryInput.jsx`, `AIRecsGrid.jsx`, `AIRecCard.jsx`
+- `handlers/discover_ai/handler.go` — Go handler for AI recommendations (chips, recommend, refine)
+- `services/recommendations/` — Claude-backed recommendation pipeline: prompt, context, resolver, quota, cache
+- `assets/src/js/lib/discover/watchlistClient.js` — fetch wrapper for `/discover/watchlist/*` endpoints (add/remove/list)
+- `handlers/discover_watchlist/handler.go` — Go handler for the watchlist (GET/POST/DELETE)
+- `models/movie_watchlist.go`, `models/series_watchlist.go` — DB models, joined with `*_metadata` for the list view
+- `assets/src/js/lib/discover/localizeClient.js` — fetch wrapper for `POST /discover/localize` (batch localized titles/plots, per-id session cache) + `localizedTitle`/`withLocalized` overlay helpers
+- `assets/src/js/lib/discover/http.js` — shared `csrfHeaders()` for the discover JSON POST endpoints
+- `handlers/discover/localize.go` — Go handler bridging catalog ids to the enrichment localization pipeline
+- `assets/src/js/lib/discover/reviewsClient.js` — fetch wrapper for `POST /discover/reviews` (single-id, per-id session cache)
+- `assets/src/js/lib/discover/components/Reviews.jsx` — `useReviews` hook + `ReviewsList` (content of the Reviews tab in the stream modal)
+- `assets/src/js/lib/discover/components/ExpandableText.jsx` — inline "…"-expandable clamped text (modal description, AI rec plots, review bodies)
+- `assets/src/js/lib/textClamp.js` — shared cut-search math (`findTextCut`/`trimTextCut`/`CLAMP_LINE_HEIGHT`) used by ExpandableText and the vanilla plot clamp in `app/resource/get.js`
+- `assets/src/js/lib/discover/components/StarIcon.jsx` — shared filled rating star (grid cards, modal header, rate buttons, AI badges, review ratings)
+- `assets/src/js/lib/discover/ids.js` — `bareImdbTitleID` guard shared by localizeClient and reviewsClient (client mirror of the server-side id checks)
+- `handlers/discover/reviews.go` — Go handler bridging the modal's title id to the `ReviewsProvider` enrichment capability
+- `migrations/59_tmdb_info_imdb_id_index.up.sql` — partial index on `tmdb.info(imdb_id)` for batch imdb→tmdb lookups
+
+### Key Components
+
+- **DiscoverApp** — root component using `useReducer(discoverReducer, initialState)`. Manages init, catalog loading, search, modal state, and addon wizard flow.
+- **StreamModal** — dialog modal driven by `modal` state from reducer. Views: `loading`, `streams` (with reactive filter chips), `episodes` (season tabs + episode list), `progress` (torrent processing).
+- **AddonWizard** — two-step guided wizard for discovering and installing Stremio addons. Step 1: source selection (Official Stremio, Community). Step 2: addon browsing with search, filters, and batch install.
+- **discoverReducer** — single reducer handling all state transitions. Actions: `INIT_SUCCESS`, `INIT_ERROR`, `SET_PHASE`, `ADDONS_UPDATED`, `SELECT_TYPE`, `SELECT_CATALOG`, `CATALOG_LOADING`, `CATALOG_LOADED`, `CATALOG_ERROR`, `SEARCH_START`, `SEARCH_RESULTS`, `SELECT_SEARCH_TYPE`, `EXIT_SEARCH`, `SHOW_MODAL`, `CLOSE_MODAL`, `WATCHLIST_IDS_LOADED`, `WATCHLIST_ITEMS_LOADED`, `WATCHLIST_FILTER_TOGGLE`, `WATCHLIST_ADD`, `WATCHLIST_REMOVE`, `SELECT_WATCHLIST_TYPE`, `LOCALIZED_MERGED`.
+- **StremioClient** (`lib/discover/client.js`) — fetches manifests, catalogs, search results, meta, and streams from Stremio addon URLs. Uses LRU cache (max 100 entries) and AbortController with 10s timeout on all fetch calls. `fetchAllManifests()` returns full per-addon health (status / source / error) — see [Addon Health](#addon-health).
+- **AddonHealthChip** — page-level surface for addon outages: hidden when everything is `ok`, otherwise renders a warning chip with retry + a per-addon drawer. See [Addon Health](#addon-health).
+- **useDiscoverUrl** — custom hook managing browser history (`pushState`/`replaceState`) and `popstate` events for back/forward navigation.
+
+### Build Configuration
+
+- **Preact** with `@babel/preset-react` using automatic JSX runtime (`importSource: "preact"`)
+- Webpack processes `.jsx?` files, resolves `.jsx` extensions
+- Tailwind purge includes `.jsx` files
+
+## Homepage Ribbon
+
+The discover ribbon (`templates/partials/discover.html`) shows a row of static movie poster cards on the homepage. Clicking the ribbon or "See more" navigates to `/discover` via `data-async-target="main"`.
+
+Controlled by `{{ if not .Tool }}` — hidden when the page is loaded as a tool/embed.
+
+## Cinemeta (Default Catalogs)
+
+[Cinemeta](https://v3-cinemeta.strem.io) is the standard Stremio metadata provider. It is **always included by default** — its URL is prepended to the addon list on the client side if not already present. This means:
+
+- Users always see Cinemeta's `movie/top` and `series/top` catalogs even without any custom addons configured
+- Cinemeta catalogs appear first in the catalog selector (since it's prepended)
+- If the user has added Cinemeta manually in their profile, it won't be duplicated
+- Cinemeta is also always used for search and meta/episode fetching (see below)
+
+## Browsing
+
+1. On page load, Cinemeta is prepended to addon URLs (if not already present)
+2. All addon manifests (including Cinemeta) are fetched in parallel
+3. Catalogs are extracted from manifests and grouped by type (movie, series, etc.)
+4. User selects a type tab, then a catalog from the dropdown
+5. Items are fetched with pagination (`skip` param), Load More button for next page
+
+## Localized Metadata
+
+Stremio addons (Cinemeta included) return English titles/descriptions regardless of `Accept-Language`. For non-English locales the grid and stream modal overlay translations served by the **server enrichment pipeline** — the same `LocalizableMapper` chain (today: TMDB) and `tmdb.localized` cache used by the resource page, library and AI recommendations.
+
+### Flow
+
+1. After any grid surface loads (catalog page, search results, watchlist items), `DiscoverApp` fire-and-forgets `fetchLocalized([{id, type}])` — same pattern as `fetchUserStatuses`
+2. `localizeClient.js` filters to bare IMDB `tt*` ids (episode ids, bare `tmdb*` and custom addon ids are skipped), dedupes against a module-level session cache, and POSTs `/discover/localize` in chunks of ≤100
+3. `handlers/discover/localize.go` (auth-gated) reads the language from the i18n middleware (URL prefix), fans out `Enricher.LocalizeByID` with bounded concurrency (8). Response contract — three outcomes per id: `{title, plot}` (localized), explicit `{}` (checked, no translation → client caches the negative verdict), id omitted (pipeline error → client leaves it uncached and retries on a later batch)
+4. `Enricher.LocalizeByID` walks the mapper chain via capability interfaces: `LocalizableMapper.Localize` first (3-tier cache: lazymap → `tmdb.localized` → TMDB API); only when that finds nothing, one `DirectMapper.MapByID` call pulls a previously unseen id into `tmdb.info` (find + details + external ids) and Localize retries — known ids never pay the extra resolution queries
+5. The response merges into `state.localized` (`LOCALIZED_MERGED`, additive-only); `overlayLocalized()` applies it at render time in the `displayItems` memo — items in state stay untouched, English remains the fallback
+6. Modal dispatch sites build titles through `localizedTitle(id, ...fallbacks)` / `withLocalized(item)` from `localizeClient.js` (cardClick, episodes view, post-meta patch, both calendar flows) so the localized-over-`meta.name` precedence lives in one place; deep-links with a cold cache fetch the single id and patch the open modal in place
+
+### Properties
+
+- **English sessions cost zero** — `getLang() === 'en'` short-circuits in the client before any network call, and the handler guards server-side too
+- **First sight of an id is the only expensive case** (up to 4 TMDB calls); the result persists in `tmdb.info` + `tmdb.localized`, so popular catalog pages are effectively free for everyone after the first non-English viewer
+- **No new localization logic** — the endpoint is a thin bridge; adding e.g. Kinopoisk Russian titles means implementing `LocalizableMapper` on the KPU mapper, zero changes in this path
+- **Client type hints are not trusted for identity** — only `tt*` ids are accepted (an IMDB id maps to exactly one TMDB entity; `GetTmdbID` resolves the real movie/tv type from `tmdb.info` or the populated find-result array, the hint is just a preference). Bare `tmdb*` ids are rejected because their movie/tv namespaces overlap numerically and a wrong hint could upsert a wrong-namespace title into `tmdb.info`
+- **Transient failures don't stick** — a TMDB timeout during a batch leaves those ids uncached on the client (omitted-from-response contract above), so the next grid load retries them; only an explicit "no translation" verdict is pinned for the session
+- Episode names in the episodes view stay English (Cinemeta data) — TMDB episode localization is a possible follow-up via `tmdb_episodes.go`
+
+## Reviews (TMDB)
+
+The stream modal shows TMDB community reviews for the open title, when they exist. "When they exist" is the design: Discover surfaces mostly popular/trending content where TMDB review coverage is decent; long-tail titles get a disabled `(0)` tab / no section (no empty state). Reviews are served as-is — predominantly English, no locale filter — because an English review beats an empty section for non-EN users, and translating user text through the pipeline isn't justified before the Umami numbers prove anyone reads them.
+
+### Flow
+
+1. Both settled modal views carry the same `ModalTabs` chip row: `Episodes (N)` / `Reviews (M)` in the episodes view, `Streams (N)` / `Reviews (M)` plus the right-aligned 4K toggle in the streams view. Reviews load via the shared `useReviews(id, type)` hook (bare IMDB `tt*` ids only); the reviews chip is disabled while the count is 0. Drilling into an episode clears the tab (`tab: null` on the episode push) — the episode's streams open on the primary tab
+2. The active tab lives in the `?tab=reviews` URL param: `handleModalTabChange` in `DiscoverApp` pushes history entries, and a guard at the top of the popstate handler syncs tab-only steps into `modal.tab` without re-opening the modal — browser back/forward walks streams ⇄ reviews
+3. `reviewsClient.js` POSTs `/discover/reviews` (single id — no batching, only the modal needs reviews) and caches the verdict per id for the page lifetime; non-OK / network failures are not cached, so the next modal open retries
+4. `handlers/discover/reviews.go` (auth-gated) calls `Enricher.ReviewsByID`. Contract: 200 with a (possibly empty) `reviews` array is a definitive, cacheable verdict; 502 means the pipeline couldn't check
+5. `Enricher.ReviewsByID` walks the mapper chain via the `ReviewsProvider` capability (today: TMDB only) through the shared `walkByID` helper: the cached `Reviews` call first; a `DirectMapper.MapByID` + retry only when the id isn't in `tmdb.info` yet. TMDB keeps reviews in an in-memory lazymap (1h expire, capacity 1000, no DB table — reviews are display-only), capped at 5 per title, each body truncated to 2000 runes. Reviews containing links (`https?://` or `www.`-prefixed — `reviewHasLink` in `services/enrich/tmdb.go`) are dropped as self-promotion/spam; bare domains are deliberately kept (false-positive prone)
+6. Switching to the reviews tab fires the `discover-reviews-expand` Umami event. Review bodies — like the modal description, AI rec plots and the resource-page plot — clamp to N lines with a clickable inline `…` at the cut point that expands the full text; an inline `↑` at the end of the expanded text collapses it back. The cut index is binary-searched against the height budget: `ExpandableText.jsx` (measures on an invisible clone) in Preact surfaces, an equivalent vanilla snippet in `app/resource/get.js` on the resource page
+
+### Properties
+
+- **Value is still a hypothesis** — `discover-reviews-expand` exists to answer "does anyone read these" before investing in translation or additional sources (RT/Metacritic via OMDB would be a separate `RatingsProvider`-style capability)
+- **TMDB attribution** — the section header carries a TMDB badge; reviews are community content from TMDB and the badge is part of their attribution terms
+- **No new pipeline logic** — adding reviews from another source means implementing `ReviewsProvider` on that mapper, zero changes in the endpoint
+
+## Search
+
+### Flow
+
+1. User types in the search bar (debounced 400ms, minimum 2 characters)
+2. Search queries are sent in parallel to:
+   - **Cinemeta** (`v3-cinemeta.strem.io`) for both `movie/top` and `series/top` — always included even if not in user's addon list
+   - User's addons that declare search support (`extraSupported` or `extra` containing "search")
+3. Results are merged and deduplicated by item ID
+4. Default "All" tab shows all results with type badges (Movie/Series) on each card
+5. Per-type tabs show counts: "All (14) · Movie (12) · Series (2)"
+6. Switching type tabs filters locally — no re-query
+
+### Key Design Decisions
+
+- **Cinemeta always searched** — ensures baseline movie/series search even without search-capable addons
+- **No pagination in search** — Stremio search protocol doesn't support `skip` alongside `search`; Load More is hidden
+- **Race condition safety** — `searchGeneration` counter discards stale responses when user types faster than responses arrive
+- **8-second timeout** — each search request has an AbortController timeout to prevent slow addons from blocking results
+- **Request cancellation** — switching catalog/type or starting a new search aborts in-flight requests via AbortController
+- **Partial results** — `Promise.allSettled` means failing addons don't block results from working ones
+
+### Exiting Search
+
+- Press Escape, click the X button, or clear the input to exit search mode
+- Returns to catalog browsing with the first type/catalog selected
+
+## Streams & Episodes
+
+- Clicking a **movie** opens a stream modal with streams from all stream-capable addons
+- Clicking a **series** first fetches meta from Cinemeta (then falls back to user addons) to show an episode picker grouped by season, then fetches streams for the selected episode
+- Streams with an info hash link to `/{infoHash}` for playback via Webtor
+- Stream filters (source, label, language) are reactive — `useMemo` recomputes the filtered list on every filter change
+- "Back to episodes" navigation available from streams view
+
+## Transcoder capability
+
+Whether content-transcoder hands HEVC to the player as it is (HEVC
+passthrough) decides what Discover may promise about 4K HEVC. The page gets
+the transcoder's own answer as `window._passthrough = {"hevc": "on"|"off"|"unknown"}`
+(`handlers/discover` `indexData.Passthrough`). The stream modal's 4K switch
+reads it ("Video switches" below).
+
+- **Where it comes from.** `services/transcodercaps` asks
+  `GET http://$CONTENT_TRANSCODER_SERVICE_HOST:$CONTENT_TRANSCODER_SERVICE_PORT/capabilities`
+  in the background, every 30 s from the pod's start — whether or not anyone
+  opens Discover. A page never waits for it and never causes a question. The
+  answer is the capability exactly as a `POST /session` opened now would read
+  it (the transcoder's flag or capability file), not a copy of its
+  configuration.
+- **Three answers.** `on` / `off` are what the transcoder said, and the last
+  one stays until it says something else: the question is "is it configured",
+  not "does it answer this second" — a restarting transcoder or a network blip
+  does not turn a configured capability into an absent one. `unknown` is the
+  time before this pod heard any answer: its first seconds, no address
+  configured, or a transcoder that never answered (one without the endpoint
+  answers 404). `unknown` is never `off`; a page must not say "not available"
+  on it.
+- **What counts as an answer.** A 200 whose JSON has the key
+  `passthrough_video_codecs` (`[]` is `off`, a list with `hevc` is `on`).
+  A 404, 5xx, a 2 s timeout, a body that is not JSON, a JSON without the key
+  (or `null`) are no answer.
+- **Seen from outside.** `webui_transcoder_capability{answer}` (one-hot) and
+  `webui_transcoder_capability_checks_total{result}` (docs/metrics.md); a log
+  line on every change of answer (`transcoder capability: on|off`) and on
+  every new reason for not getting one (`no answer, keeping the last one`),
+  not on every poll. Without an address the start-up log says so once.
+- **Configuration.** `CONTENT_TRANSCODER_SERVICE_HOST` / `…_PORT` (default
+  80). Kubernetes injects both for the `content-transcoder` Service;
+  self-hosted sets them in its common environment. Nothing else to configure.
+- **The player does not read it.** A stream's route is decided per session
+  by the transcoder from what the browser declares; a failure to read the
+  capability cannot touch playback.
+
+## Video switches
+
+Above a title's releases the stream modal has up to three switches — HEVC,
+HDR, 4K — each shown only when the list has releases it is about, with the
+number of those releases in its label. A switch that is off hides those
+releases from the list. The rules are `lib/discover/playback.js`; the
+names are read by `lib/discover/release-video.js`.
+
+- **What a release is, by name.** HEVC: the words `x265`, `H.265`/`h265`,
+  `HEVC`; H.264: `x264`, `H.264`, `AVC`; `AV1`. HDR: `HDR`, `HDR10`,
+  `HDR10+`, `HDR10P`/`HDR10Plus` (not `HDRip`, not `HDTV`), and Dolby
+  Vision (`DV`, `DoVi`, `Dolby Vision`) without an HDR word; `HLG` is its
+  own. A word counts only as a whole token, so `HEVCKiNGS`, `Relax265`
+  and `DVDRip` say nothing. The text read is the addon's name line
+  (Torrentio writes `4k DV | HDR10+` there), the title, and a hinted file
+  name. A release that names no codec — or two different ones, like a
+  pack folder saying x265 over a file saying x264 — is `unknown` and is
+  never hidden as HEVC. 4K is the existing `4K` chip (`2160p`/`4k` in the
+  name line).
+- **How often the names are wrong.** Measured on the file paths of the
+  films opened on Webtor over two weeks (24 062; the true codec from the
+  media probe): HEVC by name is right 99.6% of the time and finds 78% of
+  HEVC files; the HDR switch's rule is right 97.9% and finds 79%. **On
+  Discover's own lists the error is not measured**: those names come from
+  addons, not from file paths, and the old 4K switch kept 4K releases out
+  of the sample. `discover-release-check` (below) measures it on the
+  releases people open.
+- **HEVC.** On by default where the browser decodes HEVC, off where it
+  answered that it does not: there HEVC is converted on our side — slower
+  to start, may pause, and 4K HEVC does not play at all. Turning it on
+  there shows that warning first. The browser's answer is the same probe
+  and tokens the page declares to the transcoder
+  (`lib/player/decode-declaration.js` `decodedTokens`, any of
+  `hevc8`/`hevc10`/`hevc8-2160`/`hevc10-2160`), asked of every browser on
+  Discover whether or not it takes part in the declaration. Only the video
+  part of that answer: the audio tokens of the same declaration (`aac51`,
+  `ac3`, `ec3`, multichannel audio) are neither in it nor waited for.
+- **HDR.** The same, by `hdr-pq`: on where the browser decodes PQ, off
+  with a warning where it answered that it does not (HDR up to 1080p may
+  look washed out; 4K HDR does not play). It hides PQ releases and Dolby
+  Vision without an HDR word (profiles 8 and 7 carry an HDR10 layer).
+  Not HLG, and not profile 5 (next item).
+- **Dolby Vision profile 5.** A release whose name reads as DV5 — the
+  profile said outright (`DV.P5`), or Dolby Vision with no HDR word from a
+  WEB source that is not a `HYBRID` — gets a yellow "DV: wrong colours"
+  badge for every browser: it has no HDR10 or SDR layer, the transcoder
+  never passes it through, and a re-encode keeps its colours wrong. It is
+  not hidden by the HDR switch; the row stays, "Download" is one click on.
+  The rule is small-sample: on the same two weeks of paths it marked 5
+  files, 4 of them DV5, and found 4 of the 6 DV5 files. Plain "DV without
+  HDR" was DV5 only 4 times in 19, which is why the rule asks for WEB.
+- **4K — the one switch that reads the transcoder.** 4K HEVC plays only
+  where the transcoder passes HEVC through (`window._passthrough.hevc ===
+  "on"`) **and** this page declares 4K Main10 (`hevc10-2160`, the
+  transcoder's own rule; 9 in 10 HEVC sources over 1080p are Main10). There
+  4K is shown, and the 4K switch stays only for the 4K releases whose names
+  say something the transcoder still sends to the old route, which converts
+  nothing over 1080p (`uhdReleasePlays`): AV1, Dolby Vision 5, HLG (not
+  passed through yet), and HDR — PQ, or Dolby Vision with an HDR10 layer —
+  where the page does not declare `hdr-pq`. No such release in the list,
+  no switch. Its warning there is the old one, true for them. On the paths
+  opened over 14 days, of 2 926 files over 1080p: HEVC 1 128 (PQ 479,
+  HLG 5, DV5 6, DV7 44 — profile 7 cannot be told by name, so it is not
+  held back), AV1 37 (12 of them say so). Everywhere else the switch holds
+  every 4K release, off by default, and turning it on warns — with a text
+  that says why:
+  - this page does not declare: its sessions take the old route whatever
+    the transcoder answers, so the warning Discover always had
+    (`discover.warning4kBody`), which is true there. The transcoder's
+    answer is not asked for it: an `unknown` (every page, until the
+    transcoder has `GET /capabilities`) changes nothing for a page that
+    does not declare, and the web-ui and content-transcoder rollouts need
+    no order for it;
+  - this page declares, and the transcoder's answer is `unknown` or the
+    browser has not answered: "we couldn't check"
+    (`discover.warning4kBodyUnchecked`) — a check that did not happen is
+    not "4K is off";
+  - the transcoder passes HEVC through and this browser declared without
+    4K Main10: "this browser doesn't decode 10-bit HEVC"
+    (`discover.warning4kBodyNoHevc`) — a browser with 1080p HEVC or 4K
+    Main only is not offered 4K HEVC as playable;
+  - the transcoder converts: the old warning, as above.
+  4K HEVC tier High (UHD Blu-ray remuxes) also needs `hevc-high`; a
+  browser that declares 4K Main10 without it is not told (not handled).
+- **A check that has not answered is not a "no".** Until the browser's
+  probe answers (the first moments of a first visit; a cached answer of
+  the same browser counts at once), HEVC and HDR stay shown and turning
+  them on does not warn. The probe is the declaration's: its module is a
+  lazy chunk (`decode-probe`) that Discover loads for every visitor.
+- **The viewer's choice.** `discover-prefs` in localStorage: `showHevc`,
+  `showHdr`, `show4k` are written only when the viewer flips a switch, and
+  a written choice wins over any default. `show4k` keeps its old meaning,
+  "show 4K that will not play here": where 4K plays it hides nothing that
+  plays and still answers for the releases the switch holds there; it is
+  never deleted, so if the transcoder stops passing HEVC through the switch
+  holds every 4K release again with the viewer's old choice. There is no
+  migration step: an existing `show4k: true` keeps 4K shown where the
+  switch stands.
+- **Everything hidden.** When the switches hide every release, the list
+  says so instead of going empty: the one switch that hides them all is
+  named (`discover.allHevcStreams`, `discover.allHdrStreams`, the old
+  `discover.all4kStreams`), several are named together
+  (`discover.allHiddenStreams`).
+- **Before passthrough is on** (the transcoder answers `off`), HEVC and
+  HDR are converted for every browser, so today the two defaults tell
+  apart browsers the transcoder still treats alike: a browser that decodes
+  HEVC keeps HEVC shown (as before), one that does not gets it hidden
+  (owner's decision, 2026-09-28). The defaults become exact when the
+  browser's sessions pass through.
+
+## Addon Wizard
+
+The AddonWizard component provides a guided two-step flow for discovering and installing Stremio addons.
+
+### Flow
+
+1. **Step 1 — Source Selection**: User selects addon sources (Official Stremio, Community from stremio-addons.net). "Select all" checkbox available.
+2. **Step 2 — Addon Browsing**: Addons are fetched from selected sources, enriched with community vote data from GitHub Issues, deduplicated, and sorted (torrent addons first, then by votes). User can search, filter (torrent-only toggle, 18+ toggle), and select addons for batch installation.
+
+### Data Sources
+
+- **Official Stremio** — `https://api.strem.io/addonscollection.json`
+- **Community** — `https://stremio-addons.net/api/addon_catalog/all/stremio-addons.net.json`
+- **Popularity votes** — fetched from GitHub Issues at `Stremio-Community/stremio-addons-list`, sorted by thumbs-up reactions
+
+### Deduplication
+
+Addons are deduplicated by normalized manifest ID and normalized name. Official source addons take priority over community duplicates.
+
+### Batch Install Endpoint
+
+`POST /stremio/addon-url/batch-add` — accepts `{ urls: [...] }`, validates each addon URL, saves to user profile. Response: `{ added, skipped, limitReached, limit }`.
+
+Tier-based limits: free tier max 3 addons, paid unlimited.
+
+### Integration with Stream Modal
+
+When opened from the streams modal ("Set up addons" button), the wizard:
+- Saves the current modal state and URL params in `pendingStreamRef`
+- On completion: re-fetches manifests, reloads streams, restores modal and URL
+- On skip/close: restores the previous modal state and URL params
+
+### Third-party Disclaimer
+
+Both wizard steps display a disclaimer: all addon sources and addons are third-party services not affiliated with Webtor.
+
+## Watchlist
+
+The watchlist is the discover-level "save for later" surface. It is intentionally distinct from `library` (which tracks downloaded torrents) and `vault` (long-term hosting pledges) — watchlist entries are intent-only, IMDB-keyed, with no torrent attached.
+
+### Surface
+
+- A heart icon sits in the bottom-right of every IMDB card across catalog grids, search results, AI recommendations, and inside the stream modal. Click toggles add / remove, optimistically updating the UI and showing a success toast.
+- A two-button switcher `[Catalog | Watchlist]` in the sticky tab bar (anchored next to the type tabs on the same row) flips between the catalog grid and the saved-list grid. The switcher is hidden during search — search always queries Cinemeta + addon catalogs, never the local list, and starting a search exits watchlist mode.
+- Inside the watchlist view, the regular `SearchTabs` component is reused for the `All / Movies / Series` segment with live counts. The `CatalogSelector` is hidden in this mode.
+- An empty Watchlist view shows a hint to bookmark cards from any other surface.
+
+### URL state and navigation
+
+The active mode is reflected in the URL so back/forward navigation works:
+
+- `?watchlist=1` — Watchlist view active
+- `?watchlist=1&watchlist-type=movie` — Watchlist view filtered to movies/series
+- No `watchlist` param — Catalog view (default)
+- `?tab=reviews` — reviews tab active inside an open stream modal (absent = streams tab); cleared on modal close
+
+The Preact app pushes a history entry on each switcher click and listens to `popstate` so the user can navigate between catalog → watchlist → modal → catalog with the browser controls. Direct links to `/discover?watchlist=1` open the Watchlist view immediately and lazy-load items on first paint.
+
+The browser's bookmark badge state persists server-side and is rehydrated on every page load via `GET /discover/watchlist/ids` — independently of the URL `watchlist` flag.
+
+### Data model
+
+Two parallel tables, symmetric to `movie_status` / `series_status`:
+
+- `public.movie_watchlist (user_id, video_id, source, created_at)` — PK `(user_id, video_id)`
+- `public.series_watchlist (user_id, video_id, source, created_at)` — PK `(user_id, video_id)`
+
+There is no FK on `movie_metadata` / `series_metadata`: a user can bookmark before metadata is cached. The handler triggers `Enricher.LookupByVideoID` + `UpsertXxxMetadata` on insert so the next list call has a full card.
+
+`source` records the entry point (`ai`, `search`, `catalog`, `streamy`) — used as a future signal for the recommendation engine and to measure CTR per surface.
+
+### AI cross-feed
+
+The watchlist is fed into the AI Discover prompt alongside the rated-history block: see `services/recommendations/context.go` (`UserContextBuilder.Build` calls `ListUserWatchlist`) and the "Watchlist as taste signal" section in `docs/ai_recommendations.md`. Claude uses it both as a strong taste hint and as an exclusion list, and the `isAlreadyKnown` post-filter drops any Claude-leaked duplicate (matched against `FilterMovieWatchlistVideoIDs` / `FilterSeriesWatchlistVideoIDs`). A user with no watch history but a populated watchlist now gets Claude-generated chips instead of the static cold-start set.
+
+### Free-tier limit
+
+Combined movie + series watchlist size is capped at **200** for free users (`FreeTierWatchlistLimit` in `handlers/discover_watchlist/handler.go`). Paid users are unlimited. The limit is a soft anti-abuse cap, not a billing lever — it only kicks in on add. Hitting it returns 402 with `{ code: "limit_exceeded", limit }`. The Preact app surfaces a toast and rolls back the optimistic insert.
+
+### HTTP contract
+
+```
+GET    /discover/watchlist             → 200 { items, video_ids, limit }
+GET    /discover/watchlist/ids         → 200 { video_ids, limit }
+POST   /discover/watchlist             → 200 { added }   |   402 { code, limit }
+DELETE /discover/watchlist/:type/:vid  → 200 { removed }
+```
+
+`items` are returned in Cinemeta-shape (`id, type, name, year, poster, imdbRating`) so the same `ItemGrid` renders both modes without source-of-truth branching. `type` is `movie` or `series`; ordering is newest-first, movies and series merged by `created_at`.
+
+## Analytics (Umami)
+
+Events tracked:
+
+- `discover-catalog-loaded` — catalog fetch completed (`type`, `catalog`)
+- `discover-search` — search performed (`query`, `count`)
+- `discover-streams-loaded` — streams fetched for item (`type`, `id`, `count`)
+- `discover-wizard-opened` — addon wizard opened
+- `discover-wizard-installed` — addons installed via wizard (`count`)
+- `discover-ribbon-click` — homepage ribbon clicked
+- `discover-see-more-click` — "See more" link clicked on homepage
+- `watchlist-mode-changed` — Catalog | Watchlist switcher flipped (`mode`: `'catalog'`|`'watchlist'`)
+- `watchlist-added` — heart icon clicked on a card not yet in the list (`id`, `source`)
+- `watchlist-removed` — heart icon clicked on a card already in the list (`id`, `source`)
+- `ai-watchlist-toggled` — heart icon clicked on an AI recommendation card (`id`, `on`)
+- `stream-from-watchlist` — a card was clicked while the Watchlist view was active (no params; bare counter so the conversion ratio is `count(stream-from-watchlist) / count(watchlist-added)`)
+- `discover-reviews-expand` — TMDB reviews section expanded in the stream modal (`id`); the gate metric for investing further in reviews (translation, more sources)
+- `discover-4k-toggle-attempt` / `-enabled` / `-disabled` / `-cancelled` — the 4K switch (no fields; names unchanged)
+- `discover-hevc-toggle-attempt` / `-enabled` / `-disabled` / `-cancelled`, and the same `discover-hdr-*` — the HEVC and HDR switches (`browser`: `yes` / `no` / `unknown`, whether it decodes them); `toggle-attempt` is the warning shown
+- `discover-streams-classified` — once per stream list: `n`, how many the names read as `hevc` / `hdr` / `uhd` / `dv5` / `unknown_codec`, how many the switches `hidden` and whether that left the list `empty`, the browser's `dec_hevc` / `dec_pq` (`yes` / `no` / `unknown`), the transcoder's `caps`, `uhd_plays`. How often the defaults hide releases and empty lists
+- `discover-release-check` — sent by the player on the first frame of a release opened from Discover (sessionStorage `wt-discover-release`, 30 min, taken once): what the name said (`rel_codec`, `rel_hdr`, `rel_dv5`, `rel_uhd`) against the file (`src`: the media probe's codec) and the session's `route` / `reason` (the transcoder's reason says `dv5` and the like only where it probed the source: a declaring browser, passthrough on). The error of the name rules on Discover's lists
+
+## Addon Health
+
+When a user's Stremio addon (Torrentio, MediaFusion, …) is down, Discover used to degrade silently: failed manifests were filtered out by `Promise.allSettled` and the user saw the same "no streams" / smaller-catalog list as if their selection genuinely had no content. The fix is a centralised per-addon health model surfaced in three places, backed by a server-side manifest snapshot.
+
+### Server-side snapshot (migration #52)
+
+`stremio_addon_url` carries a snapshot of the manifest fields we want to surface even when the addon is currently unreachable:
+
+```
+manifest_id          text         -- manifest.id
+name                 text         -- manifest.name (used by chip / profile)
+manifest_version     text         -- manifest.version
+manifest_resources   jsonb        -- string[] of resource names
+manifest_types       jsonb        -- string[] of supported types
+manifest_logo        text         -- manifest.logo URL (rendered as profile addon icon)
+manifest_fetched_at  timestamptz  -- when the snapshot was last refreshed
+```
+
+The logo is stored as a third-party URL (no proxying). The profile UI loads it as `<img src referrerpolicy="no-referrer">` with a first-letter initial behind it as fallback — if the image 404s or the addon's CDN dies, the initial keeps the row visually grounded.
+
+All columns are nullable. Pre-existing rows (added before migration #52) carry NULLs and are picked up by the lazy backfill below.
+
+**Capture sites:**
+- `POST /stremio/addon-url/add` and `/batch-add` — `AddonValidator.ValidateAndFetch` parses the manifest once and persists the snapshot together with the URL. Failures inside `batch-add` are tolerated (snapshot left NULL); single-add still fails the request because that's the user's only feedback signal.
+- `POST /stremio/addon-url/:id/refresh-snapshot` — server-side re-fetch + persist. Returns the new snapshot in JSON. Used by:
+  1. The lazy backfill from the Discover client (when `fetchAllManifests` succeeds for an addon whose snapshot is missing or older than 7 days).
+  2. The per-addon "Refresh" button in the profile UI.
+
+The 7-day staleness threshold lives in `assets/src/js/lib/discover/addonsApi.js::isSnapshotStale`. Refresh requests are fire-and-forget — failures don't surface to the user beyond an optional toast in the profile.
+
+### Client bootstrap
+
+`handlers/discover/handler.go` serializes the rich shape into `window._addons`:
+
+```js
+{ id, url, name, manifestId, version, resources[], types[], fetchedAt }
+```
+
+`assets/src/js/app/discover.js` prepends a synthetic Cinemeta seed (we never persist it server-side because Cinemeta is hardcoded) and hands the seeds to `StremioClient`. The chip and selector get names and capabilities up front; the manifest fetch fills in catalogs and confirms health.
+
+### Status model
+
+`StremioClient.fetchAllManifests()` (`assets/src/js/lib/discover/client.js`) returns one record per addon URL — never silently drops failures:
+
+```js
+{
+    baseUrl,
+    manifest,         // null when addon is unreachable AND no cache hit AND no seed
+    status,           // 'ok' | 'unreachable' | 'misconfigured'
+    source,           // 'fresh' | 'cache' | 'seed' | null
+    error,            // string from the fetch failure (optional)
+    lastSuccessAt,    // unix-ms (only when source is cache or seed)
+}
+```
+
+Failure buckets:
+
+- `unreachable` — network error, timeout, 5xx, malformed JSON. User-facing copy: "not responding". Action: retry.
+- `misconfigured` — 401/403/404. User-facing copy: "check the addon URL". Action: open profile.
+
+**Fallback chain** on fetch failure:
+1. localStorage cache (`manifestCache.read`) — overwritten on every successful fetch, 30-day sanity cap.
+2. Server seed (the snapshot from `window._addons`) — survives across browsers and private windows because it lives in PostgreSQL.
+3. Nothing — addon shows as host only.
+
+The classification lives in `client.js::classifyError`.
+
+### Status model
+
+`StremioClient.fetchAllManifests()` (`assets/src/js/lib/discover/client.js`) returns one record per addon URL — never silently drops failures:
+
+```js
+{
+    baseUrl,
+    manifest,         // null when addon is unreachable AND no cache hit
+    status,           // 'ok' | 'unreachable' | 'misconfigured'
+    source,           // 'fresh' | 'cache' | null
+    error,            // string from the fetch failure (optional)
+    lastSuccessAt,    // unix-ms (only when source === 'cache')
+}
+```
+
+Failure buckets:
+
+- `unreachable` — network error, timeout, 5xx, malformed JSON. User-facing copy: "not responding". Action: retry.
+- `misconfigured` — 401/403/404. User-facing copy: "check the addon URL". Action: open profile.
+
+The classification lives in `client.js::classifyError`. On any failure we read `manifestCache.read(baseUrl)`; if there's a hit, we keep the cached manifest and tag the entry `source: 'cache'` so the UI can still render the addon's catalogs (disabled).
+
+### Manifest cache (`manifestCache.js`)
+
+`localStorage`-backed, key prefix `stremio.manifest.`. Overwrite-on-success only — a failing fetch never invalidates the stored copy. 30-day sanity cap drops genuinely abandoned entries. `prune(activeBaseUrls)` runs once per `StremioClient` construction to drop entries whose addon URL is no longer in the user's profile, plus anything past the cap. Single-entry size guard at 200 KB to prevent one oversized manifest from blowing the storage quota.
+
+This is a per-browser fallback. The server-side snapshot is the cross-browser one — both work together, with the localStorage hit checked first in the fallback chain.
+
+### Centralised state
+
+`state.addons` in the reducer (`discoverReducer.js`) is a flat array built by `buildAddons(addonStatuses)`:
+
+```js
+{ baseUrl, host, name, status, source, capabilities, lastSuccessAt, error }
+```
+
+Catalogs built by `buildCatalogs(addonStatuses)` carry `disabled: status !== 'ok'` and `addonStatus`. The same source feeds three UI surfaces:
+
+1. **`AddonHealthChip`** in the Discover sticky header. Hidden when every addon is `ok`. Otherwise renders a yellow warning row ("N of M addons unavailable" or "All addons unavailable") with an inline retry button and an expandable drawer listing every addon with its status, capabilities, and a "Manage addons" link to `/profile`.
+2. **`CatalogSelector`** (`Tabs.jsx`) groups options by addon when multiple addons are present. Disabled catalogs sit in an `<optgroup label="Torrentio · unavailable">` with `<option disabled>` and a `⚠` prefix — the user sees their previously-available catalogs, just greyed out, instead of having them silently vanish.
+3. **`StreamModal` `StreamContent`** (`StreamModal.jsx`) — the modal carries `failedAddons` from `loadStreams`. Two new branches:
+    - `streams.length === 0 && failedAddons.length > 0` → dedicated empty-state with explicit attribution ("Torrentio isn't responding") plus the retry button. Different copy from the generic `discover.noStreams`.
+    - `streams.length > 0 && failedAddons.length > 0` → thin yellow banner above the list ("Torrentio didn't respond — list may be incomplete") with retry.
+
+`failedAddons` combines two sources: addons whose stream fetch errored mid-flight, plus addons we couldn't even probe (manifest is unreachable AND its capabilities either include `stream` from cache or are unknown). Without the inferred branch, an addon that was already down at page load wouldn't appear in the modal at all.
+
+### Retry paths
+
+- `retryAddons` (chip retry) — re-fetches manifests, updates `state.addons` and `state.catalogs`. Does **not** drop the page back into the loading view; preserves the user's current type/catalog selection.
+- `retryStreams` (modal retry) — `retryAddons` + re-issues `loadStreams` for the currently-open modal. Re-uses URL params to reconstruct the stream id (handles series episodes via `tt:season:episode`).
+- `retry` (full-page error retry, pre-existing) — only used when init itself throws.
+
+### Pre-selected disabled catalog
+
+When the URL points at a catalog whose addon is currently down (e.g. `?catalog-base=torrentio.strem.fun&catalog-id=top`), `loadCatalog` short-circuits on `catalog.disabled` and the grid renders `CatalogUnavailable` (`EmptyStates.jsx`) — explicit attribution to the addon, retry button, and a copy that nudges the user to pick another catalog. The chip is still visible and still works.
+
+### What's intentionally NOT done
+
+- **Active health-check** (background ping). Too costly in upstream addon load and in trust assumptions. Health is observed when used, not polled.
+- **Differentiation beyond `unreachable` / `misconfigured`**. Granular HTTP-code-specific copy adds maintenance overhead without changing what the user can do.
+- **Server-side addon health endpoint**. All current consumers (chip, selector, modal) live in the same Discover SPA and read the same client-side state. Cross-feature signals (profile, dashboard) would justify it later.
+
+### Profile UI (per-addon snapshot)
+
+`templates/partials/profile/addon_urls.html` renders each addon row with the snapshot when present:
+- 36×36 logo from `manifest_logo` with a first-letter initial behind it as fallback (visible if the image fails to load or there's no logo URL).
+- Addon name (bold) over the URL (muted) when `name` is set; otherwise the URL alone.
+- Capability pills derived from `manifest_resources` (e.g. `catalog`, `stream`, `meta`).
+- Per-addon "Refresh" icon button → `POST /stremio/addon-url/:id/refresh-snapshot`. The row's logo + name + pills are re-rendered inline from the JSON response. Toast feedback via `profile.addons.refreshed` / `profile.addons.refreshFailed`.
+
+### i18n keys
+
+All copy goes through `t/tf` with translations in `locales/{en,ru,es,de,fr,pt,it,pl,tr,nl,cs}.json`:
+
+- `discover.allAddonsDown`, `discover.addonsPartialDown`, `discover.addonGroupUnavailable`
+- `discover.addonReady`, `discover.addonUnreachable`, `discover.addonUnreachableCached`, `discover.addonMisconfigured`
+- `discover.manageAddons`, `discover.collapse`, `discover.expand`
+- `discover.catalogTemporarilyUnavailable`, `discover.catalogUnavailableBody`, `discover.catalogUnavailableBodyGeneric`
+- `discover.streamsFailedTitle`, `discover.streamsFailedOne`, `discover.streamsFailedMany`, `discover.streamsFailedBody`
+- `discover.streamsPartialFailureOne`, `discover.streamsPartialFailureMany`
+- `profile.addons.refresh`, `profile.addons.refreshed`, `profile.addons.refreshFailed`
+
+## Addon Protocol
+
+Uses the [Stremio addon protocol](https://github.com/Stremio/stremio-addon-sdk/blob/master/docs/protocol.md):
+
+- Manifest: `GET {baseUrl}/manifest.json`
+- Catalog: `GET {baseUrl}/catalog/{type}/{catalogId}.json` (with optional `/skip={n}`)
+- Search: `GET {baseUrl}/catalog/{type}/{catalogId}/search={query}.json`
+- Meta: `GET {baseUrl}/meta/{type}/{id}.json`
+- Streams: `GET {baseUrl}/stream/{type}/{id}.json`
+
+## Cached streams first
+
+Streams Webtor already holds get an "Instant" chip and are listed first — see `docs/cache_index.md` (`POST /discover/availability`).

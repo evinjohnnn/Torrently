@@ -1,0 +1,12 @@
+{
+  "input": "1922.2017.720p.WEBRip.2CH.sample.mkv",
+  "want": {
+    "title": "1922",
+    "year": 2017,
+    "resolution": "720p",
+    "quality": "WEBRip",
+    "audio": "2CH",
+    "container": "mkv",
+    "sample": true
+  }
+}

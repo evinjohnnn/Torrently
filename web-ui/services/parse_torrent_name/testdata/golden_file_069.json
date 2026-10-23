@@ -1,0 +1,10 @@
+{
+  "input": "War Dogs (2016) HDTS 600MB - NBY",
+  "want": {
+    "title": "War Dogs",
+    "year": 2016,
+    "quality": "HDTS",
+    "group": "NBY",
+    "size": "600MB"
+  }
+}

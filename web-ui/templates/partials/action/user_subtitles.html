@@ -1,0 +1,149 @@
+{{ define "user_subtitles_view" }}
+{{ $lang := .Ctx.Lang }}
+{{ $data := .Data }}
+{{ $expanded := $data.ExpandedLang }}
+{{ $off := $data.SubtitlesOff }}
+{{/* Rendered into the #my-subtitles wrapper, which sits AFTER
+     #subtitle-tracks: a role="radiogroup" holds radios and nothing else,
+     and this partial's disclosure button and uploads panel are neither.
+     The MY chips still belong in the radiogroup, grouped by language like
+     every other track — so who renders them depends on which render this
+     is (.RenderChips):
+
+       initial page render  — the dialog's own track loop renders every
+                              upload (they are UserSubtitle items in the
+                              same GetSubtitles result) straight into the
+                              row; this partial renders panel + toggle only,
+                              and a no-JS page is already correct.
+       async reload         — nothing re-runs that loop, this partial is the
+                              whole response, so it renders the chips here,
+                              inside #my-upload-chips, and the client moves
+                              them into the radiogroup (adoptUploadChips in
+                              track-picker.js).
+
+     #my-upload-chips exists only on that second render, and its presence is
+     what tells the client "this is the server's current, complete list of
+     this viewer's uploads". That matters for a delete: the response then
+     holds one chip fewer — or none at all — and the client has to take the
+     deleted one out of the row. Without a marker an empty wrapper would be
+     indistinguishable from the initial render, where the row's MY chips are
+     the only ones there are and clearing them would empty the row.
+
+     Selection and deletion are deliberately separate elements: the chip is
+     a radio and only switches the track, while deleting a file is only
+     possible from its row in the panel below. An accidental tap on a chip
+     must never destroy an upload. */}}
+{{ if $data.RenderChips }}
+<div id="my-upload-chips" class="contents">
+{{ if .Ctx.User | hasAuth }}
+    {{ range $data.UserSubtitles }}
+    {{ $d := langDisplay .SrcLang }}
+    {{/* An upload is rank 0 on the ladder, so it is the likeliest thing the
+         subtitles switch would turn on: it has to carry data-suggested like
+         any other chip, and wear the muted block's check and fill while the
+         switch is off — the same rule stream_video.html applies to the
+         chips it renders itself. */}}
+    {{ $marked := or .Default (and $off .Suggested) }}
+    <button type="button" role="radio" aria-checked="{{ if $marked }}true{{ else }}false{{ end }}"
+            data-id="{{ .ID }}" data-provider="UserSubtitle" data-src="{{ .Src }}" data-label="{{ .OriginalName }}" data-srclang="{{ .SrcLang }}" data-kind="subtitles" data-badge="user"
+            data-lang="{{ $d.Lang }}" data-lang-name="{{ $d.Name }}" data-lang-flag="{{ $d.Flag }}"
+            {{/* ladderRank("UserSubtitle") — this list is rendered from its
+                 own view model, so the rank is fixed here rather than
+                 carried per item. */}}
+            data-rank="0"
+            {{ if .Default }}data-default="true" {{ end }}{{ if .Saved }}data-saved="true" {{ end }}{{ if .Suggested }}data-suggested="true" {{ end }}{{ if .Selected }}data-autoselect="true" {{ end }}{{ if $off }}aria-disabled="true" {{ end }}
+            {{/* Collapsed by the same rule as every other chip in the row.
+                 ExpandedLang is empty on the async reload, which has no
+                 language row to consult: nothing is collapsed then and the
+                 client re-applies the filter right after the swap. */}}
+            {{ if and $expanded (ne $d.Lang $expanded) }}hidden{{ end }}
+            class="subtitle track-chip{{ if $marked }} track-chip-active{{ end }}">
+        <svg class="chip-check w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" aria-hidden="true"{{ if not $marked }} hidden{{ end }}><polyline points="20 6 9 17 4 12"/></svg>
+        <span class="chip-origin badge badge-xs font-mono font-semibold tracking-wider bg-w-purple/10 border-w-purple/30 text-w-purpleL" title="{{ t $lang "action.stream.origin.my" }}">MY</span>
+        <span class="max-w-[9rem] sm:max-w-[14rem] truncate" title="{{ .OriginalName }}">{{ .OriginalName }}</span>
+    </button>
+    {{ end }}
+{{ end }}
+</div>
+{{ end }}
+<button type="button" id="my-uploads-toggle" class="btn btn-sm btn-ghost border border-dashed border-w-line text-w-muted hover:border-w-purple/40 hover:text-w-purpleL gap-1.5 shrink-0"
+        aria-expanded="false" aria-controls="my-uploads-panel">+ {{ t $lang "action.stream.mySubtitles" }}</button>
+<div id="my-uploads-panel" class="basis-full w-full mt-2 p-4 rounded-xl bg-base-200/50 border border-w-line" hidden>
+    {{/* The panel opens from the chip above and used to close only by
+         pressing that same chip again — a way back you have to remember.
+         The "×" says it out loud. It is the panel's own control, so it
+         lives in the heading line rather than next to the first upload row,
+         and it is type="button": the panel holds the upload form and one
+         delete form per file, and a default submit button here would post
+         whichever one it landed in. Player.jsx closes the panel from the
+         same delegate as the chip, so both paths leave the same state
+         behind (hidden panel, aria-expanded="false", data-upload-open
+         false on the wrapper that survives the async swap). */}}
+    <div class="flex items-start justify-between gap-3 mb-3">
+        <h3 class="font-bold text-lg">{{ t $lang "action.stream.mySubtitles" }}</h3>
+        <button type="button" id="my-uploads-close" class="btn btn-ghost btn-xs text-w-muted hover:text-base-content" aria-label="{{ t $lang "action.stream.close" }}" aria-controls="my-uploads-panel">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="w-4 h-4" aria-hidden="true">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12"/>
+            </svg>
+        </button>
+    </div>
+    {{ if $data.ErrKey }}
+        <div class="text-sm text-error mb-3">{{ t $lang $data.ErrKey }}</div>
+    {{ end }}
+    {{ if not (.Ctx.User | hasAuth) }}
+        <div class="py-6 text-center">
+            <p class="mb-4 text-w-sub">{{ t $lang "action.stream.mySubtitles.signInPrompt" }}</p>
+            <a class="btn btn-soft" href="{{ langPath $lang "/login" }}?return-url={{ langPath $lang (printf "/%s?file=%s" $data.ResourceID $data.Path) }}">{{ t $lang "action.stream.mySubtitles.signIn" }}</a>
+        </div>
+    {{ else }}
+        {{ if $data.UserSubtitles }}
+            {{/* One delete control per upload — the only place a file can be
+                 destroyed. Same route and same async target as before the
+                 redesign, so the reload path is unchanged. */}}
+            <ul class="w-full bg-base-200/50 rounded-xl divide-y divide-w-line mb-4">
+                {{ range $data.UserSubtitles }}
+                    <li class="p-3 flex items-center gap-4">
+                        <div class="flex-1 min-w-0">
+                            <div class="font-medium text-sm break-all">{{ .OriginalName }}</div>
+                            <div class="text-xs text-w-muted mt-0.5">{{ .Format }} · {{ .Size | bitsForHumans }}</div>
+                        </div>
+                        <form method="post"
+                              action="{{ langPath $lang .DeleteURL }}"
+                              class="shrink-0"
+                              data-async-target="#my-subtitles"
+                              data-async-push-state="false">
+                            <input type="hidden" name="_csrf" value="{{ $.Ctx.CSRF }}">
+                            <input type="hidden" name="ei_url" value="{{ $data.EIURL }}">
+                            <button type="submit" class="btn btn-ghost btn-sm text-w-pinkL hover:bg-w-pink/10" aria-label="{{ t $lang "action.stream.mySubtitles.delete" }}" data-umami-event="user-subtitle-delete">
+                                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="size-5">
+                                    <path stroke-linecap="round" stroke-linejoin="round" d="m14.74 9-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 0 0-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 0 1 3.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 0 0-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 0 0-7.5 0"/>
+                                </svg>
+                            </button>
+                        </form>
+                    </li>
+                {{ end }}
+            </ul>
+        {{ end }}
+        {{ if lt (len $data.UserSubtitles) 10 }}
+            <form method="post"
+                  action="{{ langPath $lang "/user-subtitle" }}"
+                  enctype="multipart/form-data"
+                  class="user-subtitle-form"
+                  data-async-target="#my-subtitles"
+                  data-async-push-state="false">
+                <input type="hidden" name="_csrf" value="{{ .Ctx.CSRF }}">
+                <input type="hidden" name="resource_id" value="{{ $data.ResourceID }}">
+                <input type="hidden" name="path" value="{{ $data.Path }}">
+                <input type="hidden" name="ei_url" value="{{ $data.EIURL }}">
+                <label class="upload-dashed flex flex-col items-center justify-center p-6 cursor-pointer text-center rounded">
+                    <span class="text-w-sub mb-2">{{ t $lang "action.stream.mySubtitles.dragHint" }}</span>
+                    <span class="text-xs text-w-muted">{{ t $lang "action.stream.mySubtitles.formats" }}</span>
+                    <input type="file" name="file" accept=".srt,.vtt,.ass,text/vtt,application/x-subrip" class="hidden user-subtitle-input">
+                </label>
+            </form>
+        {{ else }}
+            <p class="text-sm text-w-sub">{{ t $lang "action.stream.mySubtitles.limitReached" }}</p>
+        {{ end }}
+    {{ end }}
+</div>
+{{ end }}

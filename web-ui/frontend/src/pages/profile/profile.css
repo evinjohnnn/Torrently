@@ -1,0 +1,755 @@
+/* Profile: settings in glass panes, a section index beside them on wide screens. */
+
+.pf-page {
+  padding-top: 32px;
+  padding-bottom: 64px;
+}
+.pf-head {
+  max-width: 720px;
+  margin-bottom: 28px;
+}
+.pf-head h1 {
+  font-size: var(--step-4);
+  letter-spacing: -0.04em;
+}
+.pf-head .lede {
+  margin-top: 10px;
+}
+.pf-back {
+  margin: 0 0 8px -12px;
+}
+
+.pf-layout {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 40px;
+  align-items: start;
+}
+.pf-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+  max-width: 820px;
+}
+
+/* ───────── Index ───────── */
+
+.pf-index {
+  position: sticky;
+  top: calc(var(--nav-h) + 24px);
+  max-height: calc(100vh - var(--nav-h) - 48px);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 4px;
+}
+.pf-index ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.pf-index-title {
+  padding: 0 12px 4px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-3);
+}
+.pf-index a {
+  display: block;
+  padding: 7px 12px;
+  border-radius: var(--r-sm);
+  color: var(--ink-2);
+  font-size: 14px;
+  line-height: 1.35;
+  text-decoration: none;
+  transition: background-color 200ms var(--ease), color 200ms var(--ease);
+}
+.pf-index a:hover {
+  color: var(--ink);
+  background: var(--hover);
+}
+.pf-index a.active {
+  color: var(--olive-ink);
+  background: var(--olive-wash);
+  font-weight: 600;
+}
+.pf-index-group:first-child a:first-child {
+  text-transform: capitalize;
+}
+@media (max-width: 960px) {
+  .pf-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .pf-index {
+    display: none;
+  }
+}
+
+/* ───────── Groups and sections ───────── */
+
+.pf-group-title {
+  margin-top: 28px;
+  font-size: var(--step-2);
+  letter-spacing: -0.03em;
+}
+.pf-section {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 24px;
+  border-radius: var(--r-xl);
+}
+.pf-section:focus {
+  outline: none;
+}
+.pf-section-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.pf-section-head h3 {
+  font-size: var(--step-1);
+  letter-spacing: -0.02em;
+}
+.pf-section-icon {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: var(--r-sm);
+  background: var(--olive-wash);
+  color: var(--olive-ink);
+}
+.pf-intro {
+  color: var(--ink-2);
+  max-width: 68ch;
+}
+@media (max-width: 640px) {
+  .pf-section {
+    padding: 18px 16px;
+    border-radius: var(--r-lg);
+  }
+}
+
+/* ───────── Plan ───────── */
+
+.pf-plan {
+  padding: 24px;
+  border-radius: var(--r-xl);
+  background:
+    radial-gradient(120% 140% at 100% 0%, var(--olive-wash), transparent 60%),
+    var(--glass);
+}
+.pf-plan:focus {
+  outline: none;
+}
+.pf-plan-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 16px;
+}
+.pf-plan-mark {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: var(--ink);
+  color: var(--cream);
+}
+.pf-plan-name {
+  font-size: var(--step-3);
+  letter-spacing: -0.04em;
+}
+.pf-plan-name::first-letter {
+  text-transform: uppercase;
+}
+.pf-billing {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--hairline);
+  color: var(--ink-2);
+  font-size: 15px;
+}
+@media (max-width: 640px) {
+  .pf-plan {
+    padding: 18px 16px;
+    border-radius: var(--r-lg);
+  }
+}
+
+/* ───────── Bits ───────── */
+
+.pf-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  align-self: flex-start;
+  min-height: 44px;
+  padding: 8px 12px;
+  margin-left: -12px;
+  border-radius: var(--pill);
+  color: var(--olive-ink);
+  font-size: 14px;
+  font-weight: 500;
+  text-decoration: none;
+}
+.pf-link:hover {
+  color: var(--ink);
+  background: var(--hover);
+}
+.pf-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+}
+.pf-actions .pf-link {
+  margin-left: 0;
+}
+.pf-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.pf-foot .button {
+  margin-left: auto;
+}
+.pf-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.pf-tags .chip.mono {
+  font-size: 12px;
+}
+.pf-truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pf-break {
+  overflow-wrap: anywhere;
+}
+.pf-confirm-text {
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+.pf-locked p {
+  margin-bottom: 2px;
+}
+.pf-locked a {
+  font-weight: 600;
+}
+.pf-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+  margin: 0;
+}
+.pf-facts div {
+  padding: 14px 16px;
+  border-radius: var(--r-md);
+  background: var(--well);
+  border: 1px solid var(--glass-line);
+}
+.pf-facts dt {
+  font-size: 14px;
+  color: var(--ink-2);
+}
+.pf-facts dd {
+  margin: 4px 0 0;
+  font-size: var(--step-2);
+  font-weight: 700;
+}
+
+/* ───────── Forms ───────── */
+
+.pf-add {
+  display: flex;
+  gap: 8px;
+}
+.pf-add .input {
+  flex: 1;
+  min-width: 0;
+}
+.pf-add .select {
+  flex: 0 1 220px;
+}
+.pf-add-wide .input + .input {
+  flex: 0 1 220px;
+}
+.pf-add .button {
+  min-height: 48px;
+}
+@media (max-width: 640px) {
+  .pf-add {
+    flex-direction: column;
+  }
+  .pf-add .select,
+  .pf-add-wide .input + .input {
+    flex: none;
+  }
+  .pf-add .button {
+    align-self: flex-start;
+  }
+}
+.pf-form {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+  max-width: 400px;
+}
+.pf-form .field {
+  align-self: stretch;
+}
+.pf-copy-field > label {
+  color: var(--ink-2);
+}
+.pf-copy {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.pf-copy .input {
+  flex: 1;
+  min-width: 0;
+  font-size: 13.5px;
+}
+.pf-setting {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--hairline);
+}
+.pf-rows + .pf-setting {
+  padding-top: 0;
+  border-top: 0;
+}
+.pf-setting > div {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  max-width: 60ch;
+}
+.pf-setting-title {
+  font-size: 15px;
+  font-weight: 600;
+}
+.pf-setting .select {
+  flex: 0 0 220px;
+  width: 220px;
+}
+@media (max-width: 640px) {
+  .pf-setting:has(.select) {
+    flex-direction: column;
+  }
+  .pf-setting .select {
+    flex: none;
+    width: 100%;
+  }
+}
+.pf-dialog-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.pf-fieldset {
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.pf-fieldset legend {
+  margin-bottom: 6px;
+  font-size: 14px;
+  font-weight: 500;
+}
+.pf-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 20px;
+}
+.pf-checks .check {
+  min-height: 44px;
+}
+
+/* ───────── Switch ───────── */
+
+.pf-switch {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  flex: none;
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--ink-2);
+}
+.pf-switch input {
+  position: absolute;
+  opacity: 0;
+  width: 44px;
+  height: 26px;
+  margin: 0;
+  cursor: inherit;
+}
+.pf-switch-track {
+  position: relative;
+  width: 44px;
+  height: 26px;
+  border-radius: var(--pill);
+  background: rgba(28, 31, 20, 0.18);
+  transition: background-color 200ms var(--ease);
+}
+.pf-switch-track::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--cream);
+  box-shadow: 0 1px 3px rgba(28, 31, 20, 0.3);
+  transition: transform 200ms var(--ease);
+}
+.pf-switch input:checked + .pf-switch-track {
+  background: var(--olive);
+}
+.pf-switch input:checked + .pf-switch-track::after {
+  transform: translateX(18px);
+}
+.pf-switch input:focus-visible + .pf-switch-track {
+  outline: 2px solid var(--olive);
+  outline-offset: 3px;
+}
+.pf-switch.disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+/* ───────── Rows ───────── */
+
+.pf-list-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px 16px;
+  margin-bottom: -8px;
+}
+.pf-list-head h4 {
+  font-size: 15px;
+  letter-spacing: -0.01em;
+}
+.pf-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border-top: 1px solid var(--hairline);
+}
+.pf-rows > li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 64px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--hairline);
+  transition: background-color 200ms var(--ease);
+}
+.pf-rows > li.dragging {
+  background: var(--olive-wash);
+  border-radius: var(--r-sm);
+}
+.pf-row-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.pf-row-main strong {
+  font-weight: 600;
+}
+.pf-row-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  font-size: 13px;
+  color: var(--ink-3);
+}
+.pf-row-meta.mono {
+  display: block;
+  font-size: 12px;
+}
+.pf-resolution {
+  font-size: 15px;
+  text-transform: capitalize;
+}
+.pf-empty {
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px !important;
+  padding: 20px 0 !important;
+  text-align: center;
+  color: var(--ink-2);
+}
+.pf-fixed .pf-row-main strong {
+  color: var(--ink-2);
+}
+.pf-grip {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  min-height: 44px;
+  border-radius: var(--r-sm);
+  color: var(--ink-3);
+  cursor: grab;
+  touch-action: none;
+}
+.pf-grip:hover {
+  color: var(--ink);
+  background: var(--hover);
+}
+.pf-rows > li.dragging .pf-grip {
+  cursor: grabbing;
+}
+span.pf-grip {
+  cursor: default;
+}
+.pf-delete {
+  flex: none;
+  min-width: 44px;
+}
+button.pf-delete:hover {
+  color: var(--brick);
+  background: var(--brick-wash);
+}
+.pf-spin svg {
+  animation: spin 0.9s linear infinite;
+}
+.pf-logo {
+  position: relative;
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  overflow: hidden;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--glass-line);
+  background: var(--paper-deep);
+  color: var(--ink-2);
+  font-size: 14px;
+  font-weight: 600;
+}
+.pf-logo img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: var(--cream);
+}
+.pf-poster {
+  position: relative;
+  flex: none;
+  width: 40px;
+  aspect-ratio: 2 / 3;
+  overflow: hidden;
+  border-radius: 8px;
+  border: 1px solid var(--glass-line);
+  background: linear-gradient(160deg, #e6dfc9, #cfd3b4);
+}
+.pf-poster img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+@media (max-width: 640px) {
+  .pf-rows > li {
+    gap: 4px;
+  }
+  .pf-logo {
+    display: none;
+  }
+}
+
+/* ───────── Account ───────── */
+
+.pf-account {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 32px;
+  padding-top: 24px;
+  border-top: 1px solid var(--hairline);
+}
+
+/* ───────── Payments ───────── */
+
+.pf-narrow {
+  max-width: 980px;
+}
+.pf-narrow > * + * {
+  margin-top: 16px;
+}
+.pf-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 15px;
+}
+.pf-table th {
+  padding: 0 12px 10px 0;
+  text-align: left;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ink-3);
+  border-bottom: 1px solid var(--hairline);
+}
+.pf-table td {
+  padding: 12px 12px 12px 0;
+  border-bottom: 1px solid var(--hairline);
+  white-space: nowrap;
+}
+.pf-table tr:last-child td {
+  border-bottom: 0;
+}
+.pf-table .pf-num {
+  text-align: right;
+}
+.pf-tier {
+  font-weight: 600;
+  text-transform: capitalize;
+}
+.pf-chip-link {
+  text-decoration: none;
+}
+.pf-chip-link:hover {
+  background: var(--olive-wash);
+  color: var(--olive-ink);
+}
+@media (max-width: 720px) {
+  .pf-table thead {
+    display: none;
+  }
+  .pf-table,
+  .pf-table tbody,
+  .pf-table tr,
+  .pf-table td {
+    display: block;
+  }
+  .pf-table tr {
+    padding: 10px 0;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .pf-table tr:last-child {
+    border-bottom: 0;
+  }
+  .pf-table td {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 4px 0;
+    border: 0;
+    white-space: normal;
+  }
+  .pf-table td::before {
+    content: attr(data-label);
+    color: var(--ink-3);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    font-weight: 400;
+    text-transform: none;
+  }
+  .pf-table .pf-num {
+    text-align: left;
+  }
+}
+
+/* ───────── Email result ───────── */
+
+.pf-result {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  max-width: 520px;
+  margin: 40px auto 0;
+  padding: 40px 28px;
+  border-radius: var(--r-xl);
+  text-align: center;
+}
+.pf-result h1 {
+  font-size: var(--step-3);
+}
+.pf-result-mark {
+  display: grid;
+  place-items: center;
+  width: 60px;
+  height: 60px;
+  border-radius: 50%;
+  background: var(--olive-wash);
+  color: var(--olive-ink);
+}
+.pf-result-mark.error {
+  background: var(--brick-wash);
+  color: var(--brick);
+}
+.pf-section-head + .pf-setting,
+.pf-intro + .pf-setting {
+  padding-top: 0;
+  border-top: 0;
+}
+@media (max-width: 640px) {
+  /* in a row the switch speaks for itself; its label stays for screen readers */
+  .pf-rows .pf-switch-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+}
+.pf-row-meta .chip {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.pf-row-main strong.mono {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 500;
+  word-break: break-all;
+}
+.pf-plan .pf-plan-payments {
+  margin-left: auto;
+}
+@media (max-width: 640px) {
+  .pf-plan .pf-plan-payments {
+    flex-basis: 100%;
+    margin-left: -12px;
+  }
+}

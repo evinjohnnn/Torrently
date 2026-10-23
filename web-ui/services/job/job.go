@@ -1,0 +1,756 @@
+package job
+
+import (
+	"context"
+	"runtime/debug"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/pkg/errors"
+
+	log "github.com/sirupsen/logrus"
+
+	"github.com/webtor-io/web-ui/helpers"
+	"github.com/webtor-io/web-ui/services/api"
+	"github.com/webtor-io/web-ui/services/metrics"
+)
+
+type Observer struct {
+	C      chan LogItem
+	ID     string
+	mux    sync.Mutex
+	closed bool
+}
+
+func (s *Observer) Push(ctx context.Context, v LogItem) {
+	s.mux.Lock()
+	defer s.mux.Unlock()
+	if s.closed {
+		return
+	}
+	select {
+	case <-ctx.Done():
+		return
+	case s.C <- v:
+		return
+	}
+}
+
+func (s *Observer) Close() {
+	s.mux.Lock()
+	defer s.mux.Unlock()
+	if s.closed {
+		return
+	}
+	s.closed = true
+	close(s.C)
+}
+
+func NewObserver() *Observer {
+	return &Observer{
+		C:  make(chan LogItem),
+		ID: uuid.New().String(),
+	}
+}
+
+// ErrorFormatter translates an error into a user-facing message.
+// When set, makeErrorMessage uses it instead of the default split-on-colon logic.
+type ErrorFormatter func(error) string
+
+type Job struct {
+	ID    string
+	Queue string
+	l     []LogItem
+	lmux  sync.Mutex
+	// lastStatus is the previous StatusUpdate line (tag + text) while no other
+	// item has been logged since; an identical redraw is dropped so a static
+	// line does not publish, log or push once per watchdog tick.
+	lastStatus *LogItem
+	runnable   Runnable
+	observers  map[string]*Observer
+	closed     bool
+	mux        sync.Mutex
+	cur        string
+	Context    context.Context
+	storage    Storage
+	main       bool
+	purge      bool
+	// noCache marks a run whose result must not outlive it. The job queue
+	// is also a cache -- a finished run's log is kept in storage and
+	// replayed to every later request with the same id, which for the
+	// stream job is ten minutes of viewers -- and that is wrong for a run
+	// that reached a correct page from an incomplete answer: it would
+	// serve that gap to everyone, and nothing afterwards could tell.
+	//
+	// Written by the script (DoNotCache) and read once Run has returned,
+	// in the goroutine that called it, so the two never overlap.
+	noCache        bool
+	errorFormatter ErrorFormatter
+}
+
+// DoNotCache says this run's result must not be replayed from storage to
+// later requests with the same id. The run itself still succeeds and the
+// viewer in front of it still gets their page: it is the *next* viewer this
+// protects, by making them run the job again rather than inherit a page
+// built from an answer that never arrived.
+//
+// Retiring the entry is enough -- Enqueue already drops storage 60 s after
+// a failed run, which is the same path with the same grace period, so a
+// viewer still replaying the log is unaffected. Returns the job so it can
+// be called in an expression.
+func (s *Job) DoNotCache() *Job {
+	s.noCache = true
+	return s
+}
+
+type LogItemLevel string
+
+const (
+	Info           LogItemLevel = "info"
+	Error          LogItemLevel = "error"
+	Warn           LogItemLevel = "warn"
+	Done           LogItemLevel = "done"
+	InProgress     LogItemLevel = "inprogress"
+	Redirect       LogItemLevel = "redirect"
+	Download       LogItemLevel = "download"
+	RenderTemplate LogItemLevel = "rendertemplate"
+	Custom         LogItemLevel = "custom"
+	StatusUpdate   LogItemLevel = "statusupdate"
+	Skip           LogItemLevel = "skip"
+	Close          LogItemLevel = "close"
+	Open           LogItemLevel = "open"
+)
+
+var levelMap = map[LogItemLevel]log.Level{
+	Info:       log.InfoLevel,
+	Open:       log.InfoLevel,
+	Error:      log.ErrorLevel,
+	Warn:       log.WarnLevel,
+	Done:       log.InfoLevel,
+	InProgress: log.InfoLevel,
+	Download:   log.InfoLevel,
+	Redirect:   log.InfoLevel,
+	// StatusUpdate redraws a live line (the warm-up watchdog rewrites it every
+	// second); it goes to the UI, not to Loki — Debug keeps it out of prod logs.
+	StatusUpdate:   log.DebugLevel,
+	RenderTemplate: log.InfoLevel,
+	Custom:         log.InfoLevel,
+	Skip:           log.InfoLevel,
+	Close:          log.InfoLevel,
+}
+
+type LogItem struct {
+	Level    LogItemLevel `json:"level,omitempty"`
+	Message  string       `json:"message,omitempty"`
+	Status   string       `json:"status,omitempty"`
+	Tag      string       `json:"tag,omitempty"`
+	Location string       `json:"location,omitempty"`
+	Template string       `json:"template,omitempty"`
+	Body     string       `json:"body,omitempty"`
+	// Data is what Body was rendered from, for a client that draws the
+	// card or player itself (the React app) instead of inserting Body.
+	Data      any       `json:"data,omitempty"`
+	Timestamp time.Time `json:"timestamp,omitempty"`
+}
+
+func New(ctx context.Context, id string, queue string, runnable Runnable, storage Storage, purge bool, ef ErrorFormatter) *Job {
+	return &Job{
+		ID:             id,
+		Queue:          queue,
+		runnable:       runnable,
+		Context:        ctx,
+		l:              []LogItem{},
+		observers:      map[string]*Observer{},
+		storage:        storage,
+		main:           true,
+		purge:          purge,
+		errorFormatter: ef,
+	}
+}
+
+func (s *Job) Run(ctx context.Context) error {
+	defer func() {
+		if r := recover(); r != nil {
+			log.WithField("stack", string(debug.Stack())).Errorf("job panic: %v", r)
+		}
+	}()
+	defer s.close()
+	s.open()
+	if !s.purge {
+		items, err := s.storage.Sub(ctx, s.Queue, s.ID)
+		if err != nil {
+			s.notStarted()
+			return err
+		}
+		if items != nil {
+			s.main = false
+			for i := range items {
+				if i.Level == Close {
+					s.close()
+				}
+				err = s.log(i)
+				if err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	} else {
+		err := s.storage.Drop(ctx, s.Queue, s.ID)
+		if err != nil {
+			s.notStarted()
+			return err
+		}
+	}
+
+	if s.runnable != nil {
+		err := s.execute(ctx)
+		if err != nil {
+			errr := s.Error(err)
+			if errr != nil {
+				return errr
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// notStarted reports a run the job store refused before the script started.
+// An observer of a job running elsewhere (no script) is not a run.
+func (s *Job) notStarted() {
+	if s.runnable != nil {
+		metrics.JobNotStarted(s.Queue)
+	}
+}
+
+// execute runs the script and reports its outcome exactly once. The log
+// lines for a failure are written twice (here in Error and again in retire),
+// so the counter lives with the execution rather than with the logging. A
+// replay of a stored result never reaches here and is not a run.
+func (s *Job) execute(ctx context.Context) (err error) {
+	metrics.JobStarted()
+	// A panicking script unwinds through this defer before Run's recover
+	// swallows it: with outcome left at error, a crashing script still counts.
+	outcome := metrics.JobError
+	defer func() {
+		metrics.JobFinished(s.Queue, outcome)
+	}()
+	err = s.runnable.Run(ctx, s)
+	outcome = outcomeOf(err)
+	return err
+}
+
+func outcomeOf(err error) string {
+	switch {
+	case err == nil:
+		return metrics.JobOK
+	case isStoplistBlock(err):
+		return metrics.JobRejected
+	default:
+		return metrics.JobError
+	}
+}
+
+func (s *Job) ObserveLog() *Observer {
+	s.mux.Lock()
+	defer s.mux.Unlock()
+	o := NewObserver()
+	s.observers[o.ID] = o
+	return o
+}
+
+func (s *Job) pushToObservers(ctx context.Context, l LogItem) {
+	s.mux.Lock()
+	// Create a snapshot of observers to avoid race conditions
+	observers := make([]*Observer, 0, len(s.observers))
+	for _, o := range s.observers {
+		observers = append(observers, o)
+	}
+	s.mux.Unlock()
+
+	wg := sync.WaitGroup{}
+	wg.Add(len(observers))
+	for _, o := range observers {
+		go func(o *Observer) {
+			o.Push(ctx, l)
+			wg.Done()
+		}(o)
+	}
+	wg.Wait()
+}
+
+func (s *Job) pubToStorage(l LogItem) (err error) {
+	if l.Level == Open {
+		return
+	}
+	return s.storage.Pub(s.Context, s.Queue, s.ID, l)
+}
+
+func (s *Job) logToLogger(l LogItem) {
+	message := l.Message
+	if message == "" {
+		message = string(l.Level)
+	}
+	log.WithFields(log.Fields{
+		"ID":       s.ID,
+		"Queue":    s.Queue,
+		"Tag":      l.Tag,
+		"Location": helpers.RedactURL(l.Location),
+		"Template": l.Template,
+		"Body":     helpers.RedactURL(l.Body),
+		"Status":   l.Status,
+	}).Log(levelMap[l.Level], helpers.RedactURL(message))
+}
+
+func (s *Job) log(l LogItem) error {
+	l.Timestamp = time.Now()
+
+	// Protect access to s.cur and s.l with mutex
+	s.lmux.Lock()
+	if l.Level == InProgress {
+		s.cur = l.Tag
+	} else if l.Tag == "" {
+		l.Tag = s.cur
+	}
+	if l.Level == StatusUpdate {
+		if s.lastStatus != nil && s.lastStatus.Tag == l.Tag && s.lastStatus.Status == l.Status {
+			s.lmux.Unlock()
+			return nil
+		}
+		ls := l
+		s.lastStatus = &ls
+	} else {
+		s.lastStatus = nil
+	}
+	s.l = append(s.l, l)
+	s.lmux.Unlock()
+
+	if s.main {
+		err := s.pubToStorage(l)
+		if err != nil {
+			return err
+		}
+	}
+
+	s.logToLogger(l)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	s.pushToObservers(ctx, l)
+
+	return nil
+}
+
+func (s *Job) open() *Job {
+	_ = s.log(LogItem{
+		Level: Open,
+	})
+	return s
+}
+
+func (s *Job) Info(message string) *Job {
+	_ = s.log(LogItem{
+		Level:   Info,
+		Message: message,
+	})
+	return s
+}
+
+func (s *Job) Warn(err error) *Job {
+	log.WithError(err).Warn("got job warning")
+	_ = s.log(LogItem{
+		Level:   Warn,
+		Message: s.formatError(err),
+		Tag:     s.cur,
+	})
+	return s
+}
+
+func makeErrorMessage(err error) string {
+	msg := strings.Split(err.Error(), ":")[0]
+	if errors.Is(err, context.DeadlineExceeded) {
+		return msg + " (deadline exceeded)"
+	}
+	return msg
+}
+
+func (s *Job) formatError(err error) string {
+	if s.errorFormatter != nil {
+		return s.errorFormatter(err)
+	}
+	return makeErrorMessage(err)
+}
+
+// isStoplistBlock reports whether err is a torrent-store stoplist rejection
+// (gRPC PermissionDenied with "found in stoplist" message, or rest-api's 403
+// for it, api.ErrForbidden, whose body the client drops). These are working-
+// as-intended CSAM blocks, not real errors — they bypass the "got job error"
+// log path to keep error counters meaningful.
+func isStoplistBlock(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, api.ErrForbidden) || strings.Contains(err.Error(), "found in stoplist")
+}
+
+func (s *Job) Error(err error) error {
+	fields := log.Fields{
+		"ID":    s.ID,
+		"Queue": s.Queue,
+		"Tag":   s.cur,
+	}
+	if isStoplistBlock(err) {
+		log.WithError(err).WithFields(fields).Warn("job rejected by stoplist")
+	} else {
+		log.WithError(err).WithFields(fields).Error("got job error")
+	}
+	_ = s.log(LogItem{
+		Level:   Error,
+		Message: s.formatError(err),
+		Tag:     s.cur,
+	})
+	return err
+}
+
+func (s *Job) InProgress(message string) *Job {
+	s.cur = message
+	_ = s.log(LogItem{
+		Level:   InProgress,
+		Message: message,
+		Tag:     s.cur,
+	})
+	return s
+}
+
+func (s *Job) StatusUpdate(status string) *Job {
+	_ = s.log(LogItem{
+		Level:  StatusUpdate,
+		Status: status,
+		Tag:    s.cur,
+	})
+	return s
+}
+
+func (s *Job) Done() *Job {
+	_ = s.log(LogItem{
+		Level: Done,
+		Tag:   s.cur,
+	})
+	return s
+}
+
+func (s *Job) Skip(message string) *Job {
+	s.cur = message
+	_ = s.log(LogItem{
+		Level:   Skip,
+		Message: message,
+		Tag:     s.cur,
+	})
+	return s
+}
+
+func (s *Job) Fail() *Job {
+	_ = s.log(LogItem{
+		Level: Error,
+		Tag:   s.cur,
+	})
+	return s
+}
+
+func (s *Job) DoneWithMessage(msg string) *Job {
+	_ = s.log(LogItem{
+		Level:   Done,
+		Tag:     s.cur,
+		Message: msg,
+	})
+	return s
+}
+
+func (s *Job) Download(url string, message string) *Job {
+	_ = s.log(LogItem{
+		Level:    Download,
+		Message:  message,
+		Location: url,
+	})
+	return s
+}
+
+func (s *Job) Redirect(url string, message string) *Job {
+	_ = s.log(LogItem{
+		Level:    Redirect,
+		Message:  message,
+		Location: url,
+	})
+	return s
+}
+
+func (s *Job) RenderTemplate(tag string, name string, body string) *Job {
+	return s.RenderTemplateWithData(tag, name, body, nil)
+}
+
+// RenderTemplateWithData is RenderTemplate with the view's data alongside.
+func (s *Job) RenderTemplateWithData(tag string, name string, body string, data any) *Job {
+	_ = s.log(LogItem{
+		Level:    RenderTemplate,
+		Template: name,
+		Tag:      tag,
+		Body:     body,
+		Data:     data,
+	})
+	return s
+}
+
+func (s *Job) close() {
+	if s.closed {
+		return
+	}
+	s.closed = true
+	_ = s.log(LogItem{
+		Level: Close,
+	})
+	// Snapshot under the lock, then close outside it — the same shape
+	// pushToObservers uses, and for the same reason: ObserveLog writes this
+	// map under s.mux from every SSE reader, so iterating it unlocked is a
+	// concurrent map iteration/write, which the runtime turns into an
+	// unrecoverable throw rather than a catchable panic.
+	s.mux.Lock()
+	observers := make([]*Observer, 0, len(s.observers))
+	for _, o := range s.observers {
+		observers = append(observers, o)
+	}
+	s.mux.Unlock()
+	for _, o := range observers {
+		o.Close()
+	}
+}
+
+func (s *Job) HasError() bool {
+	s.lmux.Lock()
+	defer s.lmux.Unlock()
+	if !s.closed {
+		return false
+	}
+	for _, item := range s.l {
+		if item.Level == Error {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Job) Custom(name string, body string) *Job {
+	return s.CustomWithData(name, body, nil)
+}
+
+// CustomWithData is Custom with the card's data alongside its markup.
+func (s *Job) CustomWithData(name string, body string, data any) *Job {
+	_ = s.log(LogItem{
+		Level:    Custom,
+		Template: name,
+		Body:     body,
+		Data:     data,
+	})
+	return s
+}
+
+type Jobs struct {
+	queue   string
+	mux     sync.Mutex
+	jobs    map[string]*Job
+	storage Storage
+}
+
+func newJobs(queue string, storage Storage) *Jobs {
+	return &Jobs{
+		queue:   queue,
+		jobs:    map[string]*Job{},
+		storage: storage,
+	}
+}
+
+func (s *Jobs) Enqueue(ctx context.Context, cancel context.CancelFunc, id string, r Runnable, purge bool, ef ...ErrorFormatter) *Job {
+	s.mux.Lock()
+	defer s.mux.Unlock()
+	if existing, ok := s.jobs[id]; ok && !purge {
+		if !existing.HasError() {
+			return existing
+		}
+		log.WithField("ID", id).Info("restarting errored job")
+		purge = true
+	}
+	var formatter ErrorFormatter
+	if len(ef) > 0 {
+		formatter = ef[0]
+	}
+	j := New(ctx, id, s.queue, r, s.storage, purge, formatter)
+	s.jobs[id] = j
+	go func() {
+		defer cancel()
+		err := j.Run(ctx)
+		<-time.After(60 * time.Second)
+		s.retire(id, j, err)
+	}()
+	return j
+}
+
+// retire takes a finished job out of the map and decides whether its result
+// survives in storage. Split out of Enqueue's goroutine so the decision is
+// reachable from a test without sleeping out the 60 s grace period, which is
+// there so a viewer still replaying the log is not cut off.
+//
+// Two reasons not to keep a result: the run failed, or the script asked
+// (DoNotCache) because what it produced was correct but built on a missing
+// answer. Both mean the next request with this id should run the job again.
+func (s *Jobs) retire(id string, j *Job, err error) {
+	s.mux.Lock()
+	defer s.mux.Unlock()
+	// Only cleanup if this job is still the current one (not replaced by a restart)
+	current, ok := s.jobs[id]
+	if !ok || current != j {
+		return
+	}
+	if err != nil || j.noCache {
+		dCtx, dCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_ = s.storage.Drop(dCtx, s.queue, id)
+		dCancel()
+	}
+	if err != nil {
+		fields := log.Fields{
+			"ID":    id,
+			"Queue": s.queue,
+		}
+		if isStoplistBlock(err) {
+			log.WithError(err).WithFields(fields).Warn("job rejected by stoplist")
+		} else {
+			log.WithError(err).WithFields(fields).Error("got job error")
+		}
+	}
+	delete(s.jobs, id)
+}
+
+func (s *Jobs) Log(ctx context.Context, id string) (c chan LogItem, ok bool, err error) {
+	c = make(chan LogItem, 10)
+	// s.jobs is written under s.mux by Enqueue and by the cleanup that
+	// deletes finished jobs. Reading it unlocked races those writes, and a
+	// concurrent map read/write is a runtime throw, not a panic — the
+	// recover() further up this package cannot catch it and the whole
+	// process dies. This endpoint is unauthenticated and load-job ids are
+	// sha1(infohash + "/" + lang), so the race is reachable on demand.
+	//
+	// The lock covers only the lookup: Enqueue below takes s.mux itself, so
+	// holding it across that call would deadlock.
+	s.mux.Lock()
+	j, ok := s.jobs[id]
+	s.mux.Unlock()
+	if !ok {
+		log.Infof("unable to find local job with id=%v", id)
+		var state *State
+		state, ok, err = s.storage.GetState(ctx, s.queue, id)
+		log.Infof("got storage state=%+v for id=%+v err=%+v", state, id, err)
+		if err != nil {
+			close(c)
+			return
+		}
+		if !ok {
+			log.Warnf("no state for id=%+v", id)
+			close(c)
+			return
+		}
+		jCtx, cancel := context.WithTimeout(ctx, state.TTL)
+		j = s.Enqueue(jCtx, cancel, id, nil, false)
+	} else {
+		log.Infof("found local job with id=%+v", id)
+	}
+	go func() {
+		// Create a copy of the log items while holding the lock
+		j.lmux.Lock()
+		logItems := make([]LogItem, len(j.l))
+		copy(logItems, j.l)
+		closed := j.closed
+		j.lmux.Unlock()
+
+		for _, i := range logItems {
+			c <- i
+		}
+		if closed {
+			close(c)
+		} else {
+			o := j.ObserveLog()
+			for {
+				select {
+				case <-ctx.Done():
+					close(c)
+					return
+				case i, okk := <-o.C:
+					if !okk {
+						close(c)
+						return
+					}
+					c <- i
+					if i.Level == Close {
+						close(c)
+						return
+					}
+				}
+			}
+		}
+	}()
+	return
+}
+
+type Queues struct {
+	jobs    map[string]*Jobs
+	storage Storage
+}
+
+var queueMux sync.Mutex
+
+func NewQueues(storage Storage) *Queues {
+	return &Queues{
+		jobs:    map[string]*Jobs{},
+		storage: storage,
+	}
+}
+
+// Get returns an existing queue without creating one.
+//
+// Anything that takes a queue name from a request must use this rather than
+// GetOrCreate: this map has no capacity, no TTL and no eviction, so a
+// caller-supplied name inserts an entry that is retained for the lifetime of
+// the process. Producers — the handlers and jobs that own a fixed set of
+// queue names — keep using GetOrCreate.
+func (s Queues) Get(name string) (*Jobs, bool) {
+	queueMux.Lock()
+	defer queueMux.Unlock()
+	j, ok := s.jobs[name]
+	return j, ok
+}
+
+func (s Queues) GetOrCreate(name string) *Jobs {
+	queueMux.Lock()
+	defer queueMux.Unlock()
+	_, ok := s.jobs[name]
+	if !ok {
+		s.jobs[name] = newJobs(name, s.storage)
+	}
+	return s.jobs[name]
+}
+
+type Runnable interface {
+	Run(ctx context.Context, j *Job) error
+}
+
+type Script struct {
+	body func(j *Job) error
+}
+
+func (s *Script) Run(ctx context.Context, j *Job) error {
+	return s.body(j)
+}
+
+func NewScript(body func(j *Job) error) *Script {
+	return &Script{body: body}
+}

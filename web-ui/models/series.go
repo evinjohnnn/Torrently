@@ -1,0 +1,261 @@
+package models
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/go-pg/pg/v10"
+	pkgerrors "github.com/pkg/errors"
+	"github.com/satori/go.uuid"
+)
+
+type Series struct {
+	*VideoContent
+	tableName struct{} `pg:"series"`
+
+	SeriesID         uuid.UUID  `pg:"series_id,pk,type:uuid,default:uuid_generate_v4()"`
+	SeriesMetadataID *uuid.UUID `pg:"series_metadata_id"`
+	CreatedAt        time.Time  `pg:"created_at,default:now()"`
+	UpdatedAt        time.Time  `pg:"updated_at,default:now()"`
+
+	// Transient: populated by handlers from series_status for UI badges.
+	UserWatched bool   `pg:"-"`
+	UserRating  *int16 `pg:"-"`
+
+	Episodes         []*Episode        `pg:"rel:has-many,fk:series_id"`
+	MediaInfo        *MediaInfo        `pg:"rel:has-one,fk:resource_id"`
+	SeriesMetadata   *SeriesMetadata   `pg:"rel:has-one,fk:series_metadata_id"`
+	ResourceMetadata *ResourceMetadata `pg:"rel:has-one,fk:resource_id"`
+	LibraryItems     []*Library        `pg:"rel:has-many,fk:library_id,join_fk:resource_id"`
+}
+
+// IsAdult returns the classification flag from the joined
+// resource_metadata. Nil-safe — un-classified rows return false.
+func (s *Series) IsAdult() bool {
+	return s.ResourceMetadata != nil && s.ResourceMetadata.IsAdult
+}
+
+func (s *Series) GetMetadata() *VideoMetadata {
+	if s.SeriesMetadata == nil {
+		return nil
+	}
+	return s.SeriesMetadata.VideoMetadata
+}
+
+func (s *Series) GetContent() *VideoContent {
+	return s.VideoContent
+}
+
+func (s *Series) GetContentType() ContentType {
+	return ContentTypeSeries
+}
+
+func (s *Series) GetID() uuid.UUID {
+	return s.SeriesID
+}
+
+func (s *Series) GetPath() *string {
+	return nil
+}
+
+// GetFileIdx returns nil at the series level — a series spans many files,
+// so the torrent file index is carried per-episode (Episode.FileIdx), not
+// on the series row.
+func (s *Series) GetFileIdx() *int {
+	return nil
+}
+
+// GetFileSize returns nil at the series level — file size is per-episode
+// (Episode.FileSize), like the file index.
+func (s *Series) GetFileSize() *int64 {
+	return nil
+}
+
+func (s *Series) GetEpisode(season int, episode int) *Episode {
+	for _, e := range s.Episodes {
+		var se int16
+		if e.Season != nil {
+			se = *e.Season
+		}
+		var ep int16
+		if e.Episode != nil {
+			ep = *e.Episode
+		}
+		if int(se) == season && int(ep) == episode {
+			return e
+		}
+	}
+	return nil
+}
+
+func (s *Series) GetIntYear() int {
+	if s.Year == nil {
+		return 0
+	}
+	return int(*s.Year)
+}
+
+func ReplaceSeriesForResource(ctx context.Context, db *pg.DB, resourceID string, seriesList []*Series) error {
+	tx, err := db.BeginContext(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Close()
+	}()
+
+	// Delete series (episodes will cascade)
+	_, err = tx.Model((*Series)(nil)).
+		Where("resource_id = ?", resourceID).
+		Context(ctx).
+		Delete()
+	if err != nil {
+		return err
+	}
+
+	for _, series := range seriesList {
+		// Insert series
+		_, err := tx.Model(series).
+			Context(ctx).
+			Insert()
+		if err != nil {
+			return err
+		}
+
+		// Insert episodes
+		_, err = tx.Model(&series.Episodes).
+			Context(ctx).
+			Insert()
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+func GetSeriesByResourceID(ctx context.Context, db *pg.DB, resourceID string) ([]*Series, error) {
+	var series []*Series
+
+	err := db.Model(&series).
+		Context(ctx).
+		Where("resource_id = ?", resourceID).
+		Select()
+
+	if err != nil {
+		return nil, err
+	}
+
+	return series, nil
+}
+
+func GetSeriesByID(ctx context.Context, db *pg.DB, uID uuid.UUID, seriesID string) (*Series, error) {
+	var s Series
+
+	query := db.Model(&s).
+		Context(ctx).
+		Join("join library as l").
+		JoinOn("series.resource_id = l.resource_id").
+		Where("series.series_id = ?", seriesID).
+		Where("l.user_id = ?", uID).
+		Relation("Episodes.EpisodeMetadata").
+		Limit(1)
+
+	err := query.Select()
+	if err != nil {
+		return nil, pkgerrors.Wrap(err, "failed to fetch series")
+	}
+
+	return &s, nil
+}
+
+func GetSeriesByVideoID(ctx context.Context, db *pg.DB, uID uuid.UUID, videoID string) ([]*Series, error) {
+	var list []*Series
+
+	query := db.Model(&list).
+		Context(ctx).
+		Join("left join series_metadata as smd").
+		JoinOn("series.series_metadata_id = smd.series_metadata_id").
+		Join("join library as l").
+		JoinOn("series.resource_id = l.resource_id").
+		Where("l.user_id = ?", uID).
+		Where("smd.video_id = ?", videoID).
+		Relation("SeriesMetadata").
+		Relation("Episodes.EpisodeMetadata")
+
+	err := query.Select()
+	if err != nil {
+		return nil, pkgerrors.Wrap(err, "failed to fetch series list")
+	}
+
+	return list, nil
+}
+
+func GetSeriesWithMetadataByResourceID(ctx context.Context, db *pg.DB, resourceID string) (*Series, error) {
+	var s Series
+	err := db.Model(&s).
+		Context(ctx).
+		Where("resource_id = ?", resourceID).
+		Relation("SeriesMetadata").
+		Relation("Episodes.EpisodeMetadata").
+		Limit(1).
+		Select()
+	if errors.Is(err, pg.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
+// GetSeriesWithMetadataByResourceIDAndPath resolves the series that owns
+// the file at pathStr: the one holding an episode row with that path, or
+// the resource's lone series, or nil — never an arbitrary pick. The movie
+// side has worked this way since the multi-movie packs bug
+// (pickMovieRow): one resource can hold several shows, and "no hint beats
+// naming the wrong show" applies to series the same way.
+func GetSeriesWithMetadataByResourceIDAndPath(ctx context.Context, db *pg.DB, resourceID string, pathStr string) (*Series, error) {
+	var all []*Series
+	err := db.Model(&all).
+		Context(ctx).
+		Where("series.resource_id = ?", resourceID).
+		Relation("SeriesMetadata").
+		Relation("Episodes.EpisodeMetadata").
+		Select()
+	if err != nil && !errors.Is(err, pg.ErrNoRows) {
+		return nil, err
+	}
+	return pickSeriesRow(all, pathStr), nil
+}
+
+// pickSeriesRow implements the resolution order documented on
+// GetSeriesWithMetadataByResourceIDAndPath: the series owning an episode
+// at the path, else the lone series, else nil.
+func pickSeriesRow(all []*Series, pathStr string) *Series {
+	for _, s := range all {
+		for _, e := range s.Episodes {
+			if e.Path != nil && *e.Path == pathStr {
+				return s
+			}
+		}
+	}
+	if len(all) == 1 {
+		return all[0]
+	}
+	return nil
+}
+
+func GetSeriesWithEpisodes(ctx context.Context, db *pg.DB, sID uuid.UUID) (*Series, error) {
+	var s Series
+	err := db.Model(&s).
+		Context(ctx).
+		Where("series.series_id = ?", sID).
+		Relation("Episodes.EpisodeMetadata").
+		Select()
+	if err != nil {
+		return nil, err
+	}
+	return &s, nil
+}

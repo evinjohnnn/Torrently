@@ -1,0 +1,114 @@
+package static
+
+import (
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+	"github.com/urfave/cli"
+	"github.com/webtor-io/web-ui/services/common"
+)
+
+// llmsTxt is the site's description for language models. Its links say
+// {{DOMAIN}} and are served with this deployment's own address.
+const llmsTxt = "/llms.txt"
+
+const (
+	AssetsPathFlag = "assets-path"
+	AssetsHostFlag = "assets-host"
+)
+
+func RegisterFlags(f []cli.Flag) []cli.Flag {
+	return append(f,
+		cli.StringFlag{
+			Name:   AssetsPathFlag,
+			Usage:  "assets path",
+			Value:  "./assets/dist",
+			EnvVar: "ASSETS_PATH",
+		},
+		cli.StringFlag{
+			Name:   AssetsHostFlag,
+			Usage:  "assets host",
+			Value:  "",
+			EnvVar: "WEB_ASSETS_HOST",
+		},
+		cli.StringFlag{
+			Name:   IndexNowKeyFlag,
+			Usage:  "IndexNow key of this host, served as /<key>.txt (docs/indexnow.md); unset — no key file",
+			EnvVar: "INDEXNOW_KEY",
+		},
+	)
+}
+
+func RegisterHandler(c *cli.Context, r *gin.Engine) error {
+	assetsPath := c.String(AssetsPathFlag)
+	pubPath := "pub"
+
+	if err := registerIndexNowKey(r, c.String(IndexNowKeyFlag)); err != nil {
+		return err
+	}
+	registerAssets(r, assetsPath)
+	r.Static("/pub", pubPath)
+
+	err := filepath.Walk(pubPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		route := filepath.ToSlash(strings.TrimPrefix(path, pubPath))
+		if !info.IsDir() && route != llmsTxt {
+			r.StaticFile(route, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if b, err := os.ReadFile(pubPath + llmsTxt); err == nil {
+		text := strings.ReplaceAll(string(b), "{{DOMAIN}}", strings.TrimSuffix(c.String(common.DomainFlag), "/"))
+		r.GET(llmsTxt, func(c *gin.Context) {
+			c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(text))
+		})
+	}
+	// Serve favicon and manifest files from root for search engine discoverability
+	// (robots.txt blocks /assets/, so root proxying is needed)
+	nightPath := assetsPath + "/night"
+	for _, name := range []string{
+		"favicon.ico",
+		"favicon.svg",
+		"favicon-16x16.png",
+		"favicon-32x32.png",
+		"favicon-48x48.png",
+		"manifest.webmanifest",
+		"android-chrome-36x36.png",
+		"android-chrome-48x48.png",
+		"android-chrome-72x72.png",
+		"android-chrome-96x96.png",
+		"android-chrome-144x144.png",
+		"android-chrome-192x192.png",
+		"android-chrome-256x256.png",
+		"android-chrome-384x384.png",
+		"android-chrome-512x512.png",
+		"android-chrome-maskable-36x36.png",
+		"android-chrome-maskable-48x48.png",
+		"android-chrome-maskable-72x72.png",
+		"android-chrome-maskable-96x96.png",
+		"android-chrome-maskable-144x144.png",
+		"android-chrome-maskable-192x192.png",
+		"android-chrome-maskable-256x256.png",
+		"android-chrome-maskable-384x384.png",
+		"android-chrome-maskable-512x512.png",
+		"apple-touch-icon.png",
+	} {
+		r.StaticFile("/"+name, nightPath+"/"+name)
+	}
+	return nil
+}
+
+// registerAssets serves the built assets at /assets: the same route and file
+// server as r.Static("/assets", …), with the Cache-Control of assetCache in
+// front of it.
+func registerAssets(r gin.IRouter, assetsPath string) {
+	r.Group("/assets", assetCache(NewAssetHashes(assetsPath))).Static("", assetsPath)
+}

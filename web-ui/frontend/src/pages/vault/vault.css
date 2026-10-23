@@ -1,0 +1,199 @@
+/* ───────── Summary ───────── */
+
+.vault-summary {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 40px;
+  padding: 22px 26px;
+}
+.vault-summary h2,
+.pledges-head h2 {
+  font-size: var(--step-1);
+  letter-spacing: -0.02em;
+}
+.figures {
+  margin: 10px 0 0;
+}
+.figures > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 40px;
+  padding: 8px 0;
+}
+.figures > div + div {
+  border-top: 1px solid var(--hairline);
+}
+.figures dt {
+  color: var(--ink-2);
+}
+.figures dd {
+  margin: 0;
+  font-size: 17px;
+}
+.figures .lit dd {
+  color: var(--olive-ink);
+  font-weight: 700;
+}
+.figures .warn dd {
+  color: var(--honey);
+  font-weight: 700;
+}
+@media (max-width: 720px) {
+  .vault-summary {
+    grid-template-columns: 1fr;
+    padding: 18px 20px;
+  }
+  .vault-summary > div + div {
+    padding-top: 12px;
+    border-top: 1px solid var(--hairline);
+  }
+}
+
+/* ───────── Pledges ───────── */
+
+.pledges-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  min-height: 44px;
+  margin-top: 8px;
+}
+.pledges-head.toolbar {
+  padding: 8px 8px 8px 18px;
+}
+.vault-page .row-icon.live svg {
+  animation: vault-pulse 1.6s ease-in-out infinite;
+}
+.vault-page .row-icon.quiet {
+  background: var(--honey-wash);
+  color: var(--honey);
+}
+@keyframes vault-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+.vp {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.vp.frozen {
+  color: var(--olive-ink);
+}
+.pledge-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.pledge-progress .progress {
+  flex: 1;
+  max-width: 280px;
+}
+
+/* the transfer status's badge, as a chip */
+.pill {
+  max-width: 260px;
+  white-space: normal;
+  line-height: 1.3;
+}
+.pill svg,
+.pill .spinner {
+  flex: none;
+}
+.pill .spinner {
+  width: 12px;
+  height: 12px;
+  border-width: 1.5px;
+}
+.pill.pulse svg {
+  animation: vault-pulse 1.6s ease-in-out infinite;
+}
+.pill-extra {
+  font-weight: 400;
+  opacity: 0.85;
+}
+@media (max-width: 640px) {
+  .vault-page .row {
+    flex-wrap: wrap;
+  }
+  .vault-page .row-end {
+    flex-basis: 100%;
+    padding-left: 50px;
+  }
+  .vault-page .rows.selecting .row .pill {
+    margin-left: 50px;
+  }
+  .pill {
+    max-width: none;
+  }
+}
+
+/* ───────── Upsell, guide, foot ───────── */
+
+.upsell {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px 16px;
+  padding: 20px 22px;
+}
+.upsell .row-text {
+  min-width: 220px;
+}
+.guide {
+  padding: 0 22px;
+}
+.guide summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 56px;
+  font-weight: 600;
+  cursor: pointer;
+  list-style: none;
+}
+.guide summary::-webkit-details-marker {
+  display: none;
+}
+.guide summary svg {
+  transition: transform 200ms var(--ease);
+}
+.guide[open] summary svg {
+  transform: rotate(180deg);
+}
+.guide dl {
+  margin: 0;
+  padding-bottom: 12px;
+}
+.guide dl > div {
+  display: grid;
+  grid-template-columns: 150px 1fr;
+  gap: 8px 16px;
+  padding: 12px 0;
+  border-top: 1px solid var(--hairline);
+}
+.guide dd {
+  margin: 0;
+  font-size: 15px;
+  color: var(--ink-2);
+}
+@media (max-width: 640px) {
+  .guide dl > div {
+    grid-template-columns: 1fr;
+  }
+}
+.vault-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}

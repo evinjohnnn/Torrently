@@ -1,0 +1,79 @@
+{{ define "resource/release_subscribe_banner" }}
+{{ $b := .Data.ReleaseSubBanner }}{{ if $b }}
+{{/* The banner is its own async island: subscribing re-renders just this
+     block, so the button flips to "unsubscribe" without reloading a page
+     whose file list may be several hundred rows long. */}}
+{{/* data-umami-impression only while the banner is an offer: once
+     subscribed it shows state, and counting that as an impression would
+     inflate the denominator of release-sub-created. */}}
+<div id="release-subscribe-banner"
+     class="mb-4 rounded-2xl border border-w-cyan/30 bg-w-cyan/5 p-4 sm:p-5"
+     data-async-layout="{{`{{ template "resource/release_subscribe_banner" $ }}`}}"{{ if not $b.Subscribed }} data-umami-impression="release-sub-seen" data-umami-impression-source="resource_banner"{{ end }}>
+    <div class="flex flex-col sm:flex-row sm:items-center gap-3">
+        <div class="flex-1 min-w-0">
+            {{/* Own block, not an inline sibling of the heading: as an
+                 inline badge its margin collapsed against the h3 and the two
+                 sat on top of each other. */}}
+            <div class="mb-2.5">
+                <span class="inline-flex items-center gap-1.5 badge badge-sm bg-w-cyan/10 text-w-cyan border-0 uppercase tracking-widest font-semibold">
+                    <span class="relative flex h-1.5 w-1.5 shrink-0">
+                        <span class="absolute inline-flex h-full w-full rounded-full bg-w-cyan opacity-60 motion-safe:animate-ping"></span>
+                        <span class="relative inline-flex h-1.5 w-1.5 rounded-full bg-w-cyan"></span>
+                    </span>
+                    {{ t .Lang "release_sub.on_air" }}
+                </span>
+            </div>
+            <h3 class="font-semibold text-base mb-1">
+                {{/* Both titles name the season, so both need tp — with t
+                     the parameter never arrives and the line renders
+                     "<no value>". */}}
+                {{ if $b.Subscribed }}{{ tp .Lang "release_sub.subscribed_title" "Season" $b.Season }}{{ else }}{{ tp .Lang "release_sub.banner_title" "Season" $b.Season }}{{ end }}
+            </h3>
+            <p class="text-sm text-w-sub leading-relaxed">
+                {{ if $b.Subscribed }}
+                    {{ t .Lang "release_sub.subscribed_desc" }}
+                {{ else }}
+                    {{ t .Lang "release_sub.banner_desc" }}
+                {{ end }}
+            </p>
+        </div>
+        <div class="shrink-0">
+            {{ if $b.Anonymous }}
+                {{/* Nothing to post without an account; the offer stays
+                     visible because it is a reason to have one. */}}
+                {{/* The intent rides in the return-url: after login the page comes
+                     back with ?release_sub=1 and release_subscribe_banner.js submits
+                     the subscribe form on the visitor's behalf. Without it, 81 of the
+                     first month's anonymous clicks came back to a banner that asked
+                     them to click again — and most did not. */}}
+                <a href="{{ langPath $.Lang "/login" }}?return-url={{ printf "%s?release_sub=1" (langPath $.Lang (printf "/%s" .Data.Resource.ID)) | urlquery }}"
+                   class="btn btn-sm btn-soft-cyan" data-umami-event="release-sub-login-click" data-umami-event-source="resource_banner">
+                    {{ t .Lang "release_sub.btn_subscribe" }}
+                </a>
+            {{ else if $b.Subscribed }}
+                <form method="post" data-async-push-state="false" data-async-target="#release-subscribe-banner"
+                      action="{{ langPath $.Lang (printf "/subscription/delete/%s" $b.SubscriptionID) }}">
+                    <input type="hidden" name="_csrf" value="{{ $.CSRF }}">
+                    <button type="submit" class="btn btn-sm btn-ghost border border-w-line" data-umami-event="release-sub-removed" data-umami-event-source="resource_banner">
+                        {{ t .Lang "release_sub.btn_unsubscribe" }}
+                    </button>
+                </form>
+            {{ else }}
+                <form method="post" data-async-push-state="false" data-async-target="#release-subscribe-banner"
+                      action="{{ langPath $.Lang "/subscription/add" }}" data-release-sub-form>
+                    <input type="hidden" name="_csrf" value="{{ $.CSRF }}">
+                    <input type="hidden" name="kind" value="season">
+                    <input type="hidden" name="video_id" value="{{ $b.SeriesVideoID }}">
+                    <input type="hidden" name="season" value="{{ $b.Season }}">
+                    <input type="hidden" name="source" value="resource_banner">
+                    <button type="submit" class="btn btn-sm btn-soft-cyan" data-umami-event="release-sub-created" data-umami-event-source="resource_banner">
+                        {{ t .Lang "release_sub.btn_subscribe" }}
+                    </button>
+                </form>
+            {{ end }}
+        </div>
+    </div>
+    {{ "release_subscribe_banner.js" | asset }}
+</div>
+{{ end }}
+{{ end }}

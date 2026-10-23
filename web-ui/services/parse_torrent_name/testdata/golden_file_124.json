@@ -1,0 +1,7 @@
+{
+  "input": "BBC News Special 2024",
+  "want": {
+    "title": "BBC News Special",
+    "year": 2024
+  }
+}

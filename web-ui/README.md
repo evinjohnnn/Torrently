@@ -1,0 +1,165 @@
+# Torrently web-ui
+
+Torrently is an independent, open-source torrent streaming site with a new
+interface, built on [webtor-io/web-ui](https://github.com/webtor-io/web-ui)
+under the MIT License. It is not affiliated with Webtor; see
+[NOTICE.md](NOTICE.md) for the attribution and [LICENSE](LICENSE) for the
+license.
+
+- The interface is a React app in `frontend/` served by the Go server
+  ([docs/react_ui.md](docs/react_ui.md)); `WEB_UI=classic` serves Webtor's
+  original templates instead.
+- Payments, the Stremio addon identity and other per-operator settings are
+  configuration, so a Torrently deployment never points at Webtor's accounts
+  (see "Running your own Torrently" below).
+
+## Running your own Torrently
+
+| Setting | What it is |
+|---|---|
+| `DOMAIN` | the public address of your site, used in links, emails and the Stremio addon |
+| `PATREON_CAMPAIGN` | your Patreon page name; Patreon checkout stays hidden until it is set |
+| `PATREON_TIER_IDS` | `tier=rewardId` pairs for direct Patreon checkout links, e.g. `basic=123,pro=456` |
+| `STREMIO_ADDON_ID` | the Stremio addon id (default `org.stremio.torrently`) |
+| `STREMIO_CONTACT_EMAIL` | contact address in the Stremio addon manifest (optional) |
+| `STREMIO_ADDONS_SIGNATURE` | your stremio-addons.net signature (optional) |
+
+The legal pages (`templates/views/legal/*`) are drafts with placeholders in
+square brackets. Replace them with your own terms before you launch.
+
+## Upstream features
+
+
+
+1. Lightweight - less JavaScript code, no frontend frameworks, fewer bytes sent to the client.
+2. Based on [webtor REST-API](https://github.com/webtor-io/rest-api).
+
+## Roadmap
+
+- [x] Torrent/magnet upload
+- [x] Torrent listing
+- [x] Direct file download
+- [x] Direct folder download as ZIP-archive
+- [x] Picture preview
+- [x] Audio streaming
+- [x] Video streaming
+  - [x] Base player
+  - [x] Subtitles support
+  - [x] OpenSubtitles support
+  - [x] Chromecast support
+  - [x] Embed control
+  - [x] Subtitle uploading support
+  - [ ] Subtitle size control
+- [x] Authentication
+  - [x] Passwordless authentication
+  - [x] Patreon account linking
+  - [x] Google authentication
+  - [x] Patreon authentication
+- [x] Ads and statistic integration support
+- [x] Misc
+  - [x] Feedback form
+  - [x] Allow magnet-url as query string
+  - [x] Add dark/light theme switch
+- [x] Chrome extension integration
+- [x] Embed support
+  - [x] Base version
+  - [x] Extended version
+- [x] Library
+  - [x] Torrents
+  - [x] Movies
+  - [x] Series
+  - [x] Watched/Rate
+- [x] Content enrichment
+    - [x] OMDB
+    - [x] Kinopoisk Unofficial
+    - [x] TMDB
+- [x] Vault
+- [x] Discover
+  - [x] AI Recommendations
+- [x] Integrations 
+  - [x] Stremio
+  - [x] Stremio Addons
+  - [x] WebDAV
+  - [x] S3
+  - [x] RealDebrid
+  - [x] TorBox
+- [x] i18n
+
+## Setting up connection to Webtor RestAPI
+
+You have to set up connection to [Webtor RestAPI](https://github.com/webtor-io/rest-api) before using WebUI.
+
+If you have already installed [backend part](https://github.com/webtor-io/helm-charts),
+then you have to proxy rest-api from your k8s instance to your local machine with [kubefwd](https://github.com/txn2/kubefwd):
+```
+sudo kubefwd svc -f metadata.name=rest-api -n webtor
+```
+or with [kubectl](https://kubernetes.io/docs/tasks/tools/#kubectl):
+```shell
+kubectl port-forward svc/rest-api 9090:80 -n webtor
+
+# you have to setup additional environment variables before starting application
+export REST_API_SERVICE_PORT=9090
+export REST_API_SERVICE_HOST=localhost
+```
+
+If you have [RapidAPI subscription](https://rapidapi.com/paveltatarsky-Dx4aX7s_XBt/api/webtor/)
+you can just do the following:
+
+```shell
+export RAPIDAPI_KEY={YOUR_RAPIDAPI_KEY}
+export RAPIDAPI_HOST={YOUR_RAPIDAPI_HOST}
+```
+
+### SESSION_SECRET (required)
+
+The application refuses to start without it:
+
+```shell
+export SESSION_SECRET=$(openssl rand -hex 32)
+```
+
+There is deliberately no default. This one value is the HMAC key for session
+cookies, CSRF tokens, Stremio playback links, one-click unsubscribe links,
+and — unless `S3_SIGNING_SECRET` is set separately — the derivation of every
+user's S3 secret access key. A shared or guessable value therefore makes all
+of those forgeable by anyone who knows it, which is why a working default was
+removed rather than kept for convenience.
+
+Keep it stable: changing it invalidates every existing session and every
+issued S3 credential at once.
+
+## Usage
+
+```shell
+./web-ui help
+NAME:
+   web-ui - runs webtor web ui v2
+
+USAGE:
+   web-ui [global options] command [command options] [arguments...]
+
+VERSION:
+   0.0.1
+
+COMMANDS:
+   serve, s  Serves web server
+   help, h   Shows a list of commands or help for one command
+
+GLOBAL OPTIONS:
+   --help, -h     show help
+   --version, -v  print the version
+```
+
+## Development
+
+```
+npm install
+npm start
+```
+
+## Building
+
+```shell
+make build
+```

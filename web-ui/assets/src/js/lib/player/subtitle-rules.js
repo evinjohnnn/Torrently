@@ -1,0 +1,166 @@
+// Client half of the subtitle default rule. The server picks the default
+// at render time (handlers/action/helper.go, selectListItem); the client
+// re-runs the rule when the viewer switches the audio track, because the
+// answer depends on the audio language and the server cannot know it will
+// change.
+//
+// The ladder itself is NOT reimplemented here: the server renders its
+// ladderRank as data-rank on every item (0 user upload, 1 embedded,
+// 2 sidecar, 3 OpenSubtitles by hash, 4 OpenSubtitles by imdb id, 5 AI
+// translation, 9 unknown) and this module only compares those numbers.
+// One ladder, one place to change it.
+
+// baseLang reduces a language tag to its base subtag. The server already
+// canonizes 3-letter codes to 2-letter tags before rendering, so there is
+// no ISO-639-2 map here — regional suffixes (pt-BR, pt_BR) are all that
+// is left to strip.
+export function baseLang(tag) {
+    return String(tag || '').toLowerCase().split(/[-_]/)[0];
+}
+
+// FALLBACK_LANG is the language the ladder falls back to beside a
+// translation offer: the server's fallbackLang (handlers/action/helper.go),
+// which is ud.FallbackLangTag -- English on every stream. A constant here
+// because it is the same for every viewer; TestFallbackLangIsMirroredInSubtitleRules
+// (handlers/action/english_fallback_test.go) fails when the two differ.
+export const FALLBACK_LANG = 'en';
+
+// best returns the lowest-ranked (= most trusted) candidate in lang among
+// forced or among full tracks, never mixing the two. Locked items are not
+// candidates: a locked track cannot be turned on, so selecting it would
+// leave the viewer with subtitles "on" and nothing on screen.
+//
+// Neither is an AI translation, since 2026-09-16 (owner): starting one
+// spends tokens, so no rule may pick it on the viewer's behalf -- not this
+// one, which runs when they switch the audio track, and not the subtitles
+// switch that calls through here. A translation is reached by clicking its
+// chip, or restored through data-last-subtitle when the viewer already ran
+// it in this session and it is cached. The item is still offered in the
+// picker (ListItem.Offered, drawn as "Translate to <language>"); this is
+// about what happens without a click.
+function best(tracks, lang, forced) {
+    let pick = null;
+    for (const t of tracks) {
+        if (t.id === 'none' || t.locked || t.provider === 'Translated') continue;
+        if (!!t.forced !== forced) continue;
+        if (baseLang(t.srclang) !== lang) continue;
+        if (!pick || rankOf(t) < rankOf(pick)) pick = t;
+    }
+    return pick;
+}
+
+function rankOf(t) {
+    const n = Number(t.rank);
+    return Number.isFinite(n) ? n : 9;
+}
+
+// translationOnOffer: the list holds a translation into the viewer's
+// language -- one they can start, or a locked one offered as an upsell
+// (owner, 2026-09-28: the English track plays beside either). It is the
+// server's condition (ladderPick with admitLocked answering with a
+// Translated item), read without the audio: data-offered cannot stand in
+// for it, because the server does not mark the offer when the audio it
+// rendered for was already in the viewer's language, and an audio switch
+// is exactly how the viewer leaves that state. The item only ever exists
+// in the preferred language, so its language is not tested.
+function translationOnOffer(tracks) {
+    return tracks.some((t) => t.provider === 'Translated');
+}
+
+// pickDefaultSubtitle answers "which subtitle should be on, given this
+// audio track?" and returns the item id to activate, or 'none'.
+//
+// Audio already in the viewer's language: only a forced (signs-only)
+// track is wanted — a full translation of dialogue the viewer
+// understands is noise. Audio in another language: the best full HUMAN
+// track in the preferred language — an AI translation is never the answer
+// here, because this rule runs without the viewer asking for anything (see
+// best). With none, and a translation on offer, the best English track
+// (owner, 2026-09-28: "show the main subtitles and offer to translate
+// them"; offeredDefault on the server). The offer itself is untouched: the
+// picker and the on-screen pill keep offering it, since English is not the
+// viewer's language (offerNeedsHint).
+export function pickDefaultSubtitle(tracks, audioLang, preferredLang) {
+    const list = Array.isArray(tracks) ? tracks : [];
+    const pref = baseLang(preferredLang);
+    const audio = baseLang(audioLang);
+    // The default the server already chose. Switching to 'none' instead
+    // of this would take subtitles away from a viewer who had them before
+    // touching the audio menu, so every branch that cannot name a better
+    // answer returns it.
+    const current = list.find((t) => t.isDefault && t.id && t.id !== 'none');
+    const keep = () => (current ? current.id : 'none');
+    // No preferred language at all. That is not an exotic state: it is
+    // every embed, and every deployment with SUBTITLE_TRANSLATE_ENABLED
+    // off (subtitleOptsFor returns the zero SubtitleOpts in both cases,
+    // jobs/scripts/translate_opts.go). With nothing to decide *for*, the
+    // rule has no opinion, and an opinionless rule must not act: the
+    // server's own phase-1 pick stands and the audio menu leaves the
+    // subtitles alone.
+    if (!pref) return keep();
+    if (audio && audio === pref) {
+        const f = best(list, pref, true);
+        return f ? f.id : 'none';
+    }
+    const full = best(list, pref, false);
+    if (full) return full.id;
+    if (translationOnOffer(list)) {
+        // Declared English only, as on the server (offeredDefault): an
+        // embedded stream labelled English for lack of a tag is not.
+        const en = best(list.filter((t) => !t.langGuessed), FALLBACK_LANG, false);
+        if (en) return en.id;
+    }
+    // The preferred language yielded nothing activatable. Where the server
+    // would answer "None" (an offer, no English track) or the phase-1
+    // Accept-Language match (no offer: a free viewer, NSFW, a language the
+    // service does not know), the client keeps what is on -- it has no
+    // matcher to recompute the latter with.
+    return keep();
+}
+
+// translationAction decides what selecting this item should do, given
+// what already happened to it this page load. `status` is a Map of item
+// id to 'running' (a run was started), 'done' (a run reached the final
+// progress) or 'stopped' (the service ended one incomplete).
+//
+//   'start'  — nothing has run for this item yet.
+//   'resume' — a run was started and interrupted before it finished
+//              (the viewer selected another track, which stops the poll).
+//              Poll again, but do NOT re-emit subtitle-translate-start:
+//              it is the same translation, and counting it twice would
+//              inflate the start rate against a flat done rate.
+//   'none'   — not a runnable AI item, or its translation already
+//              finished, or the service stopped it: re-selecting it must
+//              neither poll nor report.
+//
+// Without the 'done' state a warm cache double-counts — the click runs
+// the translation to completion and a second activation of the same item
+// (the mount-time restore of a saved translation, say) finds it marked
+// default with no poll running. Without 'resume' a
+// viewer who switches away mid-translation and comes back is stuck with
+// a frozen partial file for the life of the page.
+//
+// 'stopped' is terminal for the same reason 'done' is, but it took a
+// review to notice (M3): the chip says "reload to retry" and nothing
+// enforced it, so a viewer who re-clicked started another poll, got
+// `stopped` again and emitted another subtitle-translate-error. Per run
+// the telemetry was bounded; per viewer it was not. A page reload is a
+// fresh status map, which is exactly the retry the copy promises.
+export function translationAction(track, status) {
+    if (!track || !track.id) return 'none';
+    if (track.provider !== 'Translated') return 'none';
+    // A locked item has no Src: there is nothing to poll.
+    if (track.locked) return 'none';
+    const state = status && typeof status.get === 'function' ? status.get(track.id) : undefined;
+    if (state === 'done' || state === 'stopped') return 'none';
+    if (state === 'running') return 'resume';
+    return 'start';
+}
+
+// hasSavedDefault reports whether the default the server rendered is the
+// viewer's own earlier choice (ud.SubtitleID) rather than a ladder pick.
+// The audio-switch rule must leave a saved choice alone — re-deciding
+// over it would turn off subtitles the viewer explicitly asked for.
+export function hasSavedDefault(tracks) {
+    return (Array.isArray(tracks) ? tracks : []).some((t) => t.saved && t.isDefault);
+}
