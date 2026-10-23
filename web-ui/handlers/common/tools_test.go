@@ -194,3 +194,31 @@ func TestIOSGuideKeepsToItsSources(t *testing.T) {
 		}
 	}
 }
+
+// Every tool lands in a footer column: a guide in Guides, anything else in
+// one of ToolGroups. A tool with no known group would silently drop out of
+// the footer, and with it the site-wide link to its page.
+func TestToolGroups(t *testing.T) {
+	known := map[string]bool{}
+	for _, g := range ToolGroups {
+		known[g] = true
+	}
+	for _, tool := range Tools {
+		if tool.Guide {
+			if tool.Group != "" {
+				t.Errorf("%s: a guide has no group, got %q", tool.Url, tool.Group)
+			}
+			continue
+		}
+		if !known[tool.Group] {
+			t.Errorf("%s: group %q is not one of %v", tool.Url, tool.Group, ToolGroups)
+		}
+	}
+	for lang, keys := range locales(t) {
+		for _, g := range ToolGroups {
+			if keys["footer."+g] == "" {
+				t.Errorf("%s: missing footer.%s", lang, g)
+			}
+		}
+	}
+}

@@ -1,6 +1,7 @@
+import { useState } from "react";
 import { Link, usePage } from "../../app/router";
 import { useI18n } from "../../i18n";
-import { Icon, type IconName } from "../../ui/Icon";
+import { Icon } from "../../ui/Icon";
 import type { HomeData, Section, Step } from "./types";
 
 // ───────── shared ─────────
@@ -76,106 +77,141 @@ export function HowItWorks() {
 }
 
 interface Feature {
-  icon: IconName;
   key: string;
-  tags?: string[];
+  /** its number: the reading order, which the grid's flow does not follow */
+  n: number;
+  wide?: boolean;
+  tags?: string;
   href?: string;
 }
 
+/** A bento of white cards; the heading takes the first two cells. */
 export function Features() {
   const { t } = useI18n();
   const { data, session } = usePage<HomeData>();
+  // grid flow: heading + streaming | library, ddl, zip | stremio, discover, api
   const features: Feature[] = [
-    { icon: "play", key: "streaming", tags: ["MKV", "MP4", "WEBM", "AVI"] },
-    { icon: "download", key: "ddl" },
-    { icon: "archive", key: "zip" },
-    { icon: "library", key: "library", tags: ["Vault", "AI", "WebDAV", "S3"] },
-    { icon: "tv", key: "stremio" },
-    data.ai
-      ? { icon: "sparkle", key: "ai", tags: ["AI", "Beta"] }
-      : { icon: "compass", key: "discover" },
-    { icon: "server", key: "api", tags: ["REST", "Beta"], href: session.apiDocs },
+    { key: "streaming", n: 1, wide: true, tags: "MKV · MP4 · WEBM · AVI" },
+    { key: "library", n: 4, wide: true, tags: "Vault · AI · WebDAV · S3" },
+    { key: "ddl", n: 2 },
+    { key: "zip", n: 3 },
+    { key: "stremio", n: 5 },
+    data.ai ? { key: "ai", n: 6, tags: "AI · Beta" } : { key: "discover", n: 6 },
+    { key: "api", n: 7, wide: true, tags: "REST · Beta", href: session.apiDocs },
   ];
   return (
     <section id="features" className="section">
-      <div className="wrap">
-        <SectionHead title="about.features.title" subtitle="about.features.subtitle" />
-        <ul className="features glass">
-          {features.map((feature) => {
-            const body = (
-              <>
-                <span className="feature-icon">
-                  <Icon name={feature.icon} size={22} />
+      <div className="wrap bento">
+        <header className="bento-head">
+          <h2>{t("about.features.title")}</h2>
+          <p>{t("about.features.subtitle")}</p>
+        </header>
+        {features.map((feature) => {
+          const body = (
+            <>
+              <div className="bento-top">
+                <h3>{t(`about.features.${feature.key}.title`)}</h3>
+                <span className="bento-n" aria-hidden="true">
+                  {String(feature.n).padStart(2, "0")}
                 </span>
-                <span className="feature-body">
-                  <span className="feature-title">
-                    {t(`about.features.${feature.key}.title`)}
-                    {feature.href && <Icon name="external" size={15} />}
-                  </span>
-                  <span className="feature-text">{t(`about.features.${feature.key}.text`)}</span>
-                  {feature.tags && (
-                    <span className="feature-tags">
-                      {feature.tags.map((tag) => (
-                        <span key={tag} className="chip">
-                          {tag}
-                        </span>
-                      ))}
-                    </span>
-                  )}
-                </span>
-              </>
-            );
-            return (
-              <li key={feature.key}>
-                {feature.href ? (
-                  <a className="feature" href={feature.href} target="_blank" rel="noopener">
-                    {body}
-                  </a>
-                ) : (
-                  <div className="feature">{body}</div>
-                )}
-              </li>
-            );
-          })}
-        </ul>
+              </div>
+              <p>{t(`about.features.${feature.key}.text`)}</p>
+              {feature.tags && <p className="bento-tags">{feature.tags}</p>}
+            </>
+          );
+          const className = feature.wide ? "bento-card wide" : "bento-card";
+          return feature.href ? (
+            <a key={feature.key} className={className} href={feature.href} target="_blank" rel="noopener">
+              {body}
+            </a>
+          ) : (
+            <article key={feature.key} className={className}>
+              {body}
+            </article>
+          );
+        })}
       </div>
     </section>
   );
 }
 
+/** Questions the home page shows before "Show all". */
+const FAQ_SHOWN = 6;
+
+/**
+ * Heading on the left, questions on the right. An answer shows on hover or
+ * keyboard focus; a click pins it open, which is how touch screens get it.
+ * Every answer stays in the page, only folded away. The home page shows the
+ * first few questions until "Show all"; the rest stay in the DOM, hidden, so
+ * they still match the FAQPage JSON-LD. Tool pages list everything: their
+ * own questions come last and matter most there.
+ */
 export function Faq() {
   const i18n = useI18n();
   const { data } = usePage<HomeData>();
+  const [pinned, setPinned] = useState<number | null>(null);
+  const [all, setAll] = useState(false);
   const tool = data.tool?.url;
+  const folded = !tool && !all && data.faq.length > FAQ_SHOWN;
+  const showAll = () => {
+    setAll(true);
+    // the button goes away: keyboard focus lands on the first revealed question
+    requestAnimationFrame(() => document.getElementById(`faq-q-${FAQ_SHOWN}`)?.focus());
+  };
   return (
     <section id="faq" className="section">
-      <div className="wrap narrow">
-        <SectionHead title="about.faq.title" subtitle="about.faq.subtitle" />
-        <div className="faq">
-          {data.faq.map((item) => (
-            <details key={item.q} className="faq-item">
-              <summary>
-                <span>{i18n.t(item.q)}</span>
-                <Icon name="plus" size={18} />
-              </summary>
-              <div className="faq-answer">
-                {item.a.map((key) => (
-                  <p key={key}>{i18n.rich(key, item.params)}</p>
-                ))}
-                {item.guide && item.guide !== tool && (
-                  <p>
-                    <Link href={i18n.path(`/${item.guide}`)}>{i18n.t("about.faq.guideLink")}</Link>
-                  </p>
-                )}
+      <div className="wrap faq-split">
+        <header className="faq-head">
+          <h2>{i18n.t("about.faq.title")}</h2>
+          <p>{i18n.t("about.faq.subtitle")}</p>
+        </header>
+        <div>
+          <div className={folded ? "faq folded" : "faq"}>
+            {data.faq.map((item, index) => (
+              <div key={item.q} className={pinned === index ? "faq-item open" : "faq-item"}>
+                <h3>
+                  <button
+                    type="button"
+                    id={`faq-q-${index}`}
+                    className="faq-q"
+                    aria-expanded={pinned === index}
+                    aria-controls={`faq-${index}`}
+                    onClick={() => setPinned(pinned === index ? null : index)}
+                  >
+                    <span className="faq-n" aria-hidden="true">
+                      {String(index + 1).padStart(2, "0")}
+                    </span>
+                    <span>{i18n.t(item.q)}</span>
+                    <Icon name="chevron" size={20} />
+                  </button>
+                </h3>
+                <div className="faq-fold" id={`faq-${index}`}>
+                  <div className="faq-answer">
+                    {item.a.map((key) => (
+                      <p key={key}>{i18n.rich(key, item.params)}</p>
+                    ))}
+                    {item.guide && item.guide !== tool && (
+                      <p>
+                        <Link href={i18n.path(`/${item.guide}`)}>{i18n.t("about.faq.guideLink")}</Link>
+                      </p>
+                    )}
+                  </div>
+                </div>
               </div>
-            </details>
-          ))}
+            ))}
+          </div>
+          {folded && (
+            <button type="button" className="button faq-more" onClick={showAll}>
+              {i18n.t("about.faq.showAll")}
+            </button>
+          )}
         </div>
       </div>
     </section>
   );
 }
 
+/** The last word on the sheet; the footer, with the wordmark, rises from under it. */
 export function FinalCall() {
   const { t } = useI18n();
   const top = () => {
@@ -184,12 +220,17 @@ export function FinalCall() {
   };
   return (
     <section className="section final-call">
-      <div className="wrap narrow">
-        <h2>{t("about.cta.title")}</h2>
-        <p className="lede">{t("about.cta.subtitle")}</p>
-        <button type="button" className="button primary large" onClick={top}>
-          {t("about.cta.button")}
-        </button>
+      <div className="wrap">
+        <div className="final-row">
+          <div>
+            <h2>{t("about.cta.title")}</h2>
+            <p>{t("about.cta.subtitle")}</p>
+          </div>
+          <button type="button" className="button primary large" onClick={top}>
+            {t("about.cta.button")}
+            <Icon name="arrow" size={18} />
+          </button>
+        </div>
       </div>
     </section>
   );

@@ -44,12 +44,13 @@ type ToolLink struct {
 	URL   string `json:"url"`
 	Title string `json:"title"`
 	Guide bool   `json:"guide"`
+	Group string `json:"group,omitempty"`
 }
 
 var toolLinks = func() []ToolLink {
 	out := make([]ToolLink, 0, len(common.Tools))
 	for _, t := range common.Tools {
-		out = append(out, ToolLink{URL: t.Url, Title: t.Title, Guide: t.Guide})
+		out = append(out, ToolLink{URL: t.Url, Title: t.Title, Guide: t.Guide, Group: t.Group})
 	}
 	return out
 }()

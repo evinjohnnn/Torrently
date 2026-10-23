@@ -12,6 +12,9 @@ type Tool struct {
 	// capability ("How to Open a .torrent File" vs "Torrent → ZIP"). They
 	// serve a different intent and are listed apart in the footer.
 	Guide bool
+	// Group is the footer column a tool is listed under, one of
+	// ToolGroups; guides have none and get a column of their own.
+	Group string
 	// Sections is the page body, rendered by
 	// templates/partials/about/sections.html. See about.go.
 	Sections []AboutSection
@@ -22,17 +25,21 @@ type Tool struct {
 	FAQ int
 }
 
+// ToolGroups are the footer's tool columns; each heading is the i18n key
+// "footer.<group>". The footer lays them out in this order.
+var ToolGroups = []string{"download", "stream", "alternatives", "convert", "stremio"}
+
 // Tools contains the list of all available tool pages.
 // Title, Benefit, and Description are i18n message keys.
 var Tools = []Tool{
-	{Url: "torrent-to-ddl", Title: "tool.torrentToDdl.title", Benefit: "tool.torrentToDdl.benefit", Description: "tool.torrentToDdl.description", FAQ: 5, Sections: []AboutSection{
+	{Url: "torrent-to-ddl", Group: "download", Title: "tool.torrentToDdl.title", Benefit: "tool.torrentToDdl.benefit", Description: "tool.torrentToDdl.description", FAQ: 5, Sections: []AboutSection{
 		{Kind: AboutSteps, Key: "steps", Badge: "howItWorks", Accent: "pink", CTA: "discover"},
 		{Kind: AboutProse, Key: "explained", Badge: "explained", Accent: "purple", Alt: true, Paras: []string{"p1", "p2"}},
 		{Kind: AboutCompare, Key: "compare", Badge: "comparison", Accent: "cyan", Cols: []string{"torrent", "ddl"}, Footer: true},
 		{Kind: AboutProse, Key: "safety", Badge: "safety", Accent: "purple", Alt: true, Paras: []string{"text"}},
 		{Kind: AboutChecklist, Key: "video", Badge: "videoStreaming", Accent: "pink", Items: 4, Footer: true},
 	}},
-	{Url: "torrent-to-zip", Title: "tool.torrentToZip.title", Benefit: "tool.torrentToZip.benefit", Description: "tool.torrentToZip.description", Sections: []AboutSection{
+	{Url: "torrent-to-zip", Group: "download", Title: "tool.torrentToZip.title", Benefit: "tool.torrentToZip.benefit", Description: "tool.torrentToZip.description", Sections: []AboutSection{
 		{Kind: AboutSteps, Key: "steps", Badge: "howItWorks", Accent: "pink", CTA: "discover"},
 		{Kind: AboutProse, Key: "explained", Badge: "explained", Accent: "purple", Alt: true, Paras: []string{"p1", "p2"}},
 		{Kind: AboutChecklist, Key: "benefits", Badge: "benefits", Accent: "pink", Items: 4},
@@ -40,14 +47,14 @@ var Tools = []Tool{
 		{Kind: AboutProse, Key: "safety", Badge: "safety", Accent: "purple", Paras: []string{"p1", "p2"}},
 		{Kind: AboutCompare, Key: "formats", Badge: "comparison", Icon: "download", Accent: "pink", Alt: true, Cols: []string{"tar", "zip"}, Note: true},
 	}},
-	{Url: "magnet-to-ddl", Title: "tool.magnetToDdl.title", Benefit: "tool.magnetToDdl.benefit", Description: "tool.magnetToDdl.description", Sections: []AboutSection{
+	{Url: "magnet-to-ddl", Group: "download", Title: "tool.magnetToDdl.title", Benefit: "tool.magnetToDdl.benefit", Description: "tool.magnetToDdl.description", Sections: []AboutSection{
 		{Kind: AboutSteps, Key: "steps", Badge: "howItWorks", Accent: "pink", CTA: "discover"},
 		{Kind: AboutProse, Key: "explained", Badge: "explained", Accent: "purple", Alt: true, Paras: []string{"p1", "p2"}},
 		{Kind: AboutCompare, Key: "compare", Badge: "comparison", Accent: "cyan", Cols: []string{"magnet", "torrent"}, Footer: true},
 		{Kind: AboutProse, Key: "safety", Badge: "safety", Accent: "purple", Alt: true, Paras: []string{"text"}},
 		{Kind: AboutChecklist, Key: "video", Badge: "videoStreaming", Accent: "pink", Items: 4, Footer: true},
 	}},
-	{Url: "magnet-to-torrent", Title: "tool.magnetToTorrent.title", Benefit: "tool.magnetToTorrent.benefit", Description: "tool.magnetToTorrent.description", Sections: []AboutSection{
+	{Url: "magnet-to-torrent", Group: "convert", Title: "tool.magnetToTorrent.title", Benefit: "tool.magnetToTorrent.benefit", Description: "tool.magnetToTorrent.description", Sections: []AboutSection{
 		{Kind: AboutSteps, Key: "steps", Badge: "howItWorks", Accent: "pink", CTA: "discover"},
 		{Kind: AboutProse, Key: "explained", Badge: "explained", Accent: "purple", Alt: true, Paras: []string{"p1", "p2"},
 			// The two conversions are one pair; each page points at the other.
@@ -59,7 +66,7 @@ var Tools = []Tool{
 	// The reverse direction had no page of its own: the query landed on the
 	// home page and on /magnet-to-torrent, whose "reverse" callout did not
 	// hold it.
-	{Url: "torrent-to-magnet", Title: "tool.torrentToMagnet.title", Benefit: "tool.torrentToMagnet.benefit", Description: "tool.torrentToMagnet.description", Sections: []AboutSection{
+	{Url: "torrent-to-magnet", Group: "convert", Title: "tool.torrentToMagnet.title", Benefit: "tool.torrentToMagnet.benefit", Description: "tool.torrentToMagnet.description", Sections: []AboutSection{
 		{Kind: AboutSteps, Key: "steps", Badge: "howItWorks", Accent: "pink", CTA: "discover"},
 		{Kind: AboutProse, Key: "explained", Badge: "explained", Accent: "purple", Alt: true, Paras: []string{"p1", "p2"},
 			Link: &AboutLink{Url: "/magnet-to-torrent", TitleKey: "tool.magnetToTorrent.title"}},
@@ -67,7 +74,7 @@ var Tools = []Tool{
 		{Kind: AboutChecklist, Key: "useCases", Badge: "useCases", Accent: "pink", Alt: true, Items: 4},
 		{Kind: AboutProse, Key: "safety", Badge: "safety", Accent: "purple", Paras: []string{"text"}},
 	}},
-	{Url: "torrent-to-stream", Title: "tool.torrentToStream.title", Benefit: "tool.torrentToStream.benefit", Description: "tool.torrentToStream.description", Sections: []AboutSection{
+	{Url: "torrent-to-stream", Group: "stream", Title: "tool.torrentToStream.title", Benefit: "tool.torrentToStream.benefit", Description: "tool.torrentToStream.description", Sections: []AboutSection{
 		{Kind: AboutSteps, Key: "steps", Badge: "howItWorks", Accent: "pink", CTA: "discover"},
 		{Kind: AboutProse, Key: "explained", Badge: "explained", Accent: "purple", Alt: true, Paras: []string{"p1", "p2"}},
 		{Kind: AboutChecklist, Key: "benefits", Badge: "benefits", Accent: "pink", Items: 4},
@@ -78,14 +85,14 @@ var Tools = []Tool{
 	// file. The page corrects that premise rather than promising a
 	// conversion we do not perform: the video inside plays as is, and the
 	// original file downloads by direct link.
-	{Url: "torrent-to-mp4", Title: "tool.torrentToMp4.title", Benefit: "tool.torrentToMp4.benefit", Description: "tool.torrentToMp4.description", Sections: []AboutSection{
+	{Url: "torrent-to-mp4", Group: "stream", Title: "tool.torrentToMp4.title", Benefit: "tool.torrentToMp4.benefit", Description: "tool.torrentToMp4.description", Sections: []AboutSection{
 		{Kind: AboutSteps, Key: "steps", Badge: "howItWorks", Accent: "pink", CTA: "discover"},
 		{Kind: AboutProse, Key: "explained", Badge: "explained", Accent: "purple", Alt: true, Paras: []string{"p1", "p2"}},
 		{Kind: AboutChecklist, Key: "benefits", Badge: "benefits", Accent: "pink", Items: 4},
 		{Kind: AboutProse, Key: "safety", Badge: "safety", Accent: "purple", Alt: true, Paras: []string{"text"}},
 		{Kind: AboutChecklist, Key: "devices", Badge: "devices", Accent: "pink", Items: 4},
 	}},
-	{Url: "watch-torrents-online", Title: "tool.watchTorrentsOnline.title", Benefit: "tool.watchTorrentsOnline.benefit", Description: "tool.watchTorrentsOnline.description", Sections: []AboutSection{
+	{Url: "watch-torrents-online", Group: "stream", Title: "tool.watchTorrentsOnline.title", Benefit: "tool.watchTorrentsOnline.benefit", Description: "tool.watchTorrentsOnline.description", Sections: []AboutSection{
 		{Kind: AboutSteps, Key: "steps", Badge: "howItWorks", Accent: "pink", CTA: "discover"},
 		{Kind: AboutProse, Key: "explained", Badge: "explained", Accent: "purple", Alt: true, Paras: []string{"p1", "p2"}},
 		{Kind: AboutChecklist, Key: "benefits", Badge: "benefits", Accent: "pink", Items: 4},
@@ -100,7 +107,7 @@ var Tools = []Tool{
 	// this page on the core iOS queries (SERP snapshot 2026-09-21). Its
 	// column says only what its own page and help center say (checked
 	// 2026-09-23); recheck them before editing it.
-	{Url: "watch-torrents-ios", Title: "tool.watchTorrentsIos.title", Benefit: "tool.watchTorrentsIos.benefit", Description: "tool.watchTorrentsIos.description", Sections: []AboutSection{
+	{Url: "watch-torrents-ios", Group: "stream", Title: "tool.watchTorrentsIos.title", Benefit: "tool.watchTorrentsIos.benefit", Description: "tool.watchTorrentsIos.description", Sections: []AboutSection{
 		{Kind: AboutSteps, Key: "steps", Badge: "howItWorks", Accent: "pink", CTA: "discover"},
 		{Kind: AboutProse, Key: "explained", Badge: "explained", Accent: "purple", Alt: true, Paras: []string{"p1", "p2", "p3"}},
 		{Kind: AboutCompare, Key: "utorrent", Badge: "comparison", Accent: "cyan", Cols: []string{"webtor", "lite"}, Cap: "cap", Footer: true},
@@ -128,7 +135,7 @@ var Tools = []Tool{
 	// Windows, macOS, ChromeOS, iPadOS and Android — so "no uTorrent Web
 	// for Chromebook" alone would mislead. BitTorrent Web is described
 	// without naming its maker: neither site says it is the same company.
-	{Url: "utorrent-web-alternative", Title: "tool.utorrentWebAlternative.title", Benefit: "tool.utorrentWebAlternative.benefit", Description: "tool.utorrentWebAlternative.description", Sections: []AboutSection{
+	{Url: "utorrent-web-alternative", Group: "alternatives", Title: "tool.utorrentWebAlternative.title", Benefit: "tool.utorrentWebAlternative.benefit", Description: "tool.utorrentWebAlternative.description", Sections: []AboutSection{
 		{Kind: AboutSteps, Key: "steps", Badge: "howItWorks", Accent: "pink", CTA: "discover"},
 		{Kind: AboutProse, Key: "explained", Badge: "explained", Accent: "purple", Alt: true, Paras: []string{"p1", "p2", "p3"},
 			// The generic "no client" page answers the same need without the brand.
@@ -179,42 +186,42 @@ var Tools = []Tool{
 		{Kind: AboutChecklist, Key: "formats", Badge: "formats", Accent: "cyan", Alt: true, Items: 4},
 		{Kind: AboutProse, Key: "safety", Badge: "safety", Accent: "purple", Paras: []string{"text"}},
 	}},
-	{Url: "online-torrent-downloader", Title: "tool.onlineTorrentDownloader.title", Benefit: "tool.onlineTorrentDownloader.benefit", Description: "tool.onlineTorrentDownloader.description", Sections: []AboutSection{
+	{Url: "online-torrent-downloader", Group: "download", Title: "tool.onlineTorrentDownloader.title", Benefit: "tool.onlineTorrentDownloader.benefit", Description: "tool.onlineTorrentDownloader.description", Sections: []AboutSection{
 		{Kind: AboutSteps, Key: "steps", Badge: "howItWorks", Accent: "pink", CTA: "discover"},
 		{Kind: AboutProse, Key: "explained", Badge: "explained", Accent: "purple", Alt: true, Paras: []string{"p1", "p2"}},
 		{Kind: AboutCompare, Key: "compare", Badge: "comparison", Accent: "cyan", Cols: []string{"online", "client"}, Footer: true},
 		{Kind: AboutChecklist, Key: "useCases", Badge: "useCases", Accent: "pink", Alt: true, Items: 4},
 		{Kind: AboutProse, Key: "safety", Badge: "safety", Accent: "purple", Paras: []string{"p1", "p2"}},
 	}},
-	{Url: "stream-torrent-online", Title: "tool.streamTorrentOnline.title", Benefit: "tool.streamTorrentOnline.benefit", Description: "tool.streamTorrentOnline.description", Sections: []AboutSection{
+	{Url: "stream-torrent-online", Group: "stream", Title: "tool.streamTorrentOnline.title", Benefit: "tool.streamTorrentOnline.benefit", Description: "tool.streamTorrentOnline.description", Sections: []AboutSection{
 		{Kind: AboutSteps, Key: "steps", Badge: "howItWorks", Accent: "pink", CTA: "discover"},
 		{Kind: AboutProse, Key: "explained", Badge: "explained", Accent: "purple", Alt: true, Paras: []string{"p1", "p2"}},
 		{Kind: AboutChecklist, Key: "benefits", Badge: "benefits", Accent: "pink", Items: 4},
 		{Kind: AboutProse, Key: "safety", Badge: "safety", Accent: "purple", Alt: true, Paras: []string{"text"}},
 		{Kind: AboutChecklist, Key: "devices", Badge: "devices", Accent: "pink", Items: 4},
 	}},
-	{Url: "torrent-player", Title: "tool.torrentPlayer.title", Benefit: "tool.torrentPlayer.benefit", Description: "tool.torrentPlayer.description", Sections: []AboutSection{
+	{Url: "torrent-player", Group: "stream", Title: "tool.torrentPlayer.title", Benefit: "tool.torrentPlayer.benefit", Description: "tool.torrentPlayer.description", Sections: []AboutSection{
 		{Kind: AboutSteps, Key: "steps", Badge: "howItWorks", Accent: "pink", CTA: "discover"},
 		{Kind: AboutProse, Key: "explained", Badge: "explained", Accent: "purple", Alt: true, Paras: []string{"p1", "p2"}},
 		{Kind: AboutChecklist, Key: "benefits", Badge: "benefits", Accent: "pink", Items: 4},
 		{Kind: AboutProse, Key: "safety", Badge: "safety", Accent: "purple", Alt: true, Paras: []string{"text"}},
 		{Kind: AboutChecklist, Key: "devices", Badge: "devices", Accent: "pink", Items: 4},
 	}},
-	{Url: "web-torrent-client", Title: "tool.webTorrentClient.title", Benefit: "tool.webTorrentClient.benefit", Description: "tool.webTorrentClient.description", Sections: []AboutSection{
+	{Url: "web-torrent-client", Group: "alternatives", Title: "tool.webTorrentClient.title", Benefit: "tool.webTorrentClient.benefit", Description: "tool.webTorrentClient.description", Sections: []AboutSection{
 		{Kind: AboutSteps, Key: "steps", Badge: "howItWorks", Accent: "pink", CTA: "discover"},
 		{Kind: AboutProse, Key: "explained", Badge: "explained", Accent: "purple", Alt: true, Paras: []string{"p1", "p2"},
 			// p2 ends on devices that cannot run a torrent app; the brand page is the next step.
 			Link: &AboutLink{Url: "/utorrent-web-alternative", TitleKey: "tool.utorrentWebAlternative.title"}},
 		{Kind: AboutChecklist, Key: "benefits", Badge: "benefits", Accent: "pink", Items: 4},
 	}},
-	{Url: "cloud-torrent-client", Title: "tool.cloudTorrentClient.title", Benefit: "tool.cloudTorrentClient.benefit", Description: "tool.cloudTorrentClient.description", Sections: []AboutSection{
+	{Url: "cloud-torrent-client", Group: "download", Title: "tool.cloudTorrentClient.title", Benefit: "tool.cloudTorrentClient.benefit", Description: "tool.cloudTorrentClient.description", Sections: []AboutSection{
 		{Kind: AboutSteps, Key: "steps", Badge: "howItWorks", Accent: "pink", CTA: "discover"},
 		{Kind: AboutProse, Key: "explained", Badge: "explained", Accent: "purple", Alt: true, Paras: []string{"p1", "p2"}},
 		{Kind: AboutChecklist, Key: "benefits", Badge: "benefits", Accent: "pink", Items: 4},
 		{Kind: AboutChecklist, Key: "devices", Badge: "devices", Accent: "pink", Alt: true, Items: 4},
 		{Kind: AboutProse, Key: "safety", Badge: "safety", Accent: "purple", Paras: []string{"text"}},
 	}},
-	{Url: "stremio-addons-online", Title: "tool.stremioAddonsOnline.title", Benefit: "tool.stremioAddonsOnline.benefit", Description: "tool.stremioAddonsOnline.description", Sections: []AboutSection{
+	{Url: "stremio-addons-online", Group: "stremio", Title: "tool.stremioAddonsOnline.title", Benefit: "tool.stremioAddonsOnline.benefit", Description: "tool.stremioAddonsOnline.description", Sections: []AboutSection{
 		{Kind: AboutSteps, Key: "steps", Badge: "howItWorks", Accent: "pink", CTA: "discover"},
 		{Kind: AboutProse, Key: "explained", Badge: "explained", Accent: "purple", Alt: true, Paras: []string{"p1", "p2"},
 			// The addon page answers the same query one step further along.
@@ -223,7 +230,7 @@ var Tools = []Tool{
 		{Kind: AboutProse, Key: "safety", Badge: "safety", Accent: "purple", Alt: true, Paras: []string{"text"}},
 		{Kind: AboutChecklist, Key: "devices", Badge: "devices", Accent: "pink", Items: 4},
 	}},
-	{Url: "torrently-stremio-addon", Title: "tool.torrentlyStremioAddon.title", Benefit: "tool.torrentlyStremioAddon.benefit", Description: "tool.torrentlyStremioAddon.description", Sections: []AboutSection{
+	{Url: "torrently-stremio-addon", Group: "stremio", Title: "tool.torrentlyStremioAddon.title", Benefit: "tool.torrentlyStremioAddon.benefit", Description: "tool.torrentlyStremioAddon.description", Sections: []AboutSection{
 		{Kind: AboutSteps, Key: "steps", Badge: "howItWorks", Accent: "pink", CTA: "stremio"},
 		{Kind: AboutProse, Key: "explained", Badge: "explained", Accent: "purple", Alt: true, Paras: []string{"p1", "p2"}},
 		{Kind: AboutChecklist, Key: "benefits", Badge: "benefits", Accent: "pink", Items: 4, Extra: "indexers"},
@@ -263,7 +270,7 @@ var Tools = []Tool{
 	// TorBox in particular; the two are named only as services compared
 	// with or connected to. Webtor is not a debrid: it resolves infohash +
 	// file index only, supplies no catalog and "finds" nothing.
-	{Url: "debrid-alternative", Title: "tool.debridAlternative.title", Benefit: "tool.debridAlternative.benefit", Description: "tool.debridAlternative.description", FAQ: 4, Sections: []AboutSection{
+	{Url: "debrid-alternative", Group: "alternatives", Title: "tool.debridAlternative.title", Benefit: "tool.debridAlternative.benefit", Description: "tool.debridAlternative.description", FAQ: 4, Sections: []AboutSection{
 		{Kind: AboutSteps, Key: "steps", Badge: "howItWorks", Accent: "pink", CTA: "stremio"},
 		{Kind: AboutProse, Key: "explained", Badge: "explained", Accent: "purple", Alt: true, Paras: []string{"p1", "p2", "p3"},
 			// The install steps live on the addon page; this page is the "why".
@@ -282,7 +289,7 @@ var Tools = []Tool{
 	// "tracker" heads are drowned by the CBS series of that name. One page
 	// targets the whole cluster; the comparison section is what carries the
 	// "sonarr alternative" half.
-	{Url: "torrent-rss-alternative", Title: "tool.torrentRssAlternative.title", Benefit: "tool.torrentRssAlternative.benefit", Description: "tool.torrentRssAlternative.description", Sections: []AboutSection{
+	{Url: "torrent-rss-alternative", Group: "alternatives", Title: "tool.torrentRssAlternative.title", Benefit: "tool.torrentRssAlternative.benefit", Description: "tool.torrentRssAlternative.description", Sections: []AboutSection{
 		{Kind: AboutSteps, Key: "steps", Badge: "howItWorks", Accent: "pink", CTA: "discover"},
 		{Kind: AboutProse, Key: "explained", Badge: "explained", Accent: "purple", Alt: true, Paras: []string{"p1", "p2"},
 			// Subscriptions poll the sources this page teaches how to connect.

@@ -244,21 +244,28 @@
 
 /* ───────── Sheet ───────── */
 
+/* the sheet rises over the hero and, at its rounded end, is the curtain the
+   footer comes out from under (chrome.css, "Footer") */
 .sheet {
   position: relative;
   padding-top: 72px;
-  border-radius: 36px 36px 0 0;
-  background: rgba(244, 240, 229, 0.94);
-  -webkit-backdrop-filter: blur(30px) saturate(1.2);
-  backdrop-filter: blur(30px) saturate(1.2);
-  box-shadow: 0 -1px 0 rgba(255, 255, 255, 0.8), 0 -30px 60px -40px rgba(48, 46, 20, 0.35);
+  border-radius: 36px 36px 40px 40px;
+  background: var(--paper);
+  box-shadow:
+    0 -1px 0 rgba(255, 255, 255, 0.8),
+    0 -30px 60px -40px rgba(48, 46, 20, 0.35),
+    0 28px 50px -30px rgba(48, 46, 20, 0.4);
 }
 .sheet > .section:first-child,
 .sheet > .ribbon-section + .section {
   padding-top: 24px;
 }
+main:has(.sheet) {
+  position: relative;
+  z-index: 1;
+}
 main:has(.sheet) + .footer {
-  margin-top: 0;
+  margin-top: -40px;
 }
 
 /* ───────── Signed in ───────── */
@@ -512,131 +519,241 @@ main:has(.sheet) + .footer {
   }
 }
 
-.features {
+/* features: a bento of white cards, the heading in its first two cells */
+.bento {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  margin: 0;
-  padding: 8px;
-  list-style: none;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
 }
-.features > li {
-  border-bottom: 1px solid var(--hairline);
-}
-.features > li:nth-last-child(-n + 2):nth-child(odd),
-.features > li:last-child {
-  border-bottom: 0;
-}
-/* an odd count: the last feature takes the whole row */
-.features > li:last-child:nth-child(odd) {
-  grid-column: 1 / -1;
-}
-.feature {
+.bento-head {
+  grid-column: span 2;
   display: flex;
-  gap: 16px;
-  height: 100%;
-  padding: 20px;
-  border-radius: var(--r-md);
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 14px;
+  padding: 8px 32px 8px 0;
+}
+.bento-head h2 {
+  font-size: clamp(36px, 4.4vw, 52px);
+  letter-spacing: -0.045em;
+  line-height: 0.98;
+}
+.bento-head p {
+  color: var(--ink-2);
+}
+.bento-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 22px;
+  border-radius: 20px;
+  background: #fff;
+  border: 1px solid rgba(28, 31, 20, 0.08);
   color: var(--ink);
   text-decoration: none;
 }
-a.feature:hover {
-  background: rgba(255, 255, 255, 0.6);
+.bento-card.wide {
+  grid-column: span 2;
+  gap: 10px;
+  padding: 24px 26px;
 }
-.feature-icon {
+a.bento-card {
+  transition: border-color 200ms var(--ease);
+}
+a.bento-card:hover {
+  color: var(--ink);
+  border-color: rgba(28, 31, 20, 0.24);
+}
+.bento-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 16px;
+}
+.bento-card h3 {
+  font-size: 18px;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+}
+.bento-card.wide h3 {
+  font-size: 24px;
+  letter-spacing: -0.03em;
+}
+.bento-n {
   flex: none;
-  width: 44px;
-  height: 44px;
-  display: grid;
-  place-items: center;
-  border-radius: var(--r-sm);
-  background: var(--olive-wash);
+  font-family: var(--font-logo);
+  font-weight: 900;
+  font-size: 16px;
+  color: var(--olive);
+}
+.bento-card p {
+  font-size: 14px;
+  color: var(--ink-2);
+}
+.bento-card .bento-tags {
+  margin-top: auto;
+  padding-top: 4px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.06em;
   color: var(--olive-ink);
 }
-.feature-body {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
+@media (max-width: 1020px) {
+  .bento {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
-.feature-title {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 17px;
-  font-weight: 600;
-  letter-spacing: -0.01em;
-}
-.feature-title svg {
-  color: var(--ink-3);
-}
-.feature-text {
-  color: var(--ink-2);
-  font-size: 15px;
-}
-.feature-tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 4px;
-}
-@media (max-width: 860px) {
-  .features {
+@media (max-width: 640px) {
+  .bento {
     grid-template-columns: 1fr;
   }
-  .features > li:nth-last-child(-n + 2):nth-child(odd) {
-    border-bottom: 1px solid var(--hairline);
+  .bento-head,
+  .bento-card.wide {
+    grid-column: auto;
+  }
+  .bento-head {
+    padding: 0 0 12px;
   }
 }
 
-.faq {
-  border-top: 1px solid var(--hairline);
+/* faq: heading left, ruled questions right; answers unfold on hover, on
+   keyboard focus, or pinned open by a click (touch) */
+.faq-split {
+  display: grid;
+  grid-template-columns: 360px minmax(0, 1fr);
+  gap: 72px;
+  align-items: start;
 }
-.faq-item {
+.faq-head {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.faq-head h2 {
+  font-size: clamp(40px, 4.6vw, 56px);
+  letter-spacing: -0.045em;
+  line-height: 0.96;
+}
+.faq-head p {
+  font-size: 17px;
+  color: var(--ink-2);
+}
+.faq {
   border-bottom: 1px solid var(--hairline);
 }
-.faq-item summary {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  min-height: 60px;
-  padding: 16px 4px;
-  font-size: 17px;
-  font-weight: 500;
-  cursor: pointer;
-  list-style: none;
+.faq-item {
+  border-top: 1px solid var(--hairline);
 }
-.faq-item summary::-webkit-details-marker {
+/* the home page shows six until "Show all" (FAQ_SHOWN in Sections.tsx) */
+.faq.folded > .faq-item:nth-child(n + 7) {
   display: none;
 }
-.faq-item summary svg {
-  flex: none;
+.faq-more {
+  margin-top: 24px;
+}
+.faq-item h3 {
+  font-size: inherit;
+  letter-spacing: normal;
+  line-height: inherit;
+}
+.faq-q {
+  width: 100%;
+  min-height: 64px;
+  padding: 18px 4px;
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr) 24px;
+  align-items: center;
+  gap: 12px;
+  text-align: left;
+  font-size: 18px;
+  font-weight: 500;
+  letter-spacing: -0.015em;
+  line-height: 1.35;
+}
+.faq-n {
+  font-family: var(--font-logo);
+  font-weight: 900;
+  font-size: 16px;
+  color: var(--olive);
+}
+.faq-q svg {
+  justify-self: center;
   color: var(--ink-3);
   transition: transform 250ms var(--ease);
 }
-.faq-item[open] summary svg {
-  transform: rotate(45deg);
-}
-.faq-item summary:hover {
-  color: var(--olive-ink);
+.faq-fold {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 250ms var(--ease);
 }
 .faq-answer {
+  min-height: 0;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   gap: 10px;
-  padding: 0 4px 22px;
+  padding-left: 56px;
+  max-width: 64ch;
+  font-size: 15px;
+  line-height: 1.65;
   color: var(--ink-2);
-  max-width: 68ch;
+}
+.faq-answer > :last-child {
+  margin-bottom: 24px;
+}
+.faq-item.open .faq-fold,
+.faq-item:has(.faq-q:focus-visible) .faq-fold {
+  grid-template-rows: 1fr;
+}
+.faq-item.open .faq-q svg,
+.faq-item:has(.faq-q:focus-visible) .faq-q svg {
+  transform: rotate(180deg);
+}
+/* a short delay before unfolding: passing the pointer over a row on the way
+   to another does not open it */
+@media (hover: hover) {
+  .faq-item:hover .faq-fold {
+    grid-template-rows: 1fr;
+    transition-delay: 120ms;
+  }
+  .faq-item:hover .faq-q svg {
+    transform: rotate(180deg);
+  }
+  .faq-item:hover .faq-q {
+    color: var(--olive-ink);
+  }
+}
+@media (max-width: 860px) {
+  .faq-split {
+    grid-template-columns: 1fr;
+    gap: 32px;
+  }
+  .faq-answer {
+    padding-left: 0;
+  }
+  .faq-q {
+    grid-template-columns: 32px minmax(0, 1fr) 24px;
+    font-size: 17px;
+  }
 }
 
-.final-call {
-  text-align: left;
+/* final call: the last section of the sheet, the curtain over the footer */
+.final-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 24px 48px;
 }
 .final-call h2 {
-  font-size: var(--step-4);
-  letter-spacing: -0.04em;
+  font-size: clamp(40px, 4.6vw, 56px);
+  letter-spacing: -0.05em;
+  line-height: 0.95;
 }
-.final-call .lede {
-  margin: 14px 0 26px;
+.final-call p {
+  margin-top: 14px;
+  font-size: 17px;
+  color: var(--ink-2);
 }
 
 /* tool pages */

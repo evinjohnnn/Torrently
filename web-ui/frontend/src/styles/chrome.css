@@ -262,29 +262,85 @@
 
 /* ───────── Footer ───────── */
 
+/* frosted glass over the page backdrop, with the wordmark behind it half
+   sunk below the page's end */
 .footer {
+  --mark: min(236px, 17.5vw);
+  position: relative;
   margin-top: 64px;
-  padding: 56px 0 32px;
-  border-top: 1px solid var(--hairline);
-  background: rgba(244, 240, 229, 0.96);
-  -webkit-backdrop-filter: blur(24px);
-  backdrop-filter: blur(24px);
+  overflow: hidden;
+  view-timeline: --footer block;
 }
+.footer-inner {
+  position: relative;
+}
+.footer-mark {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 0;
+  font-size: var(--mark);
+  line-height: 0.78;
+  text-align: center;
+  transform: translateY(32%);
+  pointer-events: none;
+}
+.footer-mark .wordmark {
+  display: block;
+  font-size: 1em;
+  line-height: inherit;
+  letter-spacing: -0.02em;
+  color: var(--olive);
+}
+.footer-glass {
+  position: relative;
+  z-index: 1;
+  padding: 96px 0 calc(var(--mark) * 0.62);
+  background: rgba(255, 255, 255, 0.58);
+  -webkit-backdrop-filter: blur(7px) saturate(1.2);
+  backdrop-filter: blur(7px) saturate(1.2);
+}
+/* under the home page's sheet the footer is a curtain raise: it slides out
+   from beneath the sheet's rounded end and settles as the page ends */
+@supports (animation-timeline: view()) {
+  @media (prefers-reduced-motion: no-preference) {
+    main:has(.sheet) + .footer .footer-inner {
+      animation: footer-rise linear both;
+      animation-timeline: --footer;
+      animation-range: entry 0% entry 100%;
+    }
+  }
+}
+@keyframes footer-rise {
+  from {
+    transform: translateY(-30%);
+  }
+}
+/* brand, resources and legal on the left; the tool groups three to a row */
 .footer-grid {
   display: grid;
-  grid-template-columns: 1.4fr repeat(4, 1fr);
-  gap: 32px;
+  grid-template-columns: 300px minmax(0, 1fr);
+  gap: 64px;
 }
-.footer-intro {
+.footer-side {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 28px;
 }
-.footer-intro a {
-  text-decoration: none;
-  align-self: flex-start;
+.footer-pair,
+.footer-groups {
+  display: grid;
+  gap: 32px;
 }
-.footer-intro p {
+.footer-pair {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px;
+}
+.footer-groups {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.footer-intro {
   color: var(--ink-2);
   font-size: 15px;
   max-width: 34ch;
@@ -313,13 +369,12 @@
   color: var(--ink);
   text-decoration: underline;
 }
+/* copyright, film data and the age mark: small, under resources and legal */
 .footer-base {
   display: flex;
-  flex-wrap: wrap;
-  gap: 8px 24px;
-  margin-top: 40px;
-  padding-top: 20px;
-  border-top: 1px solid var(--hairline);
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
   color: var(--ink-3);
   font-size: 13px;
 }
@@ -327,21 +382,24 @@
   color: inherit;
 }
 .age-mark {
-  margin-left: auto;
+  margin-top: 4px;
   padding: 1px 8px;
   border: 1px solid var(--hairline);
   border-radius: var(--pill);
 }
 @media (max-width: 1020px) {
   .footer-grid {
-    grid-template-columns: repeat(2, 1fr);
-  }
-  .footer-intro {
-    grid-column: 1 / -1;
+    grid-template-columns: 1fr;
+    gap: 40px;
   }
 }
-@media (max-width: 480px) {
-  .footer-grid {
+@media (max-width: 720px) {
+  .footer-groups {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 420px) {
+  .footer-groups {
     grid-template-columns: 1fr;
   }
 }

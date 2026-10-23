@@ -19,7 +19,7 @@ export interface Session {
   embed: boolean;
   apiDocs: string;
   support: boolean;
-  tools: { url: string; title: string; guide: boolean }[];
+  tools: { url: string; title: string; guide: boolean; group?: string }[];
   legacyCss: string;
 }
 
