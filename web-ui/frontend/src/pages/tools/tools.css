@@ -47,6 +47,10 @@
 .tool-search input::placeholder {
   color: var(--ink-3);
 }
+/* the box has its own clear button */
+.tool-search input::-webkit-search-cancel-button {
+  display: none;
+}
 /* "/" from anywhere on the page focuses the input (see Tools.tsx) */
 .tool-kbd {
   flex: none;
