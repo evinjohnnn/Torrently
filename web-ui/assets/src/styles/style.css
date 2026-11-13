@@ -1,0 +1,2453 @@
+@import 'tailwindcss';
+
+@plugin 'daisyui' {
+  exclude: properties;
+  themes: night;
+}
+
+@config '../../../tailwind.config.js';
+
+/* ===== Mobile accidental-zoom prevention =====
+   touch-action: manipulation disables double-tap-to-zoom (pinch-zoom stays
+   available for accessibility). The 16px floor on form fields on touch
+   devices stops iOS Safari from auto-zooming the page when an input with
+   font-size < 16px receives focus.
+
+   scroll-padding-top: the navbar is fixed and 72px tall (partials/nav.html),
+   so a scroll that brings an element into view -- the keyboard's focus, an
+   anchor -- stops below it rather than under it (WCAG 2.4.11). An anchor's
+   own scroll-margin adds to it (views/resource/get.html #file, #content). */
+html {
+  touch-action: manipulation;
+  scroll-padding-top: 72px;
+}
+@media (hover: none) and (pointer: coarse) {
+  input,
+  select,
+  textarea {
+    font-size: max(16px, 1em) !important;
+  }
+}
+
+/* ===== Video card grid (library + discover) =====
+   Shared visual primitives for video cards. Used by both
+   templates/partials/library/video_list.html (Go templates) and
+   assets/src/js/lib/discover/components/ItemGrid.jsx (Preact).
+   Change here → both pages stay in sync.
+   See docs/uikit.html section 7 "Video Card" for examples. */
+
+/* Settings/profile panel: the plain card every profile section sits in.
+   p-4 on phones, p-6 from sm — the same breathing room the resource page's
+   cards use, so a 360px viewport keeps 20px more for the content. One class
+   instead of the same 8-utility string repeated per partial. */
+.w-panel {
+  @apply bg-base-300/50 border border-w-line rounded-2xl p-4 sm:p-6 mb-6;
+}
+
+/* ===== Transfer status (resource page): swarm ▸ cache ▸ you =====
+   Where the viewer's bytes come from and what caps them: the chain while
+   something moves (only who takes part), the old badge while nothing does,
+   the piece bar, then the hint or the plan box. One block, in the film card
+   and -- cloned -- in the sticky bar (views/resource/get.html,
+   partials/resource/status.html, app/resource/status.js). docs/
+   transfer_status.html renders every state with these classes; the design
+   as approved (2026-09-24, revised 2026-09-25) is transfer_status.approved
+   .html, and the living page has to keep rendering with them.
+
+   Chain or badge is the block's data-mode. Both sit in one grid cell
+   (.tx-head) and stay laid out; the one not shown is only invisible. The
+   row is therefore as tall as the chain in either mode -- the source node
+   is on every chain -- and switching never moves the card.
+
+   Stable DOM: the server renders every slot once and the script only moves
+   text, attributes and cell fills into them, so the one sweep per segment
+   runs on between status messages instead of restarting every second.
+
+   Colour means cause and rides on data-tone: flow (cyan, data flowing),
+   plan (pink, the plan's cap -- the only place a CTA appears), swarm and
+   pause (amber), vault (purple), off (grey, dashed); on nodes cached (green),
+   vault, err (no seeders), warn (Vault retrying).
+
+   The block is its own size container: the chain needs ~670px laid out in a
+   row in its longest language, so below that -- a phone, the card's column on a tablet, the sticky
+   bar on a phone -- the compact chain below takes over, whatever the
+   viewport. */
+.tx {
+  /* What the speed label masks the line with: the card's colour behind the
+     block (the sticky bar and the popover set their own). */
+  --tx-bg: #121827;
+  position: relative;
+  container-type: inline-size;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+#torrent-status-sticky .tx {
+  --tx-bg: #0b0f1b;
+}
+/* The chain's row, shared with the badge: one grid cell for both. */
+.tx-head {
+  display: grid;
+  /* One track as wide as the block, not as the chain's content: an auto
+     track grew to a long chain and pushed it past the card. */
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
+}
+.tx-head > * {
+  grid-area: 1 / 1;
+  min-width: 0;
+}
+/* visibility, not display: the hidden one keeps the row's height, and is
+   neither focusable nor read out. */
+.tx[data-mode="badge"] .tx-chain,
+.tx:not([data-mode="badge"]) .tx-badge {
+  visibility: hidden;
+}
+/* The chain is the button that opens the details: a <button> of spans. */
+.tx-chain {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
+  text-align: left;
+  cursor: pointer;
+}
+.tx-chain:focus-visible {
+  outline: 2px solid #00cec9;
+  outline-offset: 3px;
+}
+
+/* Nodes: a pill (icon, name, value) -- and, in the compact chain, the short
+   number in the pill and the caption under it. */
+.tx-node {
+  flex: none;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  color: #cbd5e1;
+}
+/* The swarm's value is the chain's longest ("12 peers · 0 seeders") and the
+   one that grows with the swarm: where even the full chain's width is not
+   enough (four-digit peers), it gives way with an ellipsis rather than push
+   the viewer's node out of the row. */
+.tx-node[data-kind="swarm"] {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.tx-node[data-kind="swarm"] .tx-pill {
+  max-width: 100%;
+}
+.tx-node[data-kind="swarm"] .tx-val {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tx-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 999px;
+  background: #111827;
+  white-space: nowrap;
+}
+.tx-ic {
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+.tx-nm {
+  font-weight: 600;
+  color: #f1f5f9;
+}
+.tx-val:empty,
+.tx-short,
+.tx-cap {
+  display: none;
+}
+.tx-node[data-tone="cached"] .tx-pill,
+.tx-node[data-tone="cached"] .tx-nm {
+  border-color: rgba(74, 222, 128, 0.4);
+  color: #4ade80;
+}
+.tx-node[data-tone="vault"] .tx-pill {
+  border-color: rgba(162, 155, 254, 0.45);
+  color: #a29bfe;
+}
+.tx-node[data-tone="vault"] .tx-nm {
+  color: #c4bfff;
+}
+.tx-node[data-tone="err"] .tx-pill {
+  border-color: rgba(248, 113, 113, 0.45);
+  color: #f87171;
+}
+.tx-node[data-tone="warn"] .tx-pill {
+  border-color: rgba(251, 191, 36, 0.45);
+  color: #fbbf24;
+}
+/* Dimmed ("?", Vault not started): the icon and the outline, not the
+   words -- at half opacity "?" read at 3.9:1 on the card. The outline in the
+   node's own colour, so a dimmed Vault node stays purple. */
+.tx-node[data-dim] .tx-ic {
+  opacity: 0.5;
+}
+.tx-node[data-dim] .tx-pill {
+  border-color: color-mix(in srgb, currentColor 20%, transparent);
+}
+
+/* The badge: the one the page had before the chain (git 5d55b26e), one
+   element; its colours are the old badge's utility classes, per tone
+   ("checking" now cyan, "In Vault" purple, the muted tone lighter and
+   outlined: the approved design). Its size is the approved pill's too,
+   2 + 18 + 2 px and the border: 24px, as tall as a chain node -- DaisyUI's
+   badge-sm pinned it to 20px. */
+.tx-badge {
+  align-self: center;
+  justify-self: start;
+  max-width: 100%;
+  height: auto;
+  line-height: 18px;
+}
+.tx-badge:focus {
+  outline: none;
+}
+.tx-badge:focus-visible {
+  outline: 2px solid #00cec9;
+  outline-offset: 2px;
+}
+.tx-badge .badge-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The Vault table (views/vault/index.html): the words wrap in its status
+   column instead. On a phone the column leaves them 68px -- "Vaulting 64%
+   (9 seeders)" showed 41%, "Transfer failed, retrying" a quarter -- and the
+   title that carried the rest is no help on a touch screen. Hyphenated by
+   the page's lang; a word still wider than the column breaks anywhere
+   rather than runs out of it. */
+#vault-pledges .tx-badge .badge-text {
+  white-space: normal;
+  hyphens: auto;
+  overflow-wrap: anywhere;
+}
+.tx-bi {
+  flex: none;
+  width: 12px;
+  height: 12px;
+}
+.tx-bdots,
+.tx-badge[data-icon="dots"] .tx-bi {
+  display: none;
+}
+.tx-badge[data-icon="dots"] .tx-bdots {
+  display: inline-block;
+}
+.tx-badge[data-pulse] .tx-bi {
+  @apply animate-pulse;
+}
+/* The swarm, "(14 seeders)", a step back from the words: at 0.85 it reads
+   at 4.5:1 or more in every tone that carries it (5.2:1 at worst, Vault's
+   purple on the card); 0.7 read 4.0-4.5:1. lib/statusMarkup.test.js. */
+.tx-bx {
+  opacity: 0.85;
+}
+.tx-bx:empty {
+  display: none;
+}
+.tx-badge[data-tone="muted"] {
+  background-color: rgba(17, 24, 39, 0.5);
+  border-color: rgba(51, 65, 85, 0.35);
+  @apply text-w-sub;
+}
+.tx-badge[data-tone="cyan"] {
+  @apply bg-w-cyan/10 border-w-cyan/30 text-w-cyan;
+}
+.tx-badge[data-tone="warn"] {
+  @apply bg-warning/10 border-warning/30 text-warning;
+}
+.tx-badge[data-tone="err"] {
+  @apply bg-error/10 border-error/30 text-error;
+}
+.tx-badge[data-tone="ok"] {
+  @apply bg-green-500/10 border-green-500/30 text-green-400;
+}
+.tx-badge[data-tone="vault"] {
+  @apply bg-w-purple/10 border-w-purple/30 text-w-purpleL;
+}
+/* Not a transfer state: the Vault page's own "Expiring" (a pledge that lost
+   its backing), drawn with the same element in the pink it always had -- the
+   dashboard's Expiring count is pink too. statusview never sends it. */
+.tx-badge[data-tone="pink"] {
+  @apply bg-w-pink/10 border-w-pink/30 text-w-pinkL;
+}
+
+/* Segments: the arrow towards the viewer, the speed on the line. */
+.tx-seg {
+  --c: 0, 206, 201;
+  flex: 1 1 0;
+  min-width: 96px;
+  display: flex;
+  align-items: center;
+  color: #00cec9;
+}
+.tx-seg[data-tone="plan"] {
+  --c: 253, 121, 168;
+  color: #fd79a8;
+}
+.tx-seg[data-tone="swarm"],
+.tx-seg[data-tone="pause"] {
+  --c: 251, 191, 36;
+  color: #fbbf24;
+}
+.tx-seg[data-tone="vault"] {
+  --c: 162, 155, 254;
+  color: #a29bfe;
+}
+.tx-seg[data-tone="off"] {
+  --c: 100, 116, 139;
+  color: #94a3b8;
+}
+.tx-trk {
+  position: relative;
+  flex: 1 1 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 18px;
+  min-width: 0;
+}
+.tx-ln {
+  position: absolute;
+  left: 0;
+  right: 3px;
+  top: 50%;
+  height: 2px;
+  margin-top: -1px;
+  border-radius: 2px;
+  background-color: rgba(var(--c), 0.25);
+}
+.tx-seg[data-tone="off"] .tx-ln {
+  background: repeating-linear-gradient(90deg, rgba(100, 116, 139, 0.6) 0 3px, rgba(100, 116, 139, 0) 3px 7px);
+}
+.tx-seg[data-tone="pause"] .tx-ln {
+  background: repeating-linear-gradient(90deg, rgba(251, 191, 36, 0.45) 0 3px, rgba(251, 191, 36, 0) 3px 7px);
+}
+.tx-sp {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.25em;
+  min-width: 9ch;
+  padding: 0 6px;
+  background: var(--tx-bg);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.tx-seg[data-tone="off"] .tx-sp {
+  font-weight: 500;
+}
+.tx-note {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-style: normal;
+  font-weight: 500;
+  opacity: 0.85;
+}
+/* A label never wider than its line: where the column is too narrow for
+   the whole chain (the card's ~690px column and "0 Mbps · needed pieces
+   missing" twice) the note gives way with an ellipsis -- the speed stays,
+   and the compact chain drops the notes altogether anyway. */
+.tx-sp {
+  max-width: 100%;
+  overflow: hidden;
+}
+.tx-spd {
+  flex: none;
+}
+.tx-note:empty,
+.tx-spd:empty {
+  display: none;
+}
+/* 12px on a 12-unit grid with whole-pixel bars: at 11px from a 24-unit
+   grid the two bars landed on different sub-pixel phases and one read
+   blurred, the glyph crooked. */
+.tx-pz {
+  display: none;
+  width: 12px;
+  height: 12px;
+  flex: none;
+}
+.tx-seg[data-tone="pause"] .tx-pz {
+  display: block;
+}
+/* The plan's cap as a shape, not only pink: the player's lock at the start
+   of the line, in the compact chain only -- the wide one says "· cap" in
+   words, the compact one has no note (WCAG 1.4.1; after the box's × a phone
+   has nothing else that says it). On the track, not in the speed's label:
+   a 320 px phone has 56 px for "5 Mbps", and a lock before it cut it. */
+.tx-lk {
+  display: none;
+  width: 12px;
+  height: 12px;
+  flex: none;
+}
+.tx-dots {
+  display: none;
+  align-items: center;
+  gap: 3px;
+}
+.tx-seg[data-dots] .tx-dots {
+  display: inline-flex;
+}
+.tx-seg[data-dots] .tx-spd,
+.tx-seg[data-dots] .tx-note {
+  display: none;
+}
+.tx-dots i {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: tx-dot 1.2s ease-in-out infinite;
+}
+.tx-dots i:nth-child(2) {
+  animation-delay: 0.2s;
+}
+.tx-dots i:nth-child(3) {
+  animation-delay: 0.4s;
+}
+.tx-hd {
+  position: absolute;
+  right: -1px;
+  top: 50%;
+  width: 8px;
+  height: 10px;
+  margin-top: -5px;
+}
+.tx-seg[data-tone="off"] .tx-hd {
+  opacity: 0.5;
+}
+/* Motion: one sweep per flowing segment -- a 30%-wide gradient crossing the
+   line in 1.8 s -- and the label and the arrowhead brightening a little as
+   it passes under them (50% and ~90% of the same cycle). No glow. */
+.tx-seg[data-moving] .tx-ln {
+  background-image: linear-gradient(90deg, rgba(var(--c), 0), rgb(var(--c)), rgba(var(--c), 0));
+  background-size: 30% 100%;
+  background-repeat: no-repeat;
+  animation: tx-sweep 1.8s linear infinite;
+}
+.tx-seg[data-moving] .tx-sp {
+  animation: tx-lit 1.8s linear infinite;
+}
+.tx-seg[data-moving] .tx-hd {
+  animation: tx-head 1.8s linear infinite;
+}
+@keyframes tx-sweep {
+  from {
+    background-position: -43% 0;
+  }
+  to {
+    background-position: 143% 0;
+  }
+}
+@keyframes tx-lit {
+  0%,
+  30% {
+    filter: none;
+  }
+  50% {
+    filter: brightness(1.18);
+  }
+  70%,
+  100% {
+    filter: none;
+  }
+}
+@keyframes tx-head {
+  0%,
+  78% {
+    filter: none;
+  }
+  90% {
+    filter: brightness(1.18);
+  }
+  100% {
+    filter: none;
+  }
+}
+@keyframes tx-dot {
+  0%,
+  100% {
+    opacity: 0.25;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* Piece bar: one cell per bucket of pieces; --fill (0..1) is how much of the
+   bucket the seeder holds, .a pulses for the ones being fetched. The slot is
+   always 6px, so the block never jumps between the bar and the divider. */
+.tx-bar {
+  display: flex;
+  align-items: center;
+  height: 6px;
+  color: #00cec9;
+}
+.tx-bar[data-tone="vault"] {
+  color: #a29bfe;
+}
+.tx-pbar {
+  display: none;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  position: relative;
+  isolation: isolate;
+  width: 100%;
+  height: 6px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: color-mix(in srgb, currentColor 8%, transparent);
+}
+.tx-bar[data-mode="pieces"] .tx-pbar {
+  display: grid;
+}
+.tx-bar[data-mode="pieces"] .tx-pdiv {
+  display: none;
+}
+.tx-pbar > span {
+  background: currentColor;
+  opacity: var(--fill, 0);
+}
+.tx-pbar > span.a {
+  opacity: 0.45;
+  animation: tx-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+/* Cells holding a piece nobody connected has: the red-tinted 135° hatch,
+   and whatever of a cell is complete here drawn over it (the seeder merges
+   its runs past 512, so a hatched run may cover complete pieces). The hatch
+   is one layer under the cells, as wide as the bar, shown only where the
+   missing cells are (--tx-holes, a mask lib/transferStatus.js paintBar
+   builds from them; data-holes while there are any). Painted per cell, the
+   stripes started over in every cell and met only where a cell happened to
+   be one stripe period wide -- the docs' 128 cells at 690px; the page's 256
+   read as a row of blocks with no diagonal in it, and a gradient shifted
+   per cell still broke at every cell edge, each snapped to its own pixel. */
+.tx-pbar::before {
+  content: "";
+  display: none;
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: repeating-linear-gradient(135deg, rgba(248, 113, 113, 0.7) 0 2px, rgba(248, 113, 113, 0.15) 2px 4px);
+  -webkit-mask-image: var(--tx-holes);
+  mask-image: var(--tx-holes);
+}
+.tx-pbar[data-holes]::before {
+  display: block;
+}
+.tx-pbar > span.m {
+  animation: none;
+}
+@keyframes tx-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 0.12;
+  }
+}
+.tx-pdiv {
+  width: 100%;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.07);
+}
+
+/* The line under the bar. Pinkish when it is the plan's cap said without a
+   button (nothing faster on sale, or another offer already on screen). The
+   Vault link follows the words where pieces nobody has are the story. */
+.tx-hint {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  margin: 0;
+  font-size: 13px;
+  line-height: 18px;
+  color: #94a3b8;
+}
+.tx-hint[data-tone="plan"] {
+  color: #fbcfe8;
+}
+/* The link wraps: "Save to Vault — it finishes the download on its own" is
+   340px in English, wider than the block on most phones (viewport - 58px),
+   where nowrap had the card's edge cut it mid-word. */
+.tx-vlink {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: #a29bfe;
+  font-weight: 600;
+  text-decoration: none;
+}
+.tx-vlink:hover {
+  color: #c4bfff;
+}
+.tx-vlink svg {
+  flex: none;
+  width: 15px;
+  height: 15px;
+}
+
+/* Plan box: bolt, title and ETA on the left; the button with the trial note
+   under it on the right (action/download_file.html's pattern). */
+/* Right padding: room for the × in the corner (.tx-px), so the button beside
+   it never sits under it. */
+.tx-pbox {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 44px 14px 16px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 12px;
+  background: rgba(26, 34, 53, 0.35);
+}
+.tx-pl {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  flex: 1 1 0;
+  min-width: 240px;
+}
+.tx-bolt {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  margin-top: 1px;
+  color: #fd79a8;
+}
+.tx-pt {
+  font-size: 14px;
+  line-height: 19px;
+  font-weight: 600;
+  color: #f1f5f9;
+}
+.tx-ps {
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 17px;
+  color: #94a3b8;
+}
+.tx-ps:empty,
+.tx-pn:empty {
+  display: none;
+}
+.tx-pr {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+.tx-sbtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 0 14px;
+  border: 1px solid rgba(232, 67, 147, 0.28);
+  border-radius: 8px;
+  background: rgba(232, 67, 147, 0.14);
+  color: #fd79a8;
+  font-size: 13px;
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.tx-sbtn:hover {
+  background: rgba(232, 67, 147, 0.22);
+  color: #fd79a8;
+}
+.tx-sbtn svg {
+  flex: none;
+  width: 16px;
+  height: 16px;
+}
+/* w-sub, not the approved design's w-muted: at 11px #64748b read 3.6:1 on
+   the box, and "cancel any time" is the half of the offer that must be
+   read. The size keeps it under the button. */
+.tx-pn {
+  font-size: 11px;
+  line-height: 13px;
+  color: #94a3b8;
+  text-align: center;
+}
+/* The viewer's × (owner, 2026-09-27): the box stays until they close it. A
+   44px target in the top-right corner -- a finger's size on a phone -- with
+   the glyph small in it. */
+.tx-px {
+  position: absolute;
+  top: 0;
+  right: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 0;
+  border-radius: 12px;
+  background: none;
+  color: #64748b;
+  cursor: pointer;
+}
+.tx-px:hover {
+  color: #f1f5f9;
+}
+.tx-px:focus-visible {
+  outline: 2px solid #fd79a8;
+  outline-offset: -8px;
+}
+.tx-px svg {
+  width: 14px;
+  height: 14px;
+}
+/* Another offer on screen (the grace popup, the cap modal, the download
+   nudge): the box stays, its button and the note under it go down in place
+   -- visibility, not display, so the box keeps its height and nothing under
+   the card moves (lib/transferStatus.js keepBox). */
+.tx-pbox[data-quiet] .tx-pr {
+  visibility: hidden;
+}
+
+/* "Where the bottleneck is": a popover (top layer -- the card's
+   overflow:hidden would cut it) placed under the chain by the script; without
+   a script the browser centres it. */
+.tx-details {
+  width: min(520px, calc(100vw - 16px));
+  max-height: calc(100vh - 16px);
+  overflow: auto;
+  padding: 18px 20px;
+  border: 1px solid #334155;
+  border-radius: 14px;
+  background: #111827;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.45);
+  color: #f1f5f9;
+  text-align: left;
+}
+/* The browser centres a popover with margin:auto; preflight's margin:0 would
+   pin it to the top-left corner. The script replaces both when it places it. */
+.tx-details[popover] {
+  margin: auto;
+}
+.tx-dh {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 10px;
+}
+.tx-dt {
+  font-size: 15px;
+  font-weight: 700;
+  color: #f1f5f9;
+}
+.tx-dx {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  margin: -4px -6px -4px 0;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: #94a3b8;
+  cursor: pointer;
+}
+.tx-dx:hover {
+  color: #f1f5f9;
+}
+/* Touch: a finger's size, as the box's × (.tx-px) and the player card's;
+   the glyph and the header's height stay where they were. */
+@media (pointer: coarse) {
+  .tx-dx {
+    width: 44px;
+    height: 44px;
+    margin: -12px -14px -12px 0;
+  }
+}
+.tx-dx svg {
+  width: 16px;
+  height: 16px;
+}
+.tx-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 0;
+  border-top: 1px solid #1a2235;
+}
+.tx-rl {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.tx-rlabel {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: #cbd5e1;
+}
+.tx-rsub {
+  font-size: 12px;
+  color: #94a3b8;
+}
+.tx-rsub:empty {
+  display: none;
+}
+.tx-rv {
+  font-size: 14px;
+  font-weight: 600;
+  color: #f1f5f9;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.tx-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: rgba(232, 67, 147, 0.16);
+  color: #fd79a8;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.tx-dplan {
+  padding-top: 14px;
+  border-top: 1px solid #1a2235;
+}
+.tx-dplan .tx-pr {
+  width: 100%;
+}
+/* The details' copy of the box has no ×: the popover has its own close, and
+   the box is closed where it stands, under the bar. */
+.tx-dplan .tx-pbox {
+  padding-right: 16px;
+}
+.tx-dplan .tx-pl {
+  padding-right: 0;
+}
+.tx-dplan .tx-px {
+  display: none;
+}
+.tx-dplan .tx-sbtn {
+  justify-content: center;
+  width: 100%;
+  min-height: 44px;
+}
+/* A browser without the Popover API: in flow under the chain, opened by the
+   script with .is-open (it is cut by the card's edge there, but usable). */
+@supports not selector(:popover-open) {
+  .tx-details,
+  .tx-details[popover] {
+    display: none;
+    position: absolute;
+    top: 30px;
+    left: 0;
+    z-index: 30;
+    margin: 0;
+  }
+  .tx-details.is-open {
+    display: block;
+  }
+}
+
+/* The compact chain: the number in the pill and the caption under it, the
+   speed above its line, no note; the plan box's button full width, 44px.
+   670px: the longest full chain -- "missing" with three-digit peers, in
+   German, Spanish or Portuguese -- needs 665 (a width sweep of every chain
+   state in all 11 languages, 2026-09-25); at the old 600 it ran up to 64px
+   past its row, the viewer's node cut off by the card or past the sticky
+   bar's edge. */
+@container (max-width: 669px) {
+  .tx-chain {
+    align-items: flex-start;
+    gap: 4px;
+  }
+  .tx-node {
+    gap: 2px;
+    font-size: 11px;
+    line-height: 14px;
+    color: #94a3b8;
+  }
+  /* As tall with a number as with the icon alone ("in cache", Vault): the
+     row's height is the chain's in either mode, whatever node it has. */
+  .tx-pill {
+    gap: 4px;
+    min-height: 22px;
+    padding: 3px 7px;
+    color: #cbd5e1;
+    font-weight: 600;
+  }
+  .tx-ic {
+    width: 13px;
+    height: 13px;
+  }
+  .tx-nm,
+  .tx-val,
+  .tx-note {
+    display: none;
+  }
+  .tx-short:not(:empty) {
+    display: inline;
+  }
+  .tx-cap {
+    display: block;
+  }
+  .tx-seg {
+    min-width: 0;
+  }
+  .tx-trk {
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: flex-start;
+    height: auto;
+    padding-bottom: 12px;
+  }
+  .tx-ln {
+    top: auto;
+    bottom: 4px;
+    margin-top: 0;
+  }
+  .tx-hd {
+    top: auto;
+    bottom: 0;
+    margin-top: 0;
+  }
+  .tx-sp {
+    min-width: 0;
+    padding: 0;
+    background: none;
+    font-size: 11px;
+  }
+  /* Centred on the line, as the arrowhead at its other end; the line
+     starts after it. */
+  .tx-seg[data-tone="plan"] .tx-lk {
+    display: block;
+    position: absolute;
+    left: 0;
+    bottom: -1px;
+  }
+  .tx-seg[data-tone="plan"] .tx-ln {
+    left: 15px;
+  }
+  /* The button full width under the words; the × clear of the title,
+     beside it rather than beside the button. */
+  .tx-pbox {
+    padding-right: 16px;
+  }
+  .tx-pl {
+    min-width: 0;
+    flex-basis: 100%;
+    padding-right: 28px;
+  }
+  .tx-pr {
+    width: 100%;
+  }
+  .tx-sbtn {
+    justify-content: center;
+    width: 100%;
+    min-height: 44px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  /* No sweep: the line is simply filled. Nothing pulses. */
+  .tx-seg[data-moving] .tx-ln {
+    animation: none;
+    background-image: none;
+    background-color: rgba(var(--c), 0.6);
+  }
+  .tx-seg[data-moving] .tx-sp,
+  .tx-seg[data-moving] .tx-hd {
+    animation: none;
+  }
+  .tx-dots i {
+    animation: none;
+    opacity: 0.6;
+  }
+  .tx-pbar > span.a,
+  .tx-badge[data-pulse] .tx-bi {
+    animation: none;
+  }
+  /* DaisyUI's loading dots move by SMIL inside a mask, out of reach of
+     `animation`: "checking" shows its three dots still instead. */
+  .tx-badge[data-icon="dots"] .tx-bdots {
+    display: none;
+  }
+  .tx-badge[data-icon="dots"] .tx-bi {
+    display: inline-block;
+  }
+}
+
+.w-card-frame {
+  background-color: #1a2235; /* w-card */
+  border: 1px solid rgba(255, 255, 255, 0.07); /* w-line */
+  border-radius: 0.75rem;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  transition: border-color 0.3s, opacity 0.3s;
+  container-type: inline-size;
+}
+.w-card-frame:hover {
+  border-color: rgba(108, 92, 231, 0.3); /* w-purple/30 */
+}
+.w-card-frame.is-watched {
+  opacity: 0.7;
+}
+
+/* Card title — auto-color on parent .group hover */
+.w-card-title {
+  font-weight: 600;
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  transition: color 0.15s;
+}
+.group:hover .w-card-title {
+  color: #a29bfe; /* w-purpleL */
+}
+
+/* Active overlay badge on a poster — has text label.
+   Add positioning utility (top-2 right-2 / left-2) and color
+   utility (text-green-400 / text-yellow-400) inline. */
+.w-card-badge {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.375rem 0.625rem;
+  border-radius: 9999px;
+  background-color: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(4px);
+  font-size: 0.75rem;
+  line-height: 1rem;
+  font-weight: 600;
+  box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -4px rgba(0, 0, 0, 0.1);
+  cursor: pointer;
+  transition: background-color 0.15s, color 0.15s;
+}
+.w-card-badge:hover {
+  background-color: rgba(0, 0, 0, 0.9);
+}
+
+/* Ghost overlay — icon-only, hover-revealed on desktop, faded on touch.
+   Add positioning + hover color utility (hover:text-green-400) inline. */
+.w-card-badge-ghost {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 9999px;
+  background-color: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(4px);
+  color: #94a3b8; /* w-sub */
+  box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -4px rgba(0, 0, 0, 0.1);
+  cursor: pointer;
+  opacity: 0;
+  transition: background-color 0.15s, color 0.15s, opacity 0.15s;
+}
+.group:hover .w-card-badge-ghost {
+  opacity: 1;
+}
+.w-card-badge-ghost:hover {
+  background-color: rgba(0, 0, 0, 0.9);
+}
+@media (hover: none) {
+  .w-card-badge-ghost {
+    opacity: 0.5;
+    width: 2.5rem;
+    height: 2.5rem;
+  }
+}
+
+/* Container-query responsive: hide badge text labels and show compact
+   stars when the card is narrower than 210px. In the current grid layout
+   (max-w-900px, 2–4 cols) cards are ~140–213px, so badges stay icon-only
+   and stars stay compact on most configurations — preventing overlap. */
+@container (max-width: 209px) {
+  .w-card-badge-label {
+    display: none;
+  }
+  .w-card-badge {
+    padding: 0.375rem;
+  }
+  .w-card-stars-full {
+    display: none;
+  }
+}
+@container (min-width: 210px) {
+  .w-card-stars-compact {
+    display: none;
+  }
+}
+
+@utility loading-elipsis {
+  &::after {
+    overflow: hidden;
+    animation: ellipsis steps(4, end) 1500ms infinite;
+    content: '...';
+    width: 0;
+    display: inline-block;
+    vertical-align: bottom;
+  }
+}
+
+@utility popin {
+  animation: popin 200ms;
+}
+
+@property --promo-angle {
+  syntax: '<angle>';
+  initial-value: 0deg;
+  inherits: false;
+}
+
+@utility promo {
+  @apply p-4 pr-8 mb-6 w-full max-w-[680px] mx-auto block text-center text-white relative z-10;
+  font-size: 0.9375rem;
+  border-radius: var(--rounded-box, 1rem);
+  position: relative;
+  overflow: hidden;
+  background: #0a0a14;
+  isolation: isolate;
+
+  &::before {
+    content: '';
+    position: absolute;
+    inset: -2px;
+    border-radius: var(--rounded-box, 1rem);
+    background: conic-gradient(
+      from var(--promo-angle),
+      #e84393, #6c5ce7, #00cec9, #fdcb6e, #e84393
+    );
+    animation: promo-spin 3s linear infinite;
+    z-index: -2;
+  }
+
+  &::after {
+    content: '';
+    position: absolute;
+    inset: 2px;
+    border-radius: calc(var(--rounded-box, 1rem) - 2px);
+    background: #0a0a14;
+    z-index: -1;
+  }
+}
+
+@keyframes promo-spin {
+  to { --promo-angle: 360deg; }
+}
+
+/* Animated rainbow border only — promo's frame without its banner sizing.
+   For small inline callouts (e.g. the Silver free-trial plaque on /donate). */
+@utility promo-outline {
+  @apply relative block text-center text-white;
+  border-radius: var(--rounded-box, 1rem);
+  overflow: hidden;
+  background: #0a0a14;
+  isolation: isolate;
+
+  &::before {
+    content: '';
+    position: absolute;
+    inset: -2px;
+    border-radius: var(--rounded-box, 1rem);
+    background: conic-gradient(
+      from var(--promo-angle),
+      #e84393, #6c5ce7, #00cec9, #fdcb6e, #e84393
+    );
+    animation: promo-spin 3s linear infinite;
+    z-index: -2;
+  }
+
+  &::after {
+    content: '';
+    position: absolute;
+    inset: 2px;
+    border-radius: calc(var(--rounded-box, 1rem) - 2px);
+    background: #0a0a14;
+    z-index: -1;
+  }
+}
+
+/* Promo close button */
+.promo-close {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.375rem;
+  width: 1.75rem;
+  height: 1.75rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.7);
+  cursor: pointer;
+  border-radius: 9999px;
+  z-index: 10;
+  transition: color 0.2s, background-color 0.2s;
+}
+.promo-close:hover {
+  color: rgba(255, 255, 255, 0.9);
+  background-color: rgba(255, 255, 255, 0.1);
+}
+
+/* Compact promo for inner pages */
+.promo-compact #promo-banner {
+  max-width: 100%;
+}
+.promo-compact .promo {
+  padding: 0.5rem 2.25rem 0.5rem 1rem;
+  margin-bottom: 1rem;
+  font-size: 0.875rem;
+  max-width: 100%;
+}
+.promo-compact .promo-close {
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+@utility progress-alert {
+  @apply shadow-lg py-4 rounded-box popin;
+  background-color: #111827;
+  border: 1px solid rgba(255,255,255,0.07);
+  position: relative;
+
+  pre {
+    @apply px-5 py-1 leading-7 whitespace-pre-wrap flex items-start text-sm;
+    color: #94a3b8;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+
+    &::before {
+      content: '';
+      @apply w-1.5 h-1.5 rounded-full shrink-0 mt-[0.720rem] mx-2.25;
+      background-color: #64748b;
+    }
+
+    &.continue {
+      &::before {
+        content: none;
+      }
+      @apply pl-[2.125rem];
+    }
+
+    &.error-summary,
+    &.warn-summary {
+      @apply px-5 py-1.5 rounded-lg mx-5 mt-1;
+      background-color: rgba(232, 67, 147, 0.1);
+      color: #fd79a8;
+      &::before { content: none; }
+    }
+
+    &.done-summary,
+    &.download-summary,
+    &.redirect-summary {
+      @apply px-5 py-1.5 rounded-lg mx-5 mt-1;
+      background-color: rgba(0, 206, 201, 0.1);
+      color: #00cec9;
+      &::before { content: none; }
+    }
+
+    /* A job's note under the stage line (lib/progressLog.js addNote). */
+    &.info-summary {
+      @apply px-5 py-1.5 rounded-lg mx-5 mt-1;
+      background-color: rgba(148, 163, 184, 0.08);
+      color: #cbd5e1;
+      &::before { content: none; }
+    }
+
+    &.inprogress,
+    &.statusupdate {
+      color: #00cec9;
+      &::before {
+        background-color: #00cec9;
+        animation: dot-pulse 1.5s ease-in-out infinite;
+      }
+    }
+
+    &.statusupdate {
+      span.task-status {
+        @apply pl-1;
+        color: #64748b;
+        &::before { content: '('; }
+        &::after { content: ')'; }
+      }
+    }
+
+    &.done {
+      color: #00cec9;
+      &::before {
+        content: '✓';
+        background: none;
+        width: auto;
+        height: auto;
+        border-radius: 0;
+        margin-top: 0;
+        animation: none;
+        color: #00cec9;
+        font-weight: 700;
+        line-height: 1.75rem;
+      }
+      span.task-status { display: none; }
+    }
+
+    &.error {
+      color: #fd79a8;
+      &::before {
+        content: '✕';
+        background: none;
+        width: auto;
+        height: auto;
+        border-radius: 0;
+        margin-top: 0;
+        animation: none;
+        color: #e84393;
+        font-weight: 700;
+        line-height: 1.75rem;
+      }
+      span.task-status { display: none; }
+    }
+
+    &.skip {
+      color: #fbbf24;
+      &::before {
+        content: '»';
+        background: none;
+        width: auto;
+        height: auto;
+        border-radius: 0;
+        margin-top: 0;
+        animation: none;
+        color: #fbbf24;
+        font-weight: 700;
+        line-height: 1.75rem;
+      }
+      span.task-status { display: none; }
+    }
+
+    &.warn {
+      color: #fd79a8;
+      &::before {
+        content: '⚠';
+        background: none;
+        width: auto;
+        height: auto;
+        border-radius: 0;
+        margin-top: 0;
+        animation: none;
+        color: #fd79a8;
+        font-weight: 700;
+        line-height: 1.75rem;
+        font-size: 0.75rem;
+      }
+      span.task-status { display: none; }
+    }
+  }
+
+  .close {
+    @apply btn btn-sm;
+    background-color: rgba(0, 206, 201, 0.10) !important;
+    border-color: rgba(0, 206, 201, 0.30) !important;
+    color: #00cec9 !important;
+  }
+  .close:hover {
+    background-color: rgba(0, 206, 201, 0.20) !important;
+    border-color: rgba(0, 206, 201, 0.45) !important;
+    color: #00cec9 !important;
+  }
+
+  .alert-close-wrapper {
+    @apply gap-2 px-5;
+  }
+
+  &.progress-alert-oneline {
+    @apply flex items-center;
+    pre { @apply flex-grow; }
+    .close { @apply mr-4; }
+  }
+}
+
+@layer utilities {
+
+  @keyframes ellipsis {
+    to {
+      width: 2.25em;
+    }
+  }
+
+  @keyframes dot-pulse {
+    0%, 100% {
+      transform: scale(1);
+      opacity: 0.8;
+    }
+    50% {
+      transform: scale(1.5);
+      opacity: 1.0;
+    }
+  }
+
+  @keyframes popin {
+    from {
+      transform: scaleX(0.95);
+      opacity: 0;
+    }
+
+    to {
+      transform: scaleX(1);
+      opacity: 1;
+    }
+  }
+
+  @keyframes vault-pulse {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.45; }
+  }
+
+  .vault-pulse {
+    animation: vault-pulse 1.8s ease-in-out infinite;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .vault-pulse {
+      animation: none;
+    }
+  }
+
+  /* Progress row hosts an absolutely-positioned percent indicator that rides
+     the right edge of the gradient fill. position:relative on the <tr> makes
+     the indicator escape its host <td> and align to the row width. */
+  tr[data-vault-progress] {
+    position: relative;
+  }
+
+  .vault-progress-pct {
+    position: absolute;
+    bottom: 1px;
+    transform: translateX(-100%);
+    padding: 0 0.4rem;
+    font-size: 0.6rem;
+    font-weight: 500;
+    line-height: 1;
+    color: #a29bfe;
+    pointer-events: none;
+    font-variant-numeric: tabular-nums;
+    transition: left 250ms ease-out;
+  }
+
+  /* Below FLIP_PCT the fill is too narrow to host the indicator on its left
+     side (it would clip past the row's left edge), so it sits to the right of
+     the gradient edge instead. */
+  .vault-progress-pct.vault-progress-pct--right {
+    transform: translateX(0);
+  }
+}
+
+input:-webkit-autofill,
+input:-webkit-autofill:focus {
+  transition: background-color 600000s 0s, color 600000s 0s;
+}
+
+/* ===== Override DaisyUI night theme to match redesign ===== */
+[data-theme="night"] {
+  --color-base-100: oklch(16.630% 0.0262 269.371) !important;   /* #0a0e1a */
+  --color-base-200: oklch(21.008% 0.0318 264.665) !important;   /* #111827 */
+  --color-base-300: oklch(25.395% 0.0380 266.275) !important;   /* #1a2235 */
+  --color-base-content: oklch(96.826% 0.0069 247.896) !important; /* #f1f5f9 */
+  --color-accent: oklch(64.306% 0.2118 355.207) !important;      /* #e84393 */
+  --color-accent-content: oklch(100% 0 0) !important;             /* white */
+}
+
+/* ===== Redesign utilities ===== */
+
+.gradient-text,
+.gradient-stat {
+  background: linear-gradient(135deg, #e84393 0%, #a29bfe 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  /* tracking-tighter collapses the inline box short of the last glyph's
+     right edge, so background-clip:text cuts the final letter (visible
+     on Cyrillic "е" in hero "торренты в браузере"). Tiny trailing pad
+     gives the gradient paint room for the whole glyph. */
+  padding-right: 0.08em;
+}
+
+.cta-glow {
+  background: radial-gradient(circle, rgba(232,67,147,0.18) 0%, rgba(232,67,147,0.06) 40%, transparent 70%);
+}
+
+/* ===== Hero backdrop =====
+   Everything the hero draws behind its type, in paint order:
+
+     .hero-backdrop   section level — partials/hero_wave.html "hero_backdrop"
+       .hero-lamp       warm light behind logo and badge that spills pink/violet
+                        onto the wave band; ::after is the amber filament
+       .hero-film       warm vignette; ::before is the one film-grain layer
+       .hero-bloom      the veil bright type leaves on film (halation)
+       .hero-stars      soft stars above the headline; ::before holds the static ones
+     .hero-wave       inside the h1 wrapper — partials/hero_wave.html "hero_wave"
+                      vector waves + pixel dust, centred on the h1 by construction
+
+   plus halation on the type itself (.hero-logo, .hero-title).
+
+   Geometry hangs off the section's 120px top padding and the logo size
+   (clamp(4rem, 10vw, 6.5rem)), never off the headline text, so every locale
+   and every tool page gets the same backdrop. --hx/--hy (pointer offset from
+   the hero centre, -1..1) are published on the <section> by lib/heroPointer.
+
+   Motion: only opacity / transform / scale / translate animate, so all of it
+   runs on the compositor. Light changes are slow smooth breaths on pairwise
+   non-harmonic periods (lamp 27s + 23s swell, filament 17s, bloom 19s + 31s,
+   stars 21/29/37s). No flicker and no short sags: on a video site a light
+   that dips for a few tenths of a second reads as the stream buffering.
+   Negative delays of a quarter period start each breath at its mid level.
+
+   The backdrop was tuned with a 70% dimmer; that factor is baked into the
+   numbers below (".602 = .86 × .7"), there is no wrapper opacity group. */
+
+/* Height of the hero's first screen (logo → search box). The film's vignette
+   and bottom fade are laid out in it; the section itself is much taller
+   (dropzone, ribbons), so the backdrop cannot simply be inset:0.
+   The light that belongs behind the waves is not here: it lives in
+   .hero-band-light next to the wave band, so it stays behind the waves
+   whatever the headline's line count, locale or page. */
+.hero-backdrop {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 866px;
+  pointer-events: none;
+}
+
+/* Lamp: the warm body behind logo and badge. (Its low pink/violet spill
+   across the wave band is .hero-band-light.) transform-origin keeps the
+   scale centre of the original 820px box, so the swell moves the light
+   exactly as before. */
+.hero-lamp {
+  position: absolute;
+  left: 50%;
+  top: -60px;
+  width: 2000px;
+  height: 680px;
+  margin-left: -1000px;
+  transform-origin: 50% 410px;
+  background:
+    radial-gradient(540px 330px at 50% 305px, rgba(255,162,112,.11) 0%, rgba(248,112,138,.085) 20%, rgba(232,67,147,.05) 44%, rgba(108,92,231,.02) 72%, rgba(108,92,231,0) 100%);
+  opacity: .602; /* .86 × .7 — the level the breath is centred on */
+  /* the logo offset rides on `translate`, the pointer on `transform`, the
+     swell on `scale`, the breath on `opacity` — independent properties */
+  transform: translate3d(calc(var(--hx, 0) * 46px), calc(var(--hy, 0) * 34px), 0);
+  animation:
+    hero-lamp-swell 23s ease-in-out infinite,
+    hero-lamp-breathe 27s ease-in-out -6.75s infinite;
+  will-change: opacity, scale, transform;
+}
+/* Filament: a small amber core just under the logo, breathing on its own
+   period. Its opacity multiplies with the lamp's, so the two drift slightly
+   in colour temperature instead of pulsing together. */
+.hero-lamp::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 152px;
+  width: 600px;
+  height: 240px;
+  margin-left: -300px;
+  background: radial-gradient(closest-side, rgba(255,188,124,.14) 0%, rgba(255,152,104,.075) 34%, rgba(242,104,128,.03) 66%, rgba(242,104,128,0) 100%);
+  opacity: .9;
+  animation: hero-filament-breathe 17s ease-in-out -4.25s infinite;
+}
+@keyframes hero-lamp-swell {
+  0%, 100% { scale: 1; }
+  47%      { scale: 1.05; }
+}
+/* ±3.5% around .602: felt as the light being alive, never seen as a change */
+@keyframes hero-lamp-breathe {
+  0%, 100% { opacity: .623; }
+  50%      { opacity: .581; }
+}
+@keyframes hero-filament-breathe {
+  0%, 100% { opacity: .94; }
+  50%      { opacity: .86; }
+}
+
+/* Film: warm vignette on the top corners and sides, faded out over the lower
+   third so the hero meets the rest of the page without a seam. Static. The
+   grain is the film's ::before, so it shares this fade. */
+.hero-film {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(64% 78% at 50% 34%, transparent 50%, rgba(12,7,4,.238) 100%);
+  -webkit-mask-image: linear-gradient(180deg, #000 62%, transparent 97%);
+  mask-image: linear-gradient(180deg, #000 62%, transparent 97%);
+}
+/* The one grain layer. A static feTurbulence tile (~1.2 CSS px features),
+   two-tone from one noise channel: dark specks in the page colour, which only
+   show where there is light to take away, and sparse warm-white specks. Its
+   mask is a 72% floor everywhere plus two bumps where the lamp is
+   brightest (under the logo, and the spill on the band), so the texture is
+   ~1.4× stronger in the light than in the dark sky (fitted to the lamp grain
+   + film grain pair it replaces: same spread and bright tail per region). Never transformed: a
+   sub-pixel move would resample the grain into mush. */
+.hero-film::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='256' height='256'%3E%3Cfilter id='g' x='0' y='0' width='100%25' height='100%25' color-interpolation-filters='sRGB'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.8' numOctaves='3' seed='11' stitchTiles='stitch'/%3E%3CfeColorMatrix values='1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0'/%3E%3CfeComponentTransfer%3E%3CfeFuncR type='discrete' tableValues='.04 1'/%3E%3CfeFuncG type='discrete' tableValues='.055 .9'/%3E%3CfeFuncB type='discrete' tableValues='.1 .8'/%3E%3CfeFuncA type='table' tableValues='.5 .4 .3 .2 .1 0 .021 .046 .07 .085 .097'/%3E%3C/feComponentTransfer%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23g)'/%3E%3C/svg%3E") 0 0 / 256px 256px repeat;
+  opacity: .7;
+  -webkit-mask-image:
+    linear-gradient(rgba(0,0,0,.72), rgba(0,0,0,.72)),
+    radial-gradient(560px 320px at 50% 228px, #000, rgba(0,0,0,.55) 45%, transparent),
+    radial-gradient(760px 180px at 50% 395px, rgba(0,0,0,.4), transparent);
+  mask-image:
+    linear-gradient(rgba(0,0,0,.72), rgba(0,0,0,.72)),
+    radial-gradient(560px 320px at 50% 228px, #000, rgba(0,0,0,.55) 45%, transparent),
+    radial-gradient(760px 180px at 50% 395px, rgba(0,0,0,.4), transparent);
+}
+
+/* Bloom: warm around the logo (centre y=167) and a faint pink/violet ambient
+   below it. (The wide low part under the h1 is .hero-band-light.) */
+.hero-bloom {
+  position: absolute;
+  left: 50%;
+  top: 0;
+  width: 1200px;
+  height: 660px;
+  margin-left: -600px;
+  background:
+    radial-gradient(280px 110px at 50% 167px, rgba(255,132,88,.1), rgba(246,92,112,.05) 46%, rgba(232,67,147,.018) 74%, transparent),
+    radial-gradient(620px 340px at 50% 270px, rgba(232,67,147,.035), rgba(108,92,231,.016) 50%, transparent 85%);
+  opacity: .63; /* .9 × .7 */
+  transform: translate3d(calc(var(--hx, 0) * 14px), calc(var(--hy, 0) * 10px), 0);
+  animation:
+    hero-bloom-breathe 19s ease-in-out infinite,
+    hero-bloom-swell 31s ease-in-out infinite;
+  will-change: opacity, transform;
+}
+/* uneven on purpose: an evenly spaced swell reads as a pulse (×.7 baked) */
+@keyframes hero-bloom-breathe {
+  0%, 100% { opacity: .63; }
+  38%      { opacity: .7; }
+  61%      { opacity: .574; }
+  80%      { opacity: .665; }
+}
+@keyframes hero-bloom-swell {
+  0%, 100% { scale: 1; }
+  52%      { scale: 1.035; }
+}
+
+/* Stars in the sky above the headline. The sky ends just above the h1 at any
+   logo size (h1 top = 208px + logo). Fourteen static stars are one painted
+   background; six breathe in three pairs, each star its own 7-8px element,
+   so a breath composites two tiny layers instead of a full-width one.
+   Breathing stars sit at --x/--y of the free width/height, the same
+   placement background-position percentages give the static ones. */
+.hero-stars {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: calc(196px + clamp(64px, 10vw, 104px));
+  transform: translate3d(calc(var(--hx, 0) * -5px), calc(var(--hy, 0) * -4px), 0);
+  will-change: transform;
+}
+.hero-stars::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(closest-side, rgba(255,238,222,.154), rgba(255,238,222,.057) 32%, rgba(255,238,222,0)) 3% 26% / 7px 7px no-repeat,
+    radial-gradient(closest-side, rgba(205,200,255,.126), rgba(205,200,255,.047) 32%, rgba(205,200,255,0)) 8% 64% / 7px 7px no-repeat,
+    radial-gradient(closest-side, rgba(253,190,214,.112), rgba(253,190,214,.041) 32%, rgba(253,190,214,0)) 12% 12% / 6px 6px no-repeat,
+    radial-gradient(closest-side, rgba(255,238,222,.14), rgba(255,238,222,.052) 32%, rgba(255,238,222,0)) 16% 44% / 7px 7px no-repeat,
+    radial-gradient(closest-side, rgba(205,200,255,.105), rgba(205,200,255,.039) 32%, rgba(205,200,255,0)) 24% 6% / 6px 6px no-repeat,
+    radial-gradient(closest-side, rgba(255,238,222,.126), rgba(255,238,222,.047) 32%, rgba(255,238,222,0)) 30% 30% / 7px 7px no-repeat,
+    radial-gradient(closest-side, rgba(255,238,222,.098), rgba(255,238,222,.036) 32%, rgba(255,238,222,0)) 47% 20% / 6px 6px no-repeat,
+    radial-gradient(closest-side, rgba(253,190,214,.098), rgba(253,190,214,.036) 32%, rgba(253,190,214,0)) 58% 5% / 6px 6px no-repeat,
+    radial-gradient(closest-side, rgba(205,200,255,.126), rgba(205,200,255,.047) 32%, rgba(205,200,255,0)) 67% 34% / 7px 7px no-repeat,
+    radial-gradient(closest-side, rgba(255,238,222,.154), rgba(255,238,222,.057) 32%, rgba(255,238,222,0)) 80% 16% / 7px 7px no-repeat,
+    radial-gradient(closest-side, rgba(255,238,222,.112), rgba(255,238,222,.041) 32%, rgba(255,238,222,0)) 86% 72% / 7px 7px no-repeat,
+    radial-gradient(closest-side, rgba(253,190,214,.112), rgba(253,190,214,.041) 32%, rgba(253,190,214,0)) 88% 46% / 6px 6px no-repeat,
+    radial-gradient(closest-side, rgba(205,200,255,.14), rgba(205,200,255,.052) 32%, rgba(205,200,255,0)) 95% 28% / 7px 7px no-repeat,
+    radial-gradient(closest-side, rgba(253,190,214,.091), rgba(253,190,214,.034) 32%, rgba(253,190,214,0)) 5% 90% / 6px 6px no-repeat;
+}
+.hero-stars i {
+  position: absolute;
+  left: calc((100% - var(--z)) * var(--x));
+  top: calc((100% - var(--z)) * var(--y));
+  width: var(--z);
+  height: var(--z);
+  background: radial-gradient(closest-side, rgb(var(--c) / var(--a)), rgb(var(--c) / calc(var(--a) * .37)) 30%, rgb(var(--c) / 0));
+  opacity: .5;
+  animation: hero-star-breathe var(--d) ease-in-out var(--t) infinite;
+}
+/* slow and never to zero: a breath, not a twinkle */
+@keyframes hero-star-breathe {
+  0%, 100% { opacity: .35; }
+  50%      { opacity: 1; }
+}
+
+/* Halation on the bright type: tight red-orange rim, mid halo, faint wide
+   bloom — static, em-based so it follows the clamp() font sizes. Highlights
+   print slightly warm, hence cream instead of white (contrast goes up).
+   Hooked on classes of the hero's own logo and h1; the navbar logo shares
+   none of them. */
+.hero-logo {
+  color: #fdf6ee;
+  text-shadow:
+    0 0 .04em rgba(255,92,52,.55),
+    0 0 .13em rgba(255,104,64,.32),
+    0 0 .4em rgba(255,120,84,.15);
+}
+.hero-title {
+  color: #fdf6ee;
+  text-shadow:
+    0 0 .05em rgba(255,90,54,.4),
+    0 0 .18em rgba(255,104,70,.18),
+    0 0 .5em rgba(255,116,84,.08);
+}
+/* background-clip:text would get the inherited text-shadow painted OVER its
+   fill, so the gradient line takes its halo from drop-shadow instead */
+.hero-title .gradient-text {
+  text-shadow: none;
+  filter: drop-shadow(0 0 .05em rgba(255,84,100,.4)) drop-shadow(0 0 .22em rgba(255,100,110,.14));
+}
+
+/* Band light: the lamp's low pink/violet spill and the bloom's wide warm
+   veil under the headline, anchored to the wave band (same centre: the h1
+   wrapper), so the lit part sits behind the waves at any line count, locale
+   or page. A sibling of .hero-wave, not a child: the band's headline-column
+   mask must not dim the light. Alphas carry the lamp's .602 and the bloom's
+   .63; it breathes on the lamp's period. */
+.hero-band-light {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 2000px;
+  height: 420px;
+  margin: -210px 0 0 -1000px;
+  pointer-events: none;
+  background:
+    radial-gradient(540px 150px at 50% 50%, rgba(255,112,92,.0315), rgba(232,67,147,.0176) 42%, rgba(108,92,231,.0069) 72%, transparent),
+    radial-gradient(960px 200px at 50% 50%, rgba(232,67,147,.0361) 0%, rgba(200,80,185,.0289) 40%, rgba(108,92,231,.0144) 72%, rgba(108,92,231,0) 100%);
+  transform: translate3d(calc(var(--hx, 0) * 30px), calc(var(--hy, 0) * 22px), 0);
+  animation: hero-band-breathe 27s ease-in-out -6.75s infinite;
+  will-change: opacity, transform;
+}
+@keyframes hero-band-breathe {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: .93; }
+}
+
+/* ===== Hero wave band =====
+   Waves and dust drifting behind the headline, one current, all to the left.
+   The band is centred on the h1 wrapper, so it follows the headline whatever
+   its line count or locale. Two masks, intersected:
+   - edge fade: transparent at the viewport edges, full from 22% to 78%;
+   - headline column: waves and dust drop to --hero-col-k within ±400px of
+     the centre (the h1 is at most 780px wide) and ramp back to full over
+     140px outside it.
+     This keeps the gradient line of the h1 above 3:1 (WCAG AA for large
+     text; measured worst p1 ≈3.3 over RU/EN/FR/DE, home and tool pages,
+     390–1440, pointer at the corners) while the band keeps its full
+     brightness on the sides. It is static and depends on the
+     viewport only, never on the headline text.
+   (-webkit-mask-composite is emitted by the Tailwind/Lightning build from
+   mask-composite, with the keywords mapped: intersect → source-in, etc.)
+   Heights are multiples of 3: the dust is pixel art on a 3px grid. */
+.hero-wave {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 100vw;
+  height: 231px;
+  pointer-events: none;
+  --hero-col-k: .6;
+  -webkit-mask-image:
+    linear-gradient(90deg, transparent, #000 22%, #000 78%, transparent),
+    linear-gradient(90deg, #000 calc(50% - 540px), rgba(0,0,0,var(--hero-col-k)) calc(50% - 400px), rgba(0,0,0,var(--hero-col-k)) calc(50% + 400px), #000 calc(50% + 540px));
+  mask-image:
+    linear-gradient(90deg, transparent, #000 22%, #000 78%, transparent),
+    linear-gradient(90deg, #000 calc(50% - 540px), rgba(0,0,0,var(--hero-col-k)) calc(50% - 400px), rgba(0,0,0,var(--hero-col-k)) calc(50% + 400px), #000 calc(50% + 540px));
+  mask-composite: intersect;
+}
+/* Below 1080px the column spans the whole viewport and the 200%/400%-wide
+   svgs pack the crests tighter against the smaller type, so it goes a
+   little darker. */
+@media (max-width: 1079px) {
+  .hero-wave { --hero-col-k: .45; }
+}
+
+/* Vector waves with a phosphor halo: each line is one path drawn twice (a
+   wide faint stroke under a thin bright one). No SVG filter — blur on a
+   200%-wide animated layer is what phones pay for. Each svg is 200% wide and
+   its path is periodic across half the viewBox (integer wave count, envelope
+   period = the half), so translateX(-50%) loops seamlessly. */
+.hero-wave svg {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 200%;
+  height: 100%;
+  overflow: visible;
+  will-change: transform;
+}
+/* top/height = each viewBox's crop of the 240-unit band (36+168, 54+132,
+   66+108), so a unit maps to the same pixel as in a full-height svg */
+.hero-wave .wave-1 { top: 15%;   height: 70%; opacity: .46; animation: hero-wave-drift 38s linear infinite; }
+.hero-wave .wave-2 { top: 22.5%; height: 55%; opacity: .26; animation: hero-wave-drift 61s linear -23s infinite; }
+.hero-wave .wave-3 { top: 27.5%; height: 45%; opacity: .17; animation: hero-wave-drift 89s linear -52s infinite; }
+/* Pointer parallax: the drift owns `transform`, the offset goes on the
+   independent `translate`, so the two compose. Layers shift against the
+   cursor, nearest the most; the shifts stay well inside the edge fade. */
+.hero-wave .wave-1 { translate: calc(var(--hx, 0) * -14px) calc(var(--hy, 0) * -10px); }
+.hero-wave .wave-2 { translate: calc(var(--hx, 0) *  -9px) calc(var(--hy, 0) *  -7px); }
+.hero-wave .wave-3 { translate: calc(var(--hx, 0) *  -5px) calc(var(--hy, 0) *  -4px); }
+@keyframes hero-wave-drift {
+  to { transform: translateX(-50%); }
+}
+
+/* Pixel dust carried by the same current, in three depths: farther = slower
+   and dimmer. 3px squares (6px for the brightest near ones) on a 3px grid,
+   a plus-shaped halo on the two front layers, stepped bob. Each track is 200%
+   wide and holds its field twice, so the -50% loop tiles. Horizontal travel
+   and edge fading belong to the track and the masks, the particles only bob.
+   Pure CSS on purpose — a canvas would cost bundle size and a rAF loop on
+   phones for pure decoration. */
+.hero-dust {
+  position: absolute;
+  inset: 0;
+  -webkit-mask-image: linear-gradient(180deg, transparent, #000 12%, #000 88%, transparent);
+  mask-image: linear-gradient(180deg, transparent, #000 12%, #000 88%, transparent);
+}
+.hero-dust-track {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 200%;
+  height: 100%;
+  will-change: transform;
+  animation: hero-wave-drift var(--speed) linear infinite;
+}
+/* the slowest wave crosses in 89s, so even the near layer lags the current */
+.dust-near { --speed: 110s; translate: calc(var(--hx, 0) * -26px) calc(var(--hy, 0) * -18px); }
+.dust-mid  { --speed: 165s; translate: calc(var(--hx, 0) * -15px) calc(var(--hy, 0) * -11px); }
+.dust-far  { --speed: 240s; translate: calc(var(--hx, 0) *  -7px) calc(var(--hy, 0) *  -5px); }
+.hero-dust-field {
+  position: absolute;
+  top: 0;
+  width: 50%;
+  height: 100%;
+}
+.hero-dust-field + .hero-dust-field { left: 50%; }
+.hero-dust i {
+  --s: 3px;
+  position: absolute;
+  left: var(--x);
+  top: var(--y);
+  width: var(--s);
+  height: var(--s);
+  background: rgb(var(--c));
+  opacity: var(--o);
+}
+/* Anything that sits or moves on the pixel grid is rounded to it, otherwise
+   sub-pixel offsets resample the pixel art into mush. The guard matters:
+   round() over var() is only checked at computed-value time, so without it
+   an older engine would drop left/top/translate to their initial values
+   instead of skipping the declaration. */
+@supports (left: round(nearest, 50%, 3px)) {
+  .hero-dust i {
+    left: round(nearest, var(--x), 3px);
+    top: round(nearest, var(--y), 3px);
+  }
+  .dust-near { translate: round(calc(var(--hx, 0) * -26px), 3px) round(calc(var(--hy, 0) * -18px), 3px); }
+  .dust-mid  { translate: round(calc(var(--hx, 0) * -15px), 3px) round(calc(var(--hy, 0) * -11px), 3px); }
+  .dust-far  { translate: round(calc(var(--hx, 0) *  -7px), 3px) round(calc(var(--hy, 0) *  -5px), 3px); }
+}
+/* Pixel-art halo on the two front layers: the square repeated one unit out
+   on each axis — a plus with the corners left empty, which is how glow is
+   drawn on a grid. The far layer stays static and paints into its track. */
+.dust-mid i,
+.dust-near i {
+  --h: rgb(var(--c) / var(--ha));
+  box-shadow: 3px 0 0 var(--h), -3px 0 0 var(--h), 0 3px 0 var(--h), 0 -3px 0 var(--h);
+  animation: hero-dust-bob var(--d) steps(var(--n)) var(--t) infinite;
+}
+.dust-mid i  { --ha: .22; }
+.dust-near i { --ha: .38; }
+@keyframes hero-dust-bob {
+  0%, 100% { transform: translate3d(0, calc(var(--b) * -1), 0); opacity: calc(var(--o) * .5); }
+  50%      { transform: translate3d(0, var(--b), 0);            opacity: var(--o); }
+}
+/* Twinkle on a hand-picked few (class="spark", --k cycle, --kt delay): a
+   4-frame sprite in the last ~9% of the cycle — dot, small plus, big plus
+   with coloured tips, small plus in colour — then gone. The frames are laid
+   out on a strip (the inner <b>, one cell drawn as box-shadows at a 5-cell
+   pitch) behind a 5×5-cell window (the outer <b>), and the strip jumps from
+   frame to frame with step-end: a transform animation, so it runs on the
+   compositor instead of repainting box-shadows on the main thread. */
+.hero-dust .spark > b {
+  position: absolute;
+  left: calc(var(--s) * -2);
+  top: calc(var(--s) * -2);
+  width: calc(var(--s) * 5);
+  height: calc(var(--s) * 5);
+  overflow: hidden;
+}
+.hero-dust .spark > b > b {
+  --w: rgba(255,240,225,.9);
+  --f: rgb(var(--c) / .55);
+  position: absolute;
+  left: calc(var(--s) * 2);
+  top: calc(var(--s) * 2);
+  width: var(--s);
+  height: var(--s);
+  box-shadow:
+    /* frame 1: dot */
+    calc(var(--s) * 5) 0 0 #fff,
+    /* frame 2: small plus */
+    calc(var(--s) * 10) 0 0 #fff,
+    calc(var(--s) * 11) 0 0 var(--w), calc(var(--s) * 9) 0 0 var(--w),
+    calc(var(--s) * 10) var(--s) 0 var(--w), calc(var(--s) * 10) calc(var(--s) * -1) 0 var(--w),
+    /* frame 3: big plus, coloured tips */
+    calc(var(--s) * 15) 0 0 #fff,
+    calc(var(--s) * 16) 0 0 var(--w), calc(var(--s) * 14) 0 0 var(--w),
+    calc(var(--s) * 15) var(--s) 0 var(--w), calc(var(--s) * 15) calc(var(--s) * -1) 0 var(--w),
+    calc(var(--s) * 17) 0 0 var(--f), calc(var(--s) * 13) 0 0 var(--f),
+    calc(var(--s) * 15) calc(var(--s) * 2) 0 var(--f), calc(var(--s) * 15) calc(var(--s) * -2) 0 var(--f),
+    /* frame 4: small plus in colour */
+    calc(var(--s) * 20) 0 0 #fff,
+    calc(var(--s) * 21) 0 0 var(--f), calc(var(--s) * 19) 0 0 var(--f),
+    calc(var(--s) * 20) var(--s) 0 var(--f), calc(var(--s) * 20) calc(var(--s) * -1) 0 var(--f);
+  animation: hero-dust-twinkle var(--k) step-end var(--kt) infinite;
+}
+@keyframes hero-dust-twinkle {
+  0%        { transform: translateX(0); }
+  84%       { transform: translateX(calc(var(--s) * -5)); }
+  86%       { transform: translateX(calc(var(--s) * -10)); }
+  88%       { transform: translateX(calc(var(--s) * -15)); }
+  91%       { transform: translateX(calc(var(--s) * -20)); }
+  93%, 100% { transform: translateX(0); }
+}
+
+@media (max-width: 640px) {
+  .hero-backdrop { height: 894px; }
+  /* logo 64px at y 120-184; box trimmed like the desktop one (spill ends at 585) */
+  .hero-lamp {
+    width: 900px;
+    height: 600px;
+    margin-left: -450px;
+    transform-origin: 50% 380px;
+    background:
+      radial-gradient(300px 270px at 50% 262px, rgba(255,162,112,.11) 0%, rgba(248,112,138,.085) 20%, rgba(232,67,147,.05) 44%, rgba(108,92,231,.02) 72%, rgba(108,92,231,0) 100%);
+  }
+  .hero-lamp::after {
+    top: 172px;
+    width: 340px;
+    height: 150px;
+    margin-left: -170px;
+  }
+  .hero-film::before {
+    -webkit-mask-image:
+      linear-gradient(rgba(0,0,0,.72), rgba(0,0,0,.72)),
+      radial-gradient(300px 250px at 50% 200px, #000, rgba(0,0,0,.55) 45%, transparent),
+      radial-gradient(420px 140px at 50% 375px, rgba(0,0,0,.35), transparent);
+    mask-image:
+      linear-gradient(rgba(0,0,0,.72), rgba(0,0,0,.72)),
+      radial-gradient(300px 250px at 50% 200px, #000, rgba(0,0,0,.55) 45%, transparent),
+      radial-gradient(420px 140px at 50% 375px, rgba(0,0,0,.35), transparent);
+  }
+  .hero-bloom {
+    background:
+      radial-gradient(170px 76px at 50% 152px, rgba(255,132,88,.1), rgba(246,92,112,.05) 46%, rgba(232,67,147,.018) 74%, transparent),
+      radial-gradient(300px 320px at 50% 270px, rgba(232,67,147,.035), rgba(108,92,231,.016) 50%, transparent 85%);
+  }
+  /* one breathing pair is plenty on a phone-sized sky */
+  .hero-stars i:nth-child(n+3) { display: none; }
+  .hero-wave { height: 171px; }
+  .hero-band-light {
+    width: 900px;
+    margin-left: -450px;
+    background:
+      radial-gradient(230px 150px at 50% 50%, rgba(255,112,92,.0315), rgba(232,67,147,.0176) 42%, rgba(108,92,231,.0069) 72%, transparent),
+      radial-gradient(440px 150px at 50% 50%, rgba(232,67,147,.0361) 0%, rgba(200,80,185,.0289) 40%, rgba(108,92,231,.0144) 72%, rgba(108,92,231,0) 100%);
+  }
+  /* wider svg = longer visible period, otherwise ripples get too tight on
+     narrow screens; the -50% self-translate stays seamless at any width */
+  .hero-wave svg { width: 400%; }
+  /* Thin the two dense dust layers — same density feel on a much narrower
+     band. Identical in both copies of a field, so tiling stays seamless.
+     Every mid .spark sits on an odd index, so this never takes one. */
+  .dust-far i:nth-child(2n),
+  .dust-mid i:nth-child(2n) { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  /* a static frame: every layer at its resting level, no parallax */
+  .hero-lamp,
+  .hero-bloom { animation: none; transform: none; }
+  .hero-lamp::after { animation: none; }
+  .hero-stars { transform: none; will-change: auto; }
+  .hero-stars i { animation: none; opacity: .6; }
+  .hero-stars::before { opacity: .6; }
+  .hero-band-light { animation: none; transform: none; will-change: auto; }
+  /* the per-layer selectors are needed: `.hero-wave svg` (0,1,1) would lose
+     to `.hero-wave .wave-1` (0,2,0) — the old hero kept its waves drifting
+     under reduced motion because of exactly that */
+  .hero-wave .wave-1,
+  .hero-wave .wave-2,
+  .hero-wave .wave-3,
+  .hero-dust-track { animation: none; translate: none; }
+  .hero-dust i { animation: none; }
+  /* a stopped sprite frame is just a stale bright blob */
+  .hero-dust .spark > b { display: none; }
+}
+
+.upload-dashed {
+  border: 2px dashed rgba(232, 67, 147, 0.3);
+  transition: all 0.3s;
+}
+.upload-dashed:hover,
+.upload-dashed-active {
+  border-color: #e84393;
+  background: rgba(232, 67, 147, 0.06);
+}
+
+/* ===== Track picker chips (player audio/subtitle modal) =====
+   One place for the chip look, because three renderers write it: the
+   stream_video.html dialog, the user_subtitles_view partial, and
+   assets/src/js/lib/player/track-picker.js, which toggles the active
+   state on selection. The JS only ever adds or removes
+   .track-chip-active / .lang-chip-active — no utility strings in
+   JavaScript, so a restyle here reaches every chip at once.
+   See docs/uikit.html section 19.
+
+   The -active rules carry !important for the same reason .btn-soft does:
+   they have to beat daisyUI's own .btn-ghost declarations, which are not
+   less specific than a single class of ours. */
+.track-chip {
+  @apply btn btn-sm btn-ghost border border-w-line text-w-sub gap-2 hover:border-w-cyan/30 hover:text-w-cyan;
+}
+.track-chip-active {
+  background-color: rgba(0, 206, 201, 0.15) !important;
+  border-color: rgba(0, 206, 201, 0.30) !important;
+  color: #00cec9 !important;
+}
+/* A locked chip (the AI track on a free account) is drawn dimmed and can
+   never become active, so it never collides with .track-chip-active. */
+.chip-locked {
+  @apply opacity-70 text-w-muted;
+}
+
+.lang-chip {
+  @apply btn btn-xs btn-ghost border border-w-line text-w-sub gap-1 hover:border-w-cyan/30 hover:text-w-cyan;
+}
+.lang-chip-active {
+  background-color: rgba(0, 206, 201, 0.15) !important;
+  border-color: rgba(0, 206, 201, 0.30) !important;
+  color: #00cec9 !important;
+}
+
+/* The AI chip the ladder offers but never turns on: an accent outline so
+   the eye lands on it, without the cyan fill that means "this is playing".
+   A translation costs tokens, so it is an invitation, not a selection.
+   The hover rule repeats the colour because .track-chip's own hover moves
+   the border to cyan, which would read as "selected" on the one chip that
+   is not. */
+.chip-offered,
+.chip-offered:hover {
+  border-color: rgba(232, 67, 147, 0.40) !important;
+}
+
+/* The subtitle block while the switch leading the language row is off:
+   the chip rows are
+   dimmed and the chosen track keeps its mark, so the viewer sees what
+   comes back instead of an empty list. Dimming only — every chip stays
+   clickable, and clicking one turns subtitles back on with that track
+   (Player.jsx). The class is written by the server on the first render and
+   by applyOffState afterwards. */
+.picker-off {
+  @apply opacity-50;
+}
+
+.btn-pink {
+  background-color: #e84393 !important;
+  border-color: #e84393 !important;
+  color: #fff !important;
+}
+.btn-pink:hover {
+  background-color: #fd79a8 !important;
+  border-color: #fd79a8 !important;
+  box-shadow: 0 0 24px rgba(232, 67, 147, 0.35);
+}
+
+.btn-soft {
+  background-color: rgba(232, 67, 147, 0.10) !important;
+  border-color: rgba(232, 67, 147, 0.30) !important;
+  color: #fd79a8 !important;
+}
+.btn-soft:hover {
+  background-color: rgba(232, 67, 147, 0.20) !important;
+  border-color: rgba(232, 67, 147, 0.45) !important;
+  color: #fd79a8 !important;
+}
+
+.btn-soft-cyan {
+  background-color: rgba(0, 206, 201, 0.10) !important;
+  border-color: rgba(0, 206, 201, 0.30) !important;
+  color: #00cec9 !important;
+}
+.btn-soft-cyan:hover {
+  background-color: rgba(0, 206, 201, 0.20) !important;
+  border-color: rgba(0, 206, 201, 0.45) !important;
+  color: #00cec9 !important;
+}
+
+/* The action log's stage line (views/action/post.html, lib/progressLog.js;
+   lib/turnstileAction.js draws its check the same way): the running step in
+   plain words, its countdown or percent on the right, a bar under it --
+   indeterminate until a percent arrives. The full step list is folded under
+   "Show steps" (.job-steps), cards and verdicts sit between (.job-results). */
+.job-stage {
+  padding: 0 1.25rem 0.25rem;
+}
+.job-stage-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.625rem;
+}
+.job-stage-spin {
+  flex: none;
+  color: #00cec9;
+}
+/* A basis of its own: with `auto` a long title (German, a phone) took a line
+   of its own and left the spinner alone above it; now the title wraps
+   inside, and only the meta drops to a second line. */
+.job-stage-title {
+  flex: 1 1 10rem;
+  min-width: 0;
+  font-size: 0.9375rem;
+  font-weight: 600;
+  line-height: 1.35;
+  color: #f1f5f9;
+}
+.job-stage-meta {
+  margin-left: auto;
+  font-size: 0.8125rem;
+  color: #94a3b8;
+  font-variant-numeric: tabular-nums;
+}
+.job-stage-meta:empty {
+  display: none;
+}
+.job-stage-bar {
+  display: block;
+  width: 100%;
+  height: 6px;
+  margin-top: 0.625rem;
+  color: #00cec9;
+}
+.job-stage-done .job-stage-spin,
+.job-stage-done .job-stage-bar {
+  display: none;
+}
+.job-results:not(:empty) {
+  margin-top: 0.25rem;
+}
+/* A long address ("Login link sent to …") breaks inside the box instead of
+   running out of it on a phone. */
+.job-stage-title,
+.job-results pre {
+  overflow-wrap: anywhere;
+}
+.job-steps {
+  padding: 0 1.25rem;
+}
+/* Nothing to unfold before the first step. */
+.job-steps:not(:has(.log-target > *)) {
+  display: none;
+}
+.job-steps > summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.375rem 0 0;
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: #94a3b8; /* 6.9:1 on the alert; #64748b was 3.7:1 for 12 px text */
+  cursor: pointer;
+  list-style: none;
+}
+.job-steps > summary::-webkit-details-marker {
+  display: none;
+}
+.job-steps > summary::after {
+  content: '\25BE';
+}
+.job-steps[open] > summary::after {
+  content: '\25B4';
+}
+.job-steps .log-target pre {
+  padding-left: 0;
+  padding-right: 0;
+}
+
+/* A button whose job is running (lib/actionBusy.js). Not :disabled — a
+   disabled button reads as "you cannot do this", and this one is doing it:
+   it keeps its own colour, dimmed, and says so with a spinner. pointer-events
+   are off so it neither highlights nor takes a press (and so shows no cursor
+   of its own); the duplicate-press guard in lib/async.js is what actually
+   swallows a keyboard Enter. */
+.btn-busy {
+  opacity: 0.55;
+  box-shadow: none !important;
+  pointer-events: none;
+}
+
+/* Disabled, for real: the action is not available. The variants above set
+   their colours with !important, so DaisyUI's own :disabled styling never
+   reached them and a disabled button was indistinguishable from a ready one.
+   Muted rather than invisible — the label still has to be readable. */
+.btn-pink:disabled,
+.btn-pink[disabled],
+.btn-soft:disabled,
+.btn-soft[disabled],
+.btn-soft-cyan:disabled,
+.btn-soft-cyan[disabled],
+.btn-accent:disabled,
+.btn-accent[disabled] {
+  background-color: rgba(100, 116, 139, 0.10) !important;
+  border-color: rgba(255, 255, 255, 0.07) !important;
+  color: #64748b !important;
+  box-shadow: none !important;
+  cursor: not-allowed;
+}
+
+.toggle-soft:checked,
+.toggle-soft[aria-checked=true] {
+  --input-color: #fd79a8 !important;
+  background-color: rgba(232, 67, 147, 0.15) !important;
+  border-color: rgba(232, 67, 147, 0.30) !important;
+}
+
+/* Force custom text colors over DaisyUI component defaults */
+[data-theme="night"] .badge.text-w-pinkL {
+  color: #fd79a8 !important;
+}
+[data-theme="night"] .badge.text-w-muted {
+  color: #64748b !important;
+}
+[data-theme="night"] .badge.text-w-cyan {
+  color: #00cec9 !important;
+}
+[data-theme="night"] .text-w-pinkL {
+  color: #fd79a8;
+}
+[data-theme="night"] .text-w-sub {
+  color: #94a3b8;
+}
+
+/* Menu link hover: override DaisyUI menu active/hover color */
+.navbar-redesign .menu a:hover {
+  color: #f1f5f9 !important;
+  background-color: rgba(255,255,255,0.05) !important;
+}
+
+/* Ghost button hover: override DaisyUI btn-ghost hover color */
+.btn-ghost.text-w-sub:hover,
+.btn-ghost.text-w-muted:hover {
+  color: #f1f5f9 !important;
+}
+
+/* Dark-theme-specific overrides */
+[data-theme="night"] .collapse-webtor {
+  background-color: #1a2235 !important;
+}
+
+.collapse-webtor > .collapse-content {
+  position: relative;
+  z-index: 1;
+}
+
+[data-theme="night"] .navbar-redesign {
+  background-color: rgba(10, 14, 26, 0.9);
+}
+
+/* Focus on a film that has the window, a phone on its side
+   (lib/landscapeFocus.js): the navbar slides up out of it -- and, once out,
+   out of the tab order and the screen reader's reach too (visibility, after
+   the slide). The root goes black for what is outside the page: in Safari,
+   the strips beside the notch paint the root's background; the page itself
+   keeps its colour on the body. */
+.navbar-redesign {
+  transition: transform 200ms, visibility 0s;
+}
+
+html.wt-focus .navbar-redesign {
+  transform: translateY(-100%);
+  visibility: hidden;
+  transition: transform 200ms, visibility 0s 200ms;
+}
+
+html.wt-focus {
+  background-color: #000;
+}
+
+html.wt-focus body {
+  background-color: var(--color-base-100);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .navbar-redesign {
+    transition: none;
+  }
+}
+
+[data-theme="night"] .stat {
+  border-color: rgba(255,255,255,0.07) !important;
+}
+
+/* Collapse arrow color */
+[data-theme="night"] .collapse-plus > .collapse-title::after {
+  color: #64748b;
+}
+
+
+/* Toast notifications */
+.toast-alert {
+  padding: 0.75rem 1.25rem;
+  border-radius: 0.75rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: #fff;
+  pointer-events: auto;
+  opacity: 0;
+  transform: translateX(1rem);
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+.toast-alert.toast-show {
+  opacity: 1;
+  transform: translateX(0);
+}
+.toast-alert-success,
+.toast-alert-info {
+  background-color: rgba(0, 206, 201, 0.15);
+  border: 1px solid rgba(0, 206, 201, 0.30);
+  color: #00cec9;
+}
+.toast-alert-error {
+  background-color: rgba(232, 67, 147, 0.15);
+  border: 1px solid rgba(232, 67, 147, 0.30);
+  color: #fd79a8;
+}
+
+/* Hide empty pledge/library button containers to prevent flex gap */
+#pledge-button:not(:has(*)),
+#library-button:not(:has(*)) {
+  display: none;
+}
+
+/* Progress inside modal: hide cancel (modal has its own X), remove bottom margin.
+   Scoped to btn-sm without border to spare the wget/curl/URL chips (btn-xs + border). */
+.modal-box .btn-sm.btn-ghost.closeable-close:not(.border) {
+  display: none !important;
+}
+.modal-box .progress-alert {
+  margin-bottom: 0 !important;
+}
+/* A phone: the log's box inside the dialog's box only narrowed the card.
+   The log spans the dialog's box (-mx-5 in partials/file.html, list.html)
+   and loses its own, so its rows' 1.25rem insets line up with the title. */
+@media (width < 40rem) {
+  .modal-box .progress-alert {
+    padding-block: 0;
+    background: none;
+    border: 0;
+    box-shadow: none;
+  }
+}
+
+/* trigger tailwind rescan */
+
+/* The in-app notification feed prints a stored message fragment as markup
+   (see handlers/notifications.Item). The fragment is authored for email, so
+   it carries bare <p>, <a> and <ul> that Tailwind's preflight strips of all
+   styling -- links in particular would otherwise be indistinguishable from
+   the text around them. This gives those elements back just enough to read
+   as a message in a list row, without a full prose stylesheet. */
+/* Inputs and selects inside a DaisyUI .join row: w-full on the field plus
+   flex-shrink:0 on the buttons made the row wider than its card on phones
+   (input min-content ≈ 20ch), and an unclipped card pushes the document past
+   the viewport — the mobile navbar got cut off. min-width:0 lets the field
+   shrink to whatever the buttons leave. */
+.join > .input,
+.join > .select {
+  min-width: 0;
+}
+
+.notification-body {
+  p {
+    @apply my-1;
+    &:first-child { @apply mt-0; }
+    &:last-child { @apply mb-0; }
+  }
+  a {
+    @apply link link-hover text-w-pinkL break-all;
+  }
+  ul {
+    @apply list-disc pl-5 my-1;
+  }
+  h3 {
+    @apply font-semibold text-base-content mt-3 mb-1;
+  }
+  strong, b {
+    @apply font-semibold text-base-content;
+  }
+}

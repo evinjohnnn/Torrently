@@ -1,0 +1,179 @@
+package support
+
+import (
+	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/pkg/errors"
+	proto "github.com/webtor-io/abuse-store/proto"
+	"github.com/webtor-io/web-ui/services/abuse_store"
+	"github.com/webtor-io/web-ui/services/template"
+	"github.com/webtor-io/web-ui/services/turnstile"
+	"github.com/webtor-io/web-ui/services/web"
+	"google.golang.org/grpc/status"
+)
+
+type Handler struct {
+	tb  template.Builder[*web.Context]
+	asc *abuse_store.Client
+	ts  *turnstile.Service
+}
+
+func RegisterHandler(r *gin.Engine, tm *template.Manager[*web.Context], asc *abuse_store.Client, ts *turnstile.Service) {
+	h := &Handler{
+		tb:  tm.MustRegisterViews("support/*").WithLayout("main"),
+		asc: asc,
+		ts:  ts,
+	}
+	r.GET("/support", h.process)
+	r.POST("/support", h.process)
+}
+
+type Cause int
+
+var hashRegexp = regexp.MustCompile("[0-9a-f]{40}")
+
+// extractInfohash pulls the infohash out of whatever the reporter pasted — a
+// bare hash, a magnet link, a webtor URL.
+//
+// Lower-casing happens BEFORE matching: the pattern is lower-case hex only, so
+// an upper-case hash (which plenty of trackers emit in magnet links) matched
+// nothing and left the field empty. A report naming no torrent cannot be
+// enforced, and abuse-store used to store it anyway and choke on it.
+func extractInfohash(in string) string {
+	if in == "" {
+		return ""
+	}
+	return hashRegexp.FindString(strings.ToLower(in))
+}
+
+var CauseTypes = map[int]string{
+	-1: "support.selectCause",
+	0:  "support.illegalContent",
+	1:  "support.malware",
+	2:  "support.siteError",
+	3:  "support.question",
+}
+
+type Form struct {
+	Cause       Cause  `form:"cause"`
+	Subject     string `form:"subject"`
+	Description string `form:"description"`
+	Infohash    string `form:"infohash"`
+	Filename    string `form:"filename"`
+	Email       string `form:"email"`
+	Work        string `form:"work"`
+}
+
+type Data struct {
+	Form       *Form
+	CauseTypes map[int]string
+}
+
+// needsInfohash: complaints about content, malware or a site error are about
+// a specific torrent and cannot be acted on without knowing which. Questions
+// are not. Enforced server-side — the form's JS-only `required` used to be the
+// only guard, and tickets arrived with the field empty.
+func needsInfohash(cause Cause) bool {
+	return cause >= 0 && cause <= 2
+}
+
+func (s *Handler) bindForm(c *gin.Context) (*Form, error) {
+	var err error
+	cause := -1
+	// GET prefills from the query so a "report a problem" link on a torrent
+	// page can hand over the cause and infohash; POST reads the form.
+	rawCause := c.PostForm("cause")
+	if rawCause == "" && c.Request.Method == http.MethodGet {
+		rawCause = c.Query("cause")
+	}
+	if rawCause != "" {
+		cause, err = strconv.Atoi(rawCause)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if _, ok := CauseTypes[cause]; !ok {
+		return nil, errors.Errorf("cause with id=%v not defined", c)
+	}
+
+	var form Form
+	err = c.ShouldBind(&form)
+	if err != nil {
+		return nil, err
+	}
+	form.Cause = Cause(cause)
+	if c.Request.Method == http.MethodGet {
+		form.Infohash = c.Query("infohash")
+		form.Filename = c.Query("filename")
+	}
+	return &form, nil
+}
+
+func (s *Handler) sendForm(c *gin.Context, form *Form) error {
+	cl, err := s.asc.Get()
+	if err != nil {
+		return err
+	}
+	infohash := extractInfohash(form.Infohash)
+	pr := &proto.PushRequest{
+		NoticeId:    uuid.New().String(),
+		Infohash:    infohash,
+		Filename:    form.Filename,
+		Work:        form.Work,
+		StartedAt:   time.Now().Unix(),
+		Email:       form.Email,
+		Description: form.Description,
+		Subject:     form.Subject,
+		Cause:       proto.PushRequest_Cause(form.Cause),
+		Source:      proto.PushRequest_FORM,
+	}
+	_, err = cl.Push(c.Request.Context(), pr)
+	if err != nil {
+		st, ok := status.FromError(err)
+		if !ok {
+			return errors.Wrap(err, "failed to send form")
+		}
+		return errors.New(st.Message())
+	}
+	return err
+}
+
+func (s *Handler) process(c *gin.Context) {
+	tpl := s.tb.Build("support/form")
+	form, err := s.bindForm(c)
+	data := &Data{
+		Form:       form,
+		CauseTypes: CauseTypes,
+	}
+	if err != nil {
+		tpl.HTML(http.StatusBadRequest, web.NewContext(c).WithData(data).WithErr(errors.Wrap(err, "wrong args provided")))
+		return
+	}
+	if c.Request.Method == "POST" {
+		if needsInfohash(form.Cause) && extractInfohash(form.Infohash) == "" {
+			tpl.HTML(http.StatusBadRequest, web.NewContext(c).WithData(data).WithErr(web.NewUserError("error.support_infohash_required", errors.New("infohash required for this cause"))))
+			return
+		}
+		if s.ts != nil {
+			token := c.PostForm("cf-turnstile-response")
+			if err := s.ts.Validate(token, c.ClientIP()); err != nil {
+				tpl.HTML(http.StatusBadRequest, web.NewContext(c).WithData(data).WithErr(errors.Wrap(err, "captcha verification failed")))
+				return
+			}
+		}
+		err = s.sendForm(c, form)
+		if err != nil {
+			tpl.HTML(http.StatusInternalServerError, web.NewContext(c).WithData(data).WithErr(errors.Wrap(err, "failed to send form")))
+			return
+		}
+		s.tb.Build("support/success").HTML(http.StatusOK, web.NewContext(c).WithData(data))
+		return
+	}
+	tpl.HTML(http.StatusOK, web.NewContext(c).WithData(data))
+}

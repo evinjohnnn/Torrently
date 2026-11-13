@@ -1,0 +1,12 @@
+{
+  "input": "Akira (2016) - UpScaled - 720p - DesiSCR-Rip - Hindi - x264 - AC3 - 5.1 - Mafiaking - M2Tv",
+  "want": {
+    "title": "Akira",
+    "year": 2016,
+    "resolution": "720p",
+    "codec": "x264",
+    "audio": "AC3 - 5.1",
+    "group": "M2Tv",
+    "extra": "- UpScaled DesiSCR-Rip - Hindi Mafiaking"
+  }
+}

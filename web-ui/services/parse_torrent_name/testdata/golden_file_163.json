@@ -1,0 +1,10 @@
+{
+  "input": "Грозовые ворота.01.DVDRip-SVAT.avi",
+  "want": {
+    "title": "Грозовые ворота",
+    "episode": 1,
+    "quality": "DVDRip",
+    "group": "SVAT",
+    "container": "avi"
+  }
+}

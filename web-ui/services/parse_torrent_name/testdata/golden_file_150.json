@@ -1,0 +1,9 @@
+{
+  "input": "Zeta Gundam - ep 07 - Escape from Side 1.mkv",
+  "want": {
+    "title": "Zeta Gundam",
+    "episode": 7,
+    "container": "mkv",
+    "extra": "Escape from Side 1"
+  }
+}

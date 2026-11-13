@@ -1,0 +1,11 @@
+{
+  "input": "Dinosaur 13 2014 WEBrip XviD AC3 MiLLENiUM",
+  "want": {
+    "title": "Dinosaur 13",
+    "year": 2014,
+    "quality": "WEBRip",
+    "codec": "xvid",
+    "audio": "AC3",
+    "extra": "MiLLENiUM"
+  }
+}

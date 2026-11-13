@@ -1,0 +1,15 @@
+{
+  "input": "300 2006 BluRay 1080p DTS-HD MA TrueHD 7.1 Atmos x264-MgB (Sample).mkv",
+  "want": {
+    "title": "300",
+    "year": 2006,
+    "resolution": "1080p",
+    "quality": "BluRay",
+    "codec": "x264",
+    "audio": "DTS-HD MA",
+    "group": "MgB",
+    "container": "mkv",
+    "sample": true,
+    "extra": "TrueHD 7 1 Atmos"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "input": "[1009-1010] Onigashima 26 - Conqueror's Haki.mp4",
+  "want": {
+    "title": "Onigashima",
+    "episode": 26,
+    "container": "mp4",
+    "website": "1009-1010",
+    "extra": "Conqueror's Haki"
+  }
+}

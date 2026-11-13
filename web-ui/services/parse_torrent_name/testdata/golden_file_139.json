@@ -1,0 +1,11 @@
+{
+  "input": "[DKB] Shingeki no Kyojin - The Final Season S4 Pt. 1 - 01.mkv",
+  "want": {
+    "title": "Shingeki no Kyojin - The Final Season",
+    "season": 4,
+    "episode": 1,
+    "container": "mkv",
+    "website": "DKB",
+    "extra": "Pt 1"
+  }
+}

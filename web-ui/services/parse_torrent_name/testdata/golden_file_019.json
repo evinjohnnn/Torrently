@@ -1,0 +1,9 @@
+{
+  "input": "These.Final.Hours.2013.WBBRip XViD",
+  "want": {
+    "title": "These Final Hours",
+    "year": 2013,
+    "quality": "WEBRip",
+    "codec": "xvid"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "input": "Hercules (2014) WEBDL DVDRip XviD-MAX",
+  "want": {
+    "title": "Hercules",
+    "year": 2014,
+    "quality": "WEB-DL",
+    "codec": "xvid",
+    "group": "MAX",
+    "extra": "DVDRip"
+  }
+}

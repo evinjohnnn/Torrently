@@ -1,0 +1,175 @@
+const path = require('path');
+const webpack = require('webpack');
+const CopyPlugin = require('copy-webpack-plugin');
+const TerserPlugin = require('terser-webpack-plugin');
+const MiniCssExtractPlugin = require('mini-css-extract-plugin');
+const FaviconsWebpackPlugin = require('favicons-webpack-plugin');
+
+const fs = require('fs');
+
+const themes = ['night'];
+
+// Discover supported locales from the filesystem at build time.
+// Mirrors services/i18n/i18n.go discoverLocales(): only 2-letter `xx.json`
+// files count, EN first, others alphabetical. Injected into the JS bundle
+// as a global constant via DefinePlugin so lib/i18n.js doesn't need a
+// hardcoded list — drop a `xx.json` and the JS list updates on next build.
+function discoverSupportedLocales() {
+    const codes = fs.readdirSync('./locales')
+        .filter((f) => /^[a-z]{2}\.json$/.test(f))
+        .map((f) => f.replace(/\.json$/, ''))
+        .sort();
+    const en = codes.filter((c) => c === 'en');
+    const rest = codes.filter((c) => c !== 'en');
+    return [...en, ...rest];
+}
+
+function getEntries(path, ext, prefix = '') {
+    return new Promise((resolve) => {
+        fs.readdir(path, { recursive: true }, (err, files) => {
+            const entries = {};
+            for (const f of files) {
+                if (f.endsWith(ext)) entries[prefix + f.replace(ext, '')] = path + '/' + f;
+            }
+            resolve(entries);
+        });
+    })
+}
+
+
+module.exports = async (env, options) => {
+    const jsEntries = {
+        ...(await getEntries('./assets/src/js/app', '.js')),
+        ...(await getEntries('./assets/src/js/app', '.jsx')),
+    };
+    const styleEntries = await getEntries('./assets/src/styles', '.css');
+    const devMode = options.mode !== 'production';
+    const devEntries = devMode ? await getEntries('./assets/src/js/dev', '.js', 'dev/') : {};
+    const plugins = [
+        new webpack.DefinePlugin({
+            // Build-time-derived list of supported locales (see top of file).
+            // Consumed by assets/src/js/lib/i18n.js as the SUPPORTED constant.
+            __SUPPORTED_LOCALES__: JSON.stringify(discoverSupportedLocales()),
+        }),
+        new MiniCssExtractPlugin({
+            filename: '[name].css',
+        }),
+    ];
+    for (const t of themes) {
+        plugins.push(new FaviconsWebpackPlugin({
+            logo: `./assets/src/images/logo-${t}.svg`,
+            logoMaskable: `./assets/src/images/logo-${t}-maskable.svg`,
+            prefix: `${t}/`,
+            manifest: './assets/src/manifest.base.json',
+            favicons: {
+                appName: 'Torrently',
+                appShortName: 'Torrently',
+                appDescription: 'Stream and download torrents right in your browser — free, open-source, no app to install.',
+                lang: 'en',
+                background: '#f4f0e5',
+                theme_color: '#f4f0e5',
+                start_url: '/?ref=pwa',
+                icons: {
+                    android: true,
+                    appleIcon: true,
+                    appleStartup: false,
+                    favicons: true,
+                    windows: false,
+                    yandex: false,
+                },
+            },
+        }));
+        plugins.push(new CopyPlugin({
+            patterns: [
+                { from: `assets/src/images/logo-${t}.svg`, to: `${t}/favicon.svg` },
+            ],
+        }));
+    }
+    return {
+        entry: {
+            ...jsEntries,
+            ...styleEntries,
+            ...devEntries,
+        },
+        devtool: 'source-map',
+        output: {
+            filename: '[name].js',
+            chunkFilename: '[name].[chunkhash].js',
+            path: path.resolve(__dirname, 'assets', 'dist'),
+            clean: true,
+        },
+        devServer: {
+            port: 8083,
+            client: {
+                webSocketURL: 'auto://0.0.0.0:0/ws',
+            },
+            static: './assets/dist',
+            allowedHosts: 'all',
+            devMiddleware: {
+                publicPath: '/assets',
+                index: false,
+            },
+            proxy: [
+                {
+                    context: () => true,
+                    target: 'http://127.0.0.1:8080',
+                    changeOrigin: true,
+                    secure: false,
+                },
+            ],
+            watchFiles: ['templates/**/*.html', 'assets/src/**/*'],
+        },
+        optimization: {
+            // splitChunks disabled: entry points are loaded independently via Go
+            // template helpers, which don't support automatic chunk dependencies.
+            //
+            // The standing cost, and it has bitten twice (2026-09-20): a module
+            // imported by two entries, or by an entry and a lazy chunk, is
+            // DUPLICATED -- each copy with its own module-level state. So
+            // module scope is per-bundle, not per-page. Anything two bundles
+            // must agree on belongs in the DOM or on `window`, never in a
+            // module-level Map/let. See lib/actionBusy.js (the job-start
+            // spinner that no job ever stopped) and lib/turnstileAction.js.
+            minimize: true,
+            minimizer: [
+                new TerserPlugin({ parallel: true }),
+            ],
+        },
+        module: {
+            rules: [
+                {
+                    // assets/src/js/package.json declares "type": "module" so
+                    // Node's test runner can import these files directly. That
+                    // also puts webpack into strict-ESM mode for the tree,
+                    // where extensionless imports are an error — this rule
+                    // hands back the extension guessing the whole codebase is
+                    // written against. See `npm test`.
+                    test: /\.jsx?$/,
+                    include: path.resolve(__dirname, 'assets', 'src'),
+                    resolve: { fullySpecified: false },
+                    loader: 'babel-loader'
+                },
+                {
+                    test: /\.css$/i,
+                    include: path.resolve(__dirname, 'assets', 'src'),
+                    use: [
+                        devMode ? 'style-loader' : MiniCssExtractPlugin.loader,
+                        'css-loader',
+                        'postcss-loader'
+                    ],
+                },
+                {
+                    test: /\.json$/,
+                    include: path.resolve(__dirname, 'locales'),
+                    resourceQuery: /prefix=/,
+                    type: 'javascript/auto',
+                    use: [path.resolve(__dirname, 'assets/webpack/locale-filter-loader.js')],
+                },
+            ]
+        },
+        resolve: {
+            extensions: ['.js', '.jsx', '.json'],
+        },
+        plugins,
+    };
+}

@@ -1,0 +1,201 @@
+package libfs
+
+import (
+	"context"
+	"io"
+	"net/url"
+	"strings"
+
+	"github.com/pkg/errors"
+	ra "github.com/webtor-io/rest-api/services"
+	"github.com/webtor-io/web-ui/models"
+	"github.com/webtor-io/web-ui/services/api"
+	"github.com/webtor-io/web-ui/services/vfs"
+)
+
+// torrentAPI is the slice of *api.Api that TorrentDirectory needs. Declaring
+// it as an interface keeps the directory unit-testable with a fake that records
+// the list/export calls (otherwise it would reach for a live rest-api).
+type torrentAPI interface {
+	ListResourceContentCached(ctx context.Context, c *api.Claims, infohash string, args *api.ListResourceContentArgs) (*ra.ListResponse, error)
+	ExportResourceContent(ctx context.Context, c *api.Claims, infohash string, itemID string, imdbID string) (*ra.ExportResponse, error)
+}
+
+type TorrentDirectory struct {
+	*BaseDirectory
+	api torrentAPI
+}
+
+func (s *TorrentDirectory) Stat(ctx context.Context, tr *models.TorrentResource, path string) (*vfs.FileInfo, error) {
+	li, err := s.retrieveTorrentItemWithoutPrefix(ctx, tr.ResourceID, path)
+	if err != nil {
+		return nil, err
+	}
+	if li == nil {
+		return nil, vfs.NewHTTPError(404, errors.New("file not found"))
+	}
+	fi := s.listItemToFileInfo(li, tr)
+	return &fi, nil
+}
+
+func (s *TorrentDirectory) ReadDir(ctx context.Context, tr *models.TorrentResource, path string, recursive bool) ([]vfs.FileInfo, error) {
+	items, err := s.retrieveTorrentItemsWithoutPrefix(ctx, tr.ResourceID, path)
+	if err != nil {
+		return nil, err
+	}
+
+	fis := make([]vfs.FileInfo, len(items))
+	for n, i := range items {
+		fis[n] = s.listItemToFileInfo(&i, tr)
+	}
+
+	return fis, nil
+}
+
+func (s *TorrentDirectory) Open(ctx context.Context, tr *models.TorrentResource, path string) (io.ReadCloser, *url.URL, error) {
+	ti, err := s.retrieveTorrentItemWithoutPrefix(ctx, tr.ResourceID, path)
+	if err != nil {
+		return nil, nil, err
+	}
+	if ti == nil {
+		return nil, nil, vfs.NewHTTPError(404, errors.New("file not found"))
+	}
+	cu, err := s.getContentURL(ctx, tr.ResourceID, ti.ID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return nil, cu, nil
+
+}
+
+func (s *TorrentDirectory) listItemToFileInfo(i *ra.ListItem, tr *models.TorrentResource) vfs.FileInfo {
+	if i.Type == ra.ListTypeDirectory {
+		return vfs.FileInfo{
+			Path:    i.PathStr + "/",
+			ModTime: tr.CreatedAt,
+			IsDir:   true,
+			Size:    i.Size,
+		}
+	} else {
+		return vfs.FileInfo{
+			Path:     i.PathStr,
+			ModTime:  tr.CreatedAt,
+			IsDir:    false,
+			Size:     i.Size,
+			MIMEType: i.MimeType,
+		}
+	}
+}
+
+func (s *TorrentDirectory) getContentURL(ctx context.Context, rID, tID string) (*url.URL, error) {
+	wcc, err := getWebContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	er, err := s.api.ExportResourceContent(ctx, wcc.ApiClaims, rID, tID, "")
+	if err != nil {
+		return nil, err
+	}
+	return url.Parse(er.ExportItems["download"].URL)
+}
+
+func (s *TorrentDirectory) retrieveTorrentItemsWithoutPrefix(ctx context.Context, hash string, path string) ([]ra.ListItem, error) {
+	path = strings.TrimSuffix(path, "/")
+	prefix, err := s.getPrefix(ctx, hash)
+	if err != nil {
+		return nil, err
+	}
+	ls, err := s.retrieveTorrentItems(ctx, hash, prefix+path)
+	for i, l := range ls {
+		ls[i].PathStr = strings.TrimPrefix(l.PathStr, prefix)
+	}
+	return ls, err
+}
+
+func (s *TorrentDirectory) retrieveTorrentItemWithoutPrefix(ctx context.Context, hash string, path string) (*ra.ListItem, error) {
+	prefix, err := s.getPrefix(ctx, hash)
+	if err != nil {
+		return nil, err
+	}
+	l, err := s.retrieveTorrentItem(ctx, hash, prefix+path)
+	if err != nil {
+		return nil, err
+	}
+	if l == nil {
+		return nil, nil
+	}
+	l.PathStr = strings.TrimPrefix(l.PathStr, prefix)
+	return l, err
+}
+
+func (s *TorrentDirectory) retrieveTorrentItems(ctx context.Context, hash string, path string) ([]ra.ListItem, error) {
+	wcc, err := getWebContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// rest-api caps the page at 1000 and now serves listings from the
+	// lightweight torrent-store manifest, so a single page covers all but the
+	// largest directories and we make ~10x fewer round-trips than the old 100.
+	limit := uint(1000)
+	offset := uint(0)
+	var items []ra.ListItem
+	for {
+		resp, err := s.api.ListResourceContentCached(ctx, wcc.ApiClaims, hash, &api.ListResourceContentArgs{
+			Limit:  limit,
+			Offset: offset,
+			Output: api.OutputTree,
+			Path:   path,
+		})
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, resp.Items...)
+		if (resp.Count - int(offset)) == len(resp.Items) {
+			break
+		}
+		offset += limit
+	}
+	return items, nil
+}
+
+func (s *TorrentDirectory) retrieveTorrentItem(ctx context.Context, hash string, path string) (*ra.ListItem, error) {
+	path = strings.TrimSuffix(path, "/")
+	// Resolve a single entry by listing only its parent directory (tree
+	// output) and matching the child, instead of pulling the whole torrent's
+	// flat file list and scanning it linearly. The parent listing shares its
+	// cache key with the ReadDir the client almost always issues first, so a
+	// Stat/Open right after browsing a directory is a cache hit.
+	items, err := s.retrieveTorrentItems(ctx, hash, parentPath(path))
+	if err != nil {
+		return nil, err
+	}
+	for i := range items {
+		if strings.TrimSuffix(items[i].PathStr, "/") == path {
+			return &items[i], nil
+		}
+	}
+	return nil, nil
+}
+
+// parentPath returns the directory containing path, using "/" for top-level
+// entries. path is expected to be absolute ("/a/b" -> "/a", "/a" -> "/").
+func parentPath(path string) string {
+	path = strings.TrimSuffix(path, "/")
+	i := strings.LastIndex(path, "/")
+	if i <= 0 {
+		return "/"
+	}
+	return path[:i]
+}
+
+func (s *TorrentDirectory) getPrefix(ctx context.Context, hash string) (string, error) {
+	prefix := ""
+	items, err := s.retrieveTorrentItems(ctx, hash, "/")
+	if err != nil {
+		return "", err
+	}
+	if len(items) == 1 && items[0].Type == ra.ListTypeDirectory {
+		prefix = items[0].PathStr
+	}
+	return prefix, nil
+}

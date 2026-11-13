@@ -1,0 +1,302 @@
+package torznab
+
+import (
+	"context"
+	"net"
+	"net/http"
+	"net/url"
+	"sort"
+	"strings"
+	"time"
+
+	log "github.com/sirupsen/logrus"
+
+	"github.com/pkg/errors"
+	"github.com/urfave/cli"
+	jackett "github.com/webtor-io/go-jackett"
+	"github.com/webtor-io/web-ui/services/egress"
+)
+
+// maxBodyBytes caps what we read from an indexer on the download path. The
+// search path is handled by go-jackett.
+const maxBodyBytes = 8 << 20
+
+// maxPlausibleSeeders is the ceiling above which a swarm count is treated as
+// garbage rather than as a very popular torrent. The largest public swarms
+// are in the tens of thousands.
+const maxPlausibleSeeders = 1 << 20
+
+// Client talks Torznab to arbitrary user-supplied endpoints.
+//
+// The protocol itself lives in github.com/webtor-io/go-jackett (a Torznab
+// client despite the name); this type owns everything around it that is
+// specific to running the protocol against URLs a user typed in: the egress
+// policy, the result cap, and turning a result into something addressable
+// by infohash.
+//
+// It is safe for concurrent use and holds no per-user state — the endpoint
+// travels with each call.
+type Client struct {
+	cl           *http.Client
+	dl           *http.Client
+	ua           string
+	timeout      time.Duration
+	maxResults   int
+	proxied      bool
+	allowPrivate bool
+}
+
+// Options is the client configuration, separated from the cli.Context so
+// tests can build a client without one.
+type Options struct {
+	Timeout             time.Duration
+	MaxResults          int
+	UserAgent           string
+	AllowPrivateNetwork bool
+	// Proxy routes indexer requests through another host. Needed because a
+	// home ISP may drop inbound connections from datacenter ranges: the
+	// user's indexer answers their browser and their phone, and times out
+	// from every cluster node. Measured on one such setup: reachable from
+	// two providers, filtered from OVH.
+	Proxy string
+}
+
+func New(c *cli.Context) *Client {
+	return NewWithOptions(Options{
+		Timeout:             c.Duration(TimeoutFlag),
+		MaxResults:          c.Int(MaxResultsFlag),
+		UserAgent:           c.String(UserAgentFlag),
+		AllowPrivateNetwork: c.Bool(AllowPrivateNetworkFlag),
+		Proxy:               c.String(ProxyFlag),
+	})
+}
+
+func NewWithOptions(o Options) *Client {
+	if o.Timeout <= 0 {
+		o.Timeout = DefaultTimeout
+	}
+	if o.MaxResults <= 0 {
+		o.MaxResults = 30
+	}
+	return &Client{
+		cl:           newHTTPClient(o.AllowPrivateNetwork, o.Timeout, false, o.Proxy),
+		dl:           newHTTPClient(o.AllowPrivateNetwork, o.Timeout, true, o.Proxy),
+		ua:           o.UserAgent,
+		timeout:      o.Timeout,
+		maxResults:   o.MaxResults,
+		proxied:      o.Proxy != "",
+		allowPrivate: o.AllowPrivateNetwork,
+	}
+}
+
+// Timeout is the per-search budget, exposed so the stream layer can size its
+// own context to match.
+func (c *Client) Timeout() time.Duration {
+	return c.timeout
+}
+
+// MaxResults is how many results survive a single query, highest seeded
+// first.
+func (c *Client) MaxResults() int {
+	return c.maxResults
+}
+
+// HTTP exposes the search client so sibling services (the Cinemeta title
+// lookup) inherit the same timeouts and egress policy.
+func (c *Client) HTTP() *http.Client {
+	return c.cl
+}
+
+// newHTTPClient builds a client whose dialer refuses private/loopback
+// destinations unless the deployment opted in. The check sits in the dialer
+// rather than on the parsed URL because that is the only place that sees the
+// address actually connected to — a hostname resolving to 10.0.0.1, or a
+// redirect into the cluster, both land here.
+//
+// forDownload clients stop at the first redirect instead of following it:
+// download links commonly 302 to a magnet: URI, which the transport cannot
+// dial, and we want to read that Location rather than fail on it.
+func newHTTPClient(allowPrivate bool, timeout time.Duration, forDownload bool, proxy string) *http.Client {
+	d := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	d.Control = egress.DialControl(allowPrivate)
+	tr := &http.Transport{
+		DialContext:           d.DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: timeout,
+		MaxIdleConnsPerHost:   4,
+	}
+	if proxy != "" {
+		if u, err := url.Parse(proxy); err == nil {
+			tr.Proxy = http.ProxyURL(u)
+		} else {
+			log.WithError(err).Warn("ignoring unparsable torznab proxy")
+		}
+	}
+	cl := &http.Client{
+		Timeout:   timeout,
+		Transport: tr,
+	}
+	if forDownload {
+		cl.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+	}
+	return cl
+}
+
+// isPrivateIP delegates to the shared egress rule. Kept as a name in this
+// package because client_test.go's address table is the coverage for that
+// rule — the table stayed here when the implementation moved out, so the
+// shared predicate is still exercised by it.
+func isPrivateIP(ip net.IP) bool {
+	return egress.IsPrivateIP(ip)
+}
+
+// jackettClient builds a per-endpoint go-jackett client. It is cheap
+// (no connections are made) and deliberately per-call: go-jackett attaches
+// the API key to the client, so one client per user endpoint is what keeps
+// two users of the same host from borrowing each other's key.
+func (c *Client) jackettClient(ep Endpoint) (*jackett.Client, error) {
+	if err := c.validateEndpointURL(ep.URL); err != nil {
+		return nil, err
+	}
+	j, err := jackett.NewTorznab(jackett.Settings{
+		ApiURL:    strings.TrimSpace(ep.URL),
+		ApiKey:    ep.APIKey,
+		Client:    c.cl,
+		UserAgent: c.ua,
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "invalid indexer URL")
+	}
+	return j, nil
+}
+
+func (c *Client) validateEndpointURL(raw string) error {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return errors.Wrap(err, "invalid indexer URL")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return errors.New("indexer URL must use http or https")
+	}
+	if u.Host == "" {
+		return errors.New("indexer URL has no host")
+	}
+	// A proxy resolves and dials the target itself, so the dialer guard sees
+	// only the proxy. Resolving here restores most of the protection: it
+	// still misses a rebind between this lookup and the proxy's, which is
+	// why the guard proper stays in the dialer for the no-proxy case.
+	if c.proxied && !c.allowPrivate {
+		ips, err := net.LookupIP(u.Hostname())
+		if err != nil {
+			return errors.Wrap(err, "cannot resolve indexer host")
+		}
+		for _, ip := range ips {
+			if isPrivateIP(ip) {
+				return errors.Errorf("refusing to reach private address %s", ip)
+			}
+		}
+	}
+	return nil
+}
+
+// Caps probes an endpoint's capabilities. Beyond filling the snapshot we
+// persist, a successful caps call is what "the indexer works" means at add
+// time — it needs no query and every Torznab implementation answers it.
+func (c *Client) Caps(ctx context.Context, ep Endpoint) (*jackett.IndexerCaps, error) {
+	j, err := c.jackettClient(ep)
+	if err != nil {
+		return nil, err
+	}
+	caps, err := j.Caps(ctx, "")
+	if err != nil {
+		return nil, errors.Wrap(RedactError(err), "indexer did not answer a capabilities request")
+	}
+	return &caps, nil
+}
+
+// Search runs one query and returns results sorted by seeders, capped at
+// MaxResults.
+//
+// Capability validation is skipped: TorznabStream already picks the query
+// shape from the caps snapshot it persisted at add time, and letting
+// go-jackett re-check would add a caps round-trip to every search.
+func (c *Client) Search(ctx context.Context, ep Endpoint, q Query) ([]Result, error) {
+	j, err := c.jackettClient(ep)
+	if err != nil {
+		return nil, err
+	}
+	fr, err := q.fetchRequest()
+	if err != nil {
+		return nil, err
+	}
+	results, err := j.Fetch(ctx, fr, jackett.WithoutCapsValidation())
+	if err != nil {
+		return nil, errors.Wrap(RedactError(err), "indexer search failed")
+	}
+	for i := range results {
+		// Tracker is deliberately left as the feed set it. It used to be
+		// backfilled from the item's URLs, which put an id we invented
+		// ("rutracker", Prowlarr's "#3") in the same field as a name the
+		// feed gave itself ("RuTracker.org") — and the label layer, which
+		// now stores that name, cannot tell the two apart. Untagged feeds
+		// are labelled by their indexer instead; see
+		// stremio.TorznabStream.makeStreamName.
+		// Feeds that report "unknown" as seeders="-1" parse into a huge
+		// uint. Left alone those items sort above everything real and, at
+		// 30 of them, evict every genuine result before the cap.
+		if results[i].Seeders > maxPlausibleSeeders {
+			results[i].Seeders = 0
+		}
+		if results[i].Peers > maxPlausibleSeeders {
+			results[i].Peers = 0
+		}
+	}
+	sort.SliceStable(results, func(i, k int) bool {
+		return results[i].Seeders > results[k].Seeders
+	})
+	if len(results) > c.maxResults {
+		results = results[:c.maxResults]
+	}
+	return results, nil
+}
+
+// IsUnreachable reports whether an error means "our servers cannot reach
+// this URL", as opposed to the indexer answering and rejecting us.
+//
+// The distinction is the whole difference between the two mistakes users
+// make: a wrong API key is fixed on the form, an address that only exists
+// on their LAN cannot be fixed there at all. Both otherwise surface as the
+// same generic failure.
+func IsUnreachable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	for _, s := range []string{
+		"refusing to connect to private address",
+		"connection refused",
+		"no such host",
+		"network is unreachable",
+		"i/o timeout",
+		"tls handshake",
+		"certificate",
+		"context deadline exceeded",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}

@@ -1,0 +1,59 @@
+{{ define "title" }}{{ t $.Lang "library.title" }}{{ end }}
+{{ define "main" }}
+<section class="min-h-screen pt-24 sm:pt-[120px] pb-20 px-3 sm:px-6">
+  {{/* The root of "remove selected" (partials/bulk_select.html). */}}
+  <div class="max-w-[900px] mx-auto group/bulk" data-bulk-confirm="{{ t $.Lang "library.bulkRemoveConfirm" }}">
+
+    <!-- Badge (hidden on mobile to save vertical space) -->
+    <div class="hidden sm:inline-flex badge badge-lg bg-w-purple/10 border-w-purple/30 text-w-purpleL gap-2 px-4 py-3 mb-5 text-xs font-semibold tracking-widest uppercase">
+      <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0 1 11.186 0Z"/>
+      </svg>
+      {{ t $.Lang "library.badge" }}
+    </div>
+
+    <h1 class="text-[clamp(2rem,4vw,2.8rem)] font-extrabold tracking-tight leading-tight mb-2 sm:mb-4">{{ t $.Lang "library.title" }}</h1>
+    <p class="hidden sm:block text-[1.05rem] text-w-sub leading-relaxed mb-8">{{ t $.Lang "library.subtitle" }}</p>
+
+    <!-- Menu + Filters + Sort (sticky on scroll) -->
+    <div class="sticky top-[72px] z-10 -mx-3 sm:-mx-6 px-3 sm:px-6 py-3 mb-3 bg-w-bg/90 backdrop-blur-lg border-b border-w-line/30">
+      <div class="flex flex-col sm:flex-row sm:items-center gap-2">
+        {{ template "library/menu" . }}
+        <div class="flex flex-wrap items-center gap-2 sm:ml-auto">
+          {{/* Filter and sort make way for the selection's buttons: on a
+               phone the row has no room for both. */}}
+          <div class="flex items-center gap-2 group-data-[bulk-on]/bulk:hidden">
+            {{ template "library/watched_filter" (withContext $ .Data.Args) }}
+            {{ template "library/sort" (withContext $ .Data.Args) }}
+          </div>
+          {{ if .Data.Items }}{{ template "bulk_select/bar" (withContext $ "/lib/remove") }}{{ end }}
+        </div>
+      </div>
+    </div>
+
+    {{ if $.ErrKey }}<p role="alert" class="text-sm text-error mb-3">{{ t $.Lang $.ErrKey }}</p>{{ end }}
+
+    <!-- Content -->
+    {{ if .Data.Items }}
+      {{ template "library/list" . }}
+    {{ else }}
+      <!-- Empty state -->
+      <div class="text-center py-16">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1" stroke="currentColor" class="w-16 h-16 text-w-muted/40 mx-auto mb-4">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0 1 11.186 0Z" />
+        </svg>
+        <p class="text-lg font-semibold text-w-sub mb-2">{{ t $.Lang "library.noTorrents" }}</p>
+        <p class="text-sm text-w-muted mb-6">{{ t $.Lang "library.noTorrentsHint" }}</p>
+        <div class="flex flex-wrap items-center justify-center gap-3">
+          <a class="btn btn-soft" href="{{ langPath $.Lang "/" }}" data-async-target="main">{{ t $.Lang "library.browseTorrents" }}</a>
+          {{/* Anchor navigation, so no data-async-target: async swaps #main without honouring the fragment. */}}
+          <a class="btn btn-ghost border border-w-line text-w-sub hover:border-w-pink hover:text-base-content" href="{{ langPath $.Lang "/profile" }}#stremio" data-umami-event="library-empty-connect-stremio">{{ t $.Lang "library.watchOnTv" }}</a>
+        </div>
+        <p class="text-xs text-w-muted max-w-sm mx-auto mt-5 leading-relaxed">{{ t $.Lang "library.watchOnTvHint" }}</p>
+      </div>
+    {{ end }}
+
+    {{ if .Data.Items }}{{ "bulk_select.js" | asset }}{{ end }}
+  </div>
+</section>
+{{ end }}

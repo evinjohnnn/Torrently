@@ -1,0 +1,6 @@
+{
+  "input": "[designcode.io]",
+  "want": {
+    "website": "designcode.io"
+  }
+}

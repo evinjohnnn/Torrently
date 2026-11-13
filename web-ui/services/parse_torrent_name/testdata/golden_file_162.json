@@ -1,0 +1,9 @@
+{
+  "input": "01 серия_Дельфин-3_rip by_Aleksan55.mkv",
+  "want": {
+    "title": "Дельфин-3",
+    "episode": 1,
+    "container": "mkv",
+    "rip_by": "Aleksan55"
+  }
+}

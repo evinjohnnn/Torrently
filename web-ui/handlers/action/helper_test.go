@@ -1,0 +1,1702 @@
+package action
+
+import (
+	"encoding/json"
+	"strconv"
+	"strings"
+	"testing"
+
+	"golang.org/x/text/language"
+
+	ra "github.com/webtor-io/rest-api/services"
+	"github.com/webtor-io/web-ui/models"
+	"github.com/webtor-io/web-ui/services/api"
+)
+
+func probeWith(streams string) *api.MediaProbe {
+	var mp api.MediaProbe
+	if err := json.Unmarshal([]byte(`{"streams":`+streams+`}`), &mp); err != nil {
+		panic(err)
+	}
+	return &mp
+}
+
+func subtitleItems(items []ListItem) map[string]ListItem {
+	m := map[string]ListItem{}
+	for _, it := range items {
+		if it.Provider == "MediaProbe" {
+			m[it.ID] = it
+		}
+	}
+	return m
+}
+
+func TestGetSubtitlesSkipsPGSWithoutIndexShift(t *testing.T) {
+	// Transcoder drops hdmv_pgs from the HLS group, so the text track
+	// that follows it is HLS subtitle #0, not #1.
+	mp := probeWith(`[
+		{"codec_type":"video","codec_name":"h264"},
+		{"codec_type":"subtitle","codec_name":"hdmv_pgs_subtitle","tags":{"language":"eng"}},
+		{"codec_type":"subtitle","codec_name":"subrip","tags":{"language":"rus","title":"Russian"}}
+	]`)
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{}, mp, &ra.ExportTag{}, nil, &models.ExternalData{}, nil, SubtitleOpts{})
+	got := subtitleItems(items)
+	if len(got) != 1 {
+		t.Fatalf("want exactly one embedded track, got %+v", got)
+	}
+	it, ok := got["mp-0"]
+	if !ok || it.MPID != "0" || it.SrcLang != "ru" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestGetSubtitlesHidesDVDSubButKeepsIndex(t *testing.T) {
+	// dvd_subtitle IS in the transcoder's group (only PGS is excluded),
+	// so it occupies HLS index 0 and the text track after it is #1.
+	mp := probeWith(`[
+		{"codec_type":"subtitle","codec_name":"dvd_subtitle","tags":{"language":"eng"}},
+		{"codec_type":"subtitle","codec_name":"ass","tags":{"language":"eng"}}
+	]`)
+	got := subtitleItems(NewHelper().GetSubtitles(&models.VideoStreamUserData{}, mp, &ra.ExportTag{}, nil, &models.ExternalData{}, nil, SubtitleOpts{}))
+	if len(got) != 1 {
+		t.Fatalf("got %+v", got)
+	}
+	if it, ok := got["mp-1"]; !ok || it.MPID != "1" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+// Forced tracks are listed (not hidden) and flagged with Forced/Badge, so
+// the picker can show them with a "forced" badge instead of dropping them.
+func TestGetSubtitlesHidesForcedByTitle(t *testing.T) {
+	mp := probeWith(`[
+		{"codec_type":"subtitle","codec_name":"subrip","tags":{"language":"eng","title":"English (Forced)"}},
+		{"codec_type":"subtitle","codec_name":"subrip","tags":{"language":"eng","title":"English"}}
+	]`)
+	got := subtitleItems(NewHelper().GetSubtitles(&models.VideoStreamUserData{}, mp, &ra.ExportTag{}, nil, &models.ExternalData{}, nil, SubtitleOpts{}))
+	if len(got) != 2 {
+		t.Fatalf("got %+v", got)
+	}
+	if it, ok := got["mp-0"]; !ok || !it.Forced || it.Badge != "forced" {
+		t.Fatalf("forced track must be listed and flagged: %+v", got)
+	}
+	if it, ok := got["mp-1"]; !ok || it.Forced || it.Label != "English" || it.Badge != "embedded" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestGetSubtitlesCarriesOpenSubtitlesSource(t *testing.T) {
+	os := []api.OpenSubtitleTrack{{ID: "7", Source: "imdb", ExportTrack: &ra.ExportTrack{Src: "u", SrcLang: "en", Label: "English", Kind: "subtitles"}}}
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{}, nil, &ra.ExportTag{}, os, &models.ExternalData{}, nil, SubtitleOpts{})
+	for _, it := range items {
+		if it.ID == "os-7" {
+			if it.Source != "imdb" {
+				t.Fatalf("got %+v", it)
+			}
+			return
+		}
+	}
+	t.Fatal("os-7 not found")
+}
+
+func TestEmbeddedSubtitleVisible(t *testing.T) {
+	cases := []struct {
+		codec, title            string
+		visible, counts, forced bool
+	}{
+		{"subrip", "", true, true, false},
+		{"ass", "Signs & Songs", true, true, false},
+		{"hdmv_pgs_subtitle", "", false, false, false},
+		{"dvd_subtitle", "", false, true, false},
+		{"dvb_subtitle", "", false, true, false},
+		// Not bitmaps, but the transcoder has no text output for them
+		// either: hidden, slot kept.
+		{"", "", false, true, false},
+		{"hdmv_text_subtitle", "", false, true, false},
+		{"dvb_teletext", "", false, true, false},
+		{"eia_608", "", true, true, false},
+		{"mov_text", "", true, true, false},
+		// Forced tracks are now visible and flagged, not hidden.
+		{"subrip", "Forced", true, true, true},
+		{"subrip", "eng forced narrative", true, true, true},
+		{"subrip", "FORCED (English)", true, true, true},
+		// Underscore separators: the norm in scene naming and in mkvmerge
+		// track names, and `_` is a word character, so \b could not see
+		// any of these.
+		{"subrip", "Forced_English", true, true, true},
+		{"subrip", "eng_forced", true, true, true},
+		{"subrip", "Movie.eng_forced.srt", true, true, true},
+		// "forced" as a substring of an ordinary word is not a forced
+		// track -- hiding these loses a real subtitle stream.
+		{"subrip", "Unforced", true, true, false},
+		{"subrip", "Reinforced Steel", true, true, false},
+		{"subrip", "enforced subtitles", true, true, false},
+		{"subrip", "forcedly", true, true, false},
+	}
+	for _, c := range cases {
+		v, n, f := embeddedSubtitleVisible(c.codec, c.title)
+		if v != c.visible || n != c.counts || f != c.forced {
+			t.Errorf("%s/%q: got (%v,%v,%v) want (%v,%v,%v)", c.codec, c.title, v, n, f, c.visible, c.counts, c.forced)
+		}
+	}
+}
+
+// TestEmbeddedForcedIsVisibleAndFlagged pins the ladder change: a forced
+// embedded track is listed (not dropped) and carries the "forced" badge,
+// while its ordinary sibling keeps the plain "embedded" badge.
+func TestEmbeddedForcedIsVisibleAndFlagged(t *testing.T) {
+	mp := probeWith(`[
+		{"codec_type":"subtitle","codec_name":"subrip","tags":{"language":"eng","title":"English (Forced)"}},
+		{"codec_type":"subtitle","codec_name":"subrip","tags":{"language":"eng","title":"English"}}
+	]`)
+	got := subtitleItems(NewHelper().GetSubtitles(&models.VideoStreamUserData{}, mp, &ra.ExportTag{}, nil, &models.ExternalData{}, nil, SubtitleOpts{}))
+	f, ok := got["mp-0"]
+	if !ok || !f.Forced || f.Badge != "forced" {
+		t.Fatalf("forced track must be listed and flagged: %+v", got)
+	}
+	if n, ok := got["mp-1"]; !ok || n.Forced || n.Badge != "embedded" {
+		t.Fatalf("plain track: %+v", got)
+	}
+}
+
+// TestSidecarForcedAndBadges pins the badge shown per provider, and that a
+// sidecar track named/sourced "forced" gets the "forced" badge instead of
+// "sidecar".
+func TestSidecarForcedAndBadges(t *testing.T) {
+	tag := &ra.ExportTag{Tracks: []ra.ExportTrack{
+		{Src: "u1", SrcLang: "en", Label: "Movie.forced.srt", Kind: "subtitles"},
+		{Src: "u2", SrcLang: "en", Label: "Movie.srt", Kind: "subtitles"},
+	}}
+	os := []api.OpenSubtitleTrack{osTrack("7", "en")}
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{}, nil, tag, os, &models.ExternalData{}, []models.UserSubtitleTrack{{ID: "us-1", Src: "u3", Label: "mine.srt", SrcLang: "en"}}, SubtitleOpts{})
+	badges := map[string]ListItem{}
+	for _, it := range items {
+		badges[it.ID] = it
+	}
+	if !badges["et-1"].Forced || badges["et-1"].Badge != "forced" {
+		t.Errorf("et-1: %+v", badges["et-1"])
+	}
+	if badges["et-2"].Badge != "sidecar" || badges["os-7"].Badge != "os" || badges["us-1"].Badge != "user" {
+		t.Errorf("badges: et-2=%s os-7=%s us-1=%s", badges["et-2"].Badge, badges["os-7"].Badge, badges["us-1"].Badge)
+	}
+}
+
+func osTrack(id, lang string) api.OpenSubtitleTrack {
+	return api.OpenSubtitleTrack{ID: id, Source: "imdb", ExportTrack: &ra.ExportTrack{Src: "u" + id, SrcLang: lang, Label: lang + " " + id, Kind: "subtitles"}}
+}
+
+func TestGetSubtitlesPreloadsUILanguageAndEnglishOnly(t *testing.T) {
+	var os []api.OpenSubtitleTrack
+	for _, lang := range []string{"de", "pt", "en", "ru"} {
+		for i := 1; i <= 3; i++ {
+			os = append(os, osTrack(lang+strconv.Itoa(i), lang))
+		}
+	}
+	ud := &models.VideoStreamUserData{AcceptLangTags: []language.Tag{language.BrazilianPortuguese}, FallbackLangTag: language.English}
+	items := NewHelper().GetSubtitles(ud, nil, &ra.ExportTag{}, os, &models.ExternalData{}, nil, SubtitleOpts{})
+	got := map[string]bool{}
+	for _, it := range items {
+		if it.Preload {
+			got[it.ID] = true
+		}
+	}
+	for _, id := range []string{"os-pt1", "os-pt2", "os-pt3", "os-en1", "os-en2", "os-en3"} {
+		if !got[id] {
+			t.Errorf("%s should be preloaded, got %v", id, got)
+		}
+	}
+	for _, id := range []string{"os-de1", "os-ru1", "none"} {
+		if got[id] {
+			t.Errorf("%s must not be preloaded", id)
+		}
+	}
+}
+
+func TestGetSubtitlesPreloadIsCapped(t *testing.T) {
+	var os []api.OpenSubtitleTrack
+	for i := 1; i <= 12; i++ {
+		os = append(os, osTrack("en"+strconv.Itoa(i), "en"))
+	}
+	ud := &models.VideoStreamUserData{AcceptLangTags: []language.Tag{language.English}, FallbackLangTag: language.English}
+	n := 0
+	for _, it := range NewHelper().GetSubtitles(ud, nil, &ra.ExportTag{}, os, &models.ExternalData{}, nil, SubtitleOpts{}) {
+		if it.Preload {
+			n++
+		}
+	}
+	if n != maxPreloadTracks {
+		t.Fatalf("preloaded %d tracks, want cap %d", n, maxPreloadTracks)
+	}
+}
+
+func TestGetSubtitlesPreloadNeverIncludesEmbedded(t *testing.T) {
+	mp := probeWith(`[{"codec_type":"subtitle","codec_name":"subrip","tags":{"language":"eng"}}]`)
+	ud := &models.VideoStreamUserData{AcceptLangTags: []language.Tag{language.English}, FallbackLangTag: language.English}
+	for _, it := range NewHelper().GetSubtitles(ud, mp, &ra.ExportTag{}, nil, &models.ExternalData{}, nil, SubtitleOpts{}) {
+		if it.Provider == "MediaProbe" && it.Preload {
+			t.Fatalf("embedded track marked preload: %+v", it)
+		}
+	}
+}
+
+// TestForcedTrackNeverAutoSelectedByLanguage pins the legacy
+// language-matching path (used when there's no explicit selection and no
+// SubtitleOpts.PreferredLang rule yet -- Task 3 adds that): a forced
+// (signs-only) track must never win automatic selection just because it
+// happens to match the viewer's language and precede the real track in
+// probe order.
+func TestForcedTrackNeverAutoSelectedByLanguage(t *testing.T) {
+	mp := probeWith(`[
+		{"codec_type":"subtitle","codec_name":"subrip","tags":{"language":"eng","title":"English (Forced)"}},
+		{"codec_type":"subtitle","codec_name":"subrip","tags":{"language":"eng","title":"English"}}
+	]`)
+	ud := &models.VideoStreamUserData{AcceptLangTags: []language.Tag{language.English}, FallbackLangTag: language.English}
+	got := subtitleItems(NewHelper().GetSubtitles(ud, mp, &ra.ExportTag{}, nil, &models.ExternalData{}, nil, SubtitleOpts{}))
+	if it, ok := got["mp-0"]; !ok || it.Default {
+		t.Fatalf("forced track must not be auto-selected: %+v", got)
+	}
+	if it, ok := got["mp-1"]; !ok || !it.Default {
+		t.Fatalf("plain track in the accept language must be selected: %+v", got)
+	}
+}
+
+// TestForcedOnlyLanguageMatchFallsThroughToNone covers the other half of the
+// guard: when the ONLY track in the viewer's language is forced, that still
+// must not become Default -- matchLang reports "no match" and
+// selectListItem falls back to lis[0] ("None"), not to the forced track.
+func TestForcedOnlyLanguageMatchFallsThroughToNone(t *testing.T) {
+	mp := probeWith(`[
+		{"codec_type":"subtitle","codec_name":"subrip","tags":{"language":"eng","title":"English (Forced)"}},
+		{"codec_type":"subtitle","codec_name":"subrip","tags":{"language":"rus","title":"Russian"}}
+	]`)
+	ud := &models.VideoStreamUserData{AcceptLangTags: []language.Tag{language.English}, FallbackLangTag: language.English}
+	items := NewHelper().GetSubtitles(ud, mp, &ra.ExportTag{}, nil, &models.ExternalData{}, nil, SubtitleOpts{})
+	got := subtitleItems(items)
+	if it, ok := got["mp-0"]; !ok || it.Default {
+		t.Fatalf("forced track must never be the language-match fallback: %+v", got)
+	}
+	found := false
+	for _, it := range items {
+		if it.ID == "none" {
+			found = true
+			if !it.Default {
+				t.Fatalf("expected fallback to None when only a forced track matches the viewer's language: %+v", items)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("None item missing")
+	}
+}
+
+// humanTracks is the common fixture of the ladder tests: one English
+// sidecar plus two OpenSubtitles tracks (a German imdb match and an
+// English hash match).
+func humanTracks() (*ra.ExportTag, []api.OpenSubtitleTrack) {
+	tag := &ra.ExportTag{Tracks: []ra.ExportTrack{{Src: "https://x/sc-en.vtt?token=T", SrcLang: "en", Label: "Movie.srt", Kind: "subtitles"}}}
+	os := []api.OpenSubtitleTrack{
+		{ID: "1", Source: "imdb", ExportTrack: &ra.ExportTrack{Src: "https://x/os-de.vtt?token=T", SrcLang: "de", Label: "German", Kind: "subtitles"}},
+		{ID: "2", Source: "hash", ExportTrack: &ra.ExportTrack{Src: "https://x/os-en.vtt?token=T", SrcLang: "en", Label: "English", Kind: "subtitles"}},
+	}
+	return tag, os
+}
+
+func byID(items []ListItem) map[string]ListItem {
+	m := map[string]ListItem{}
+	for _, it := range items {
+		m[it.ID] = it
+	}
+	return m
+}
+
+func defaultID(items []ListItem) string {
+	for _, it := range items {
+		if it.Default {
+			return it.ID
+		}
+	}
+	return ""
+}
+
+func audioProbe(lang string) *api.MediaProbe {
+	return probeWith(`[{"codec_type":"audio","codec_name":"aac","tags":{"language":"` + lang + `"}},{"codec_type":"subtitle","codec_name":"subrip","tags":{"language":"eng","title":"English"}}]`)
+}
+
+// Renamed 2026-09-16: the ladder builds the translation item and offers it,
+// but never turns it on -- see TestLadderNeverDefaultsTheTranslation. What
+// this still pins is everything about the item itself: provider, language,
+// badge, the ~tr URL with the viewer's names, and the source it picked.
+func TestLadderTranslatedIsOfferedWhenNoHumanTrackInPreferredLang(t *testing.T) {
+	tag, os := humanTracks()
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{}, audioProbe("eng"), tag, os, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true, Names: []string{"Hildy"}})
+	got := byID(items)
+	tr, ok := got["tr-pt"]
+	if !ok || tr.Provider != "Translated" || tr.SrcLang != "pt" || tr.Badge != "ai" || tr.Locked || tr.Preload {
+		t.Fatalf("translated item: %+v", tr)
+	}
+	if !strings.Contains(tr.Src, "~tr:pt/") || !strings.Contains(tr.Src, "names=Hildy") {
+		t.Fatalf("src=%q", tr.Src)
+	}
+	// Source: audio is English, so an English track wins the language
+	// preference, and between the two English ones the sidecar beats the
+	// hash-matched OpenSubtitles track -- the hash match fits the timing
+	// to this file but says nothing about the text, and community uploads
+	// routinely carry injected ads (translationSourceRank, owner ruling
+	// 2026-09-17, reversing 2026-09-16 after Sintel's hash match turned
+	// out to be mostly ads).
+	if !strings.HasPrefix(tr.Src, "https://x/sc-en.vtt~tr:pt/") {
+		t.Fatalf("expected the English sidecar as source, got %q", tr.Src)
+	}
+	if !tr.Offered || tr.Suggested || tr.Default {
+		t.Fatalf("the translation is offered, never turned on: offered=%v suggested=%v default=%v", tr.Offered, tr.Suggested, tr.Default)
+	}
+}
+
+func TestLadderHumanTrackBeatsTranslation(t *testing.T) {
+	tag, os := humanTracks()
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{}, audioProbe("eng"), tag, os, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "de", Translate: true, Paid: true})
+	if defaultID(items) != "os-1" {
+		t.Fatalf("default=%s want os-1 (human German)", defaultID(items))
+	}
+	if _, ok := byID(items)["tr-de"]; ok {
+		t.Fatal("no AI item when a human track exists in the preferred language")
+	}
+}
+
+func TestLadderOrderUserEmbeddedSidecarOS(t *testing.T) {
+	mp := probeWith(`[{"codec_type":"audio","codec_name":"aac","tags":{"language":"eng"}},{"codec_type":"subtitle","codec_name":"subrip","tags":{"language":"rus","title":"Russian"}}]`)
+	tag := &ra.ExportTag{Tracks: []ra.ExportTrack{{Src: "sc-ru", SrcLang: "ru", Label: "Movie.rus.srt", Kind: "subtitles"}}}
+	os := []api.OpenSubtitleTrack{{ID: "9", Source: "hash", ExportTrack: &ra.ExportTrack{Src: "os-ru", SrcLang: "ru", Label: "Russian", Kind: "subtitles"}}}
+	user := []models.UserSubtitleTrack{{ID: "us-1", Src: "u", Label: "mine.srt", SrcLang: "ru"}}
+	opts := SubtitleOpts{PreferredLang: "ru", Translate: true, Paid: true}
+	if d := defaultID(NewHelper().GetSubtitles(&models.VideoStreamUserData{}, mp, tag, os, &models.ExternalData{}, user, opts)); d != "us-1" {
+		t.Errorf("user upload must win: %s", d)
+	}
+	if d := defaultID(NewHelper().GetSubtitles(&models.VideoStreamUserData{}, mp, tag, os, &models.ExternalData{}, nil, opts)); d != "mp-0" {
+		t.Errorf("embedded must beat sidecar: %s", d)
+	}
+	if d := defaultID(NewHelper().GetSubtitles(&models.VideoStreamUserData{}, nil, tag, os, &models.ExternalData{}, nil, opts)); d != "et-1" {
+		t.Errorf("sidecar must beat OpenSubtitles: %s", d)
+	}
+	if d := defaultID(NewHelper().GetSubtitles(&models.VideoStreamUserData{}, nil, &ra.ExportTag{}, os, &models.ExternalData{}, nil, opts)); d != "os-9" {
+		t.Errorf("OpenSubtitles last: %s", d)
+	}
+}
+
+func TestLadderOSHashBeatsImdb(t *testing.T) {
+	os := []api.OpenSubtitleTrack{
+		{ID: "1", Source: "imdb", ExportTrack: &ra.ExportTrack{Src: "a", SrcLang: "pt", Label: "pt", Kind: "subtitles"}},
+		{ID: "2", Source: "hash", ExportTrack: &ra.ExportTrack{Src: "b", SrcLang: "pt", Label: "pt", Kind: "subtitles"}},
+	}
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{}, audioProbe("eng"), &ra.ExportTag{}, os, &models.ExternalData{}, nil, SubtitleOpts{PreferredLang: "pt"})
+	if defaultID(items) != "os-2" {
+		t.Fatalf("default=%s want os-2 (hash match)", defaultID(items))
+	}
+}
+
+func TestLadderAudioMatchesPreferredNoAutoSubtitles(t *testing.T) {
+	tag, os := humanTracks()
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{}, audioProbe("por"), tag, os, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	if defaultID(items) != "none" {
+		t.Fatalf("default=%s want none", defaultID(items))
+	}
+	tr, ok := byID(items)["tr-pt"]
+	if !ok || tr.Default {
+		t.Fatalf("AI item must still be offered, not default: %+v", tr)
+	}
+}
+
+func TestLadderAudioMatchesPreferredForcedIsDefault(t *testing.T) {
+	mp := probeWith(`[{"codec_type":"audio","codec_name":"aac","tags":{"language":"por"}},
+		{"codec_type":"subtitle","codec_name":"subrip","tags":{"language":"por","title":"Portuguese (Forced)"}},
+		{"codec_type":"subtitle","codec_name":"subrip","tags":{"language":"por","title":"Portuguese"}}]`)
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{}, mp, &ra.ExportTag{}, nil, &models.ExternalData{}, nil, SubtitleOpts{PreferredLang: "pt"})
+	if defaultID(items) != "mp-0" {
+		t.Fatalf("default=%s want mp-0 (forced pt)", defaultID(items))
+	}
+}
+
+func TestLadderForcedNeverFullDefaultNorSource(t *testing.T) {
+	tag := &ra.ExportTag{Tracks: []ra.ExportTrack{{Src: "https://x/forced.vtt", SrcLang: "en", Label: "Movie.forced.srt", Kind: "subtitles"}}}
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{}, audioProbe("eng"), tag, nil, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	if _, ok := byID(items)["tr-pt"]; ok {
+		t.Fatal("a forced track is not a translation source")
+	}
+	if d := defaultID(items); d == "et-1" {
+		t.Fatal("forced must not be the full default")
+	}
+}
+
+// TestLadderForcedInPreferredLangIsNotTheDefault is the negative control of
+// the Forced guard in bestByLadder: a forced track that IS in the preferred
+// language, with the audio in another one, still must not be selected —
+// only the audio rule (TestLadderAudioMatchesPreferredForcedIsDefault) may
+// turn a forced track on.
+func TestLadderForcedInPreferredLangIsNotTheDefault(t *testing.T) {
+	tag := &ra.ExportTag{Tracks: []ra.ExportTrack{{Src: "https://x/pt.vtt", SrcLang: "pt", Label: "Movie.forced.srt", Kind: "subtitles"}}}
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{}, audioProbe("eng"), tag, nil, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	if d := defaultID(items); d != "none" {
+		t.Fatalf("default=%s: a forced track must not be the full-subtitle default", d)
+	}
+}
+
+// TestLadderLockedForFree: a free viewer sees the AI item with a lock and
+// no Src, and it is never the default -- a "selected" track that cannot be
+// turned on would leave the player with subtitles on and nothing on
+// screen. The default comes from the phase-1 fallback instead.
+func TestLadderLockedForFree(t *testing.T) {
+	tag, os := humanTracks()
+	ud := &models.VideoStreamUserData{FallbackLangTag: language.English}
+	items := NewHelper().GetSubtitles(ud, audioProbe("eng"), tag, os, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: false})
+	tr := byID(items)["tr-pt"]
+	if !tr.Locked || tr.Src != "" || tr.Default {
+		t.Fatalf("free: %+v", tr)
+	}
+	if d := defaultID(items); d != "mp-0" {
+		t.Fatalf("default=%s: want the Accept-Language pick (the embedded English track)", d)
+	}
+}
+
+func TestLadderSavedChoiceWins(t *testing.T) {
+	tag, os := humanTracks()
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{SubtitleID: "os-1"}, audioProbe("eng"), tag, os, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	if defaultID(items) != "os-1" {
+		t.Fatalf("saved choice must win: %s", defaultID(items))
+	}
+}
+
+// TestLadderSavedChoiceIsMarkedSaved pins the difference between "the
+// viewer chose this" and "the ladder picked this". The player re-runs the
+// ladder when the audio track changes, and Default alone cannot tell it
+// which of the two it is looking at: without Saved it would re-decide
+// over a choice the viewer made explicitly and switch their subtitles
+// off.
+func TestLadderSavedChoiceIsMarkedSaved(t *testing.T) {
+	tag, os := humanTracks()
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{SubtitleID: "os-1"}, audioProbe("eng"), tag, os, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	for _, li := range items {
+		if li.ID == "os-1" {
+			if !li.Saved {
+				t.Fatal("the saved choice must be marked Saved")
+			}
+			continue
+		}
+		if li.Saved {
+			t.Fatalf("only the saved choice may be marked Saved, got %s", li.ID)
+		}
+	}
+}
+
+// TestLadderPickIsNotMarkedSaved is the negative half: an item the ladder
+// chose is Default but not Saved, so the audio rule stays free to
+// override it.
+func TestLadderPickIsNotMarkedSaved(t *testing.T) {
+	tag, os := humanTracks()
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{}, audioProbe("eng"), tag, os, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	for _, li := range items {
+		if li.Saved {
+			t.Fatalf("no saved choice was made, but %s is marked Saved", li.ID)
+		}
+	}
+}
+
+// TestLegacySavedChoiceIsMarkedSaved covers the phase-1 path (no
+// preferred language): the same saved id goes through selectListItem.
+func TestLegacySavedChoiceIsMarkedSaved(t *testing.T) {
+	tag, os := humanTracks()
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{SubtitleID: "os-1", FallbackLangTag: language.English}, audioProbe("eng"), tag, os, &models.ExternalData{}, nil,
+		SubtitleOpts{})
+	saved := byID(items)["os-1"]
+	if !saved.Default || !saved.Saved {
+		t.Fatalf("legacy saved choice: default=%v saved=%v", saved.Default, saved.Saved)
+	}
+	for _, li := range items {
+		if li.ID != "os-1" && li.Saved {
+			t.Fatalf("only the saved choice may be marked Saved, got %s", li.ID)
+		}
+	}
+}
+
+func TestLadderSourcePrefersAudioLangThenEnglish(t *testing.T) {
+	tag := &ra.ExportTag{Tracks: []ra.ExportTrack{
+		{Src: "https://x/sc-en.vtt", SrcLang: "en", Label: "en.srt", Kind: "subtitles"},
+		{Src: "https://x/sc-fr.vtt", SrcLang: "fr", Label: "fr.srt", Kind: "subtitles"},
+	}}
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{}, audioProbe("fra"), tag, nil, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	if tr := byID(items)["tr-pt"]; !strings.HasPrefix(tr.Src, "https://x/sc-fr.vtt~tr:pt/") {
+		t.Fatalf("French audio → French source, got %q", tr.Src)
+	}
+	items = NewHelper().GetSubtitles(&models.VideoStreamUserData{}, audioProbe("deu"), tag, nil, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	if tr := byID(items)["tr-pt"]; !strings.HasPrefix(tr.Src, "https://x/sc-en.vtt~tr:pt/") {
+		t.Fatalf("no source in the audio language → English, got %q", tr.Src)
+	}
+}
+
+func TestLadderNoTranslationWithoutSource(t *testing.T) {
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{}, audioProbe("eng"), &ra.ExportTag{}, nil, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	if _, ok := byID(items)["tr-pt"]; ok {
+		t.Fatal("embedded-only files have no translation source in phase 2")
+	}
+}
+
+func TestLadderDisabledFallsBackToOldSelection(t *testing.T) {
+	tag, os := humanTracks()
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{AcceptLangTags: []language.Tag{language.German}, FallbackLangTag: language.English}, nil, tag, os, &models.ExternalData{}, nil, SubtitleOpts{})
+	if defaultID(items) != "os-1" {
+		t.Fatalf("without PreferredLang the Accept-Language match applies: %s", defaultID(items))
+	}
+}
+
+// TestLadderRankAndSourceBadge pins the two fields the template and the
+// player read instead of reimplementing the ladder (R-N, R-O): every item
+// carries its ladder rank, and the AI item names the origin of the track
+// it was translated from.
+func TestLadderRankAndSourceBadge(t *testing.T) {
+	tag, os := humanTracks()
+	user := []models.UserSubtitleTrack{{ID: "us-1", Src: "https://x/mine.vtt", Label: "mine.srt", SrcLang: "ja"}}
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{}, audioProbe("eng"), tag, os, &models.ExternalData{}, user,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	got := byID(items)
+	for id, want := range map[string]int{"us-1": 0, "mp-0": 1, "et-1": 2, "os-2": 3, "os-1": 4, "tr-pt": 5} {
+		it, ok := got[id]
+		if !ok {
+			t.Fatalf("%s missing from %+v", id, got)
+		}
+		if it.Rank != want {
+			t.Errorf("%s rank=%d want %d", id, it.Rank, want)
+		}
+	}
+	tr := got["tr-pt"]
+	// et-1 is the English sidecar: English audio, and inside that language
+	// the sidecar outranks the hash-matched OpenSubtitles track for
+	// translating (translationSourceRank, 2026-09-17) -- the hash fits the
+	// timing, not the text, and community uploads carry injected ads.
+	if tr.SourceID != "et-1" || tr.SourceBadge != "sidecar" {
+		t.Errorf("AI item must name its source: sourceID=%q badge=%q", tr.SourceID, tr.SourceBadge)
+	}
+	if tr.Source != "" {
+		t.Errorf("Source is the OpenSubtitles hash|imdb enum and goes to telemetry; the AI item must leave it empty, got %q", tr.Source)
+	}
+}
+
+// TestLadderExternalDefaultIsKept covers an embed that asked for a specific
+// track: that explicit choice stands, and the ladder must not add a second
+// Default item to the list.
+func TestLadderExternalDefaultIsKept(t *testing.T) {
+	ext := &models.ExternalData{Tracks: []models.ExternalTrack{{Src: "https://x/e.vtt", SrcLang: "en", Label: "External", Default: true}}}
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{}, audioProbe("eng"), &ra.ExportTag{}, nil, ext, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	n := 0
+	for _, it := range items {
+		if it.Default {
+			n++
+		}
+	}
+	if n != 1 || defaultID(items) != "ext-1" {
+		t.Fatalf("want exactly one default (ext-1), got %d, default=%s", n, defaultID(items))
+	}
+}
+
+// TestLadderNoPreferredMatchKeepsPhaseOneSelection: the preferred language
+// yields neither a human track nor an AI one (translation off). The ladder
+// must not switch subtitles off -- the phase-1 Accept-Language selection
+// still decides.
+func TestLadderNoPreferredMatchKeepsPhaseOneSelection(t *testing.T) {
+	mp := probeWith(`[{"codec_type":"audio","codec_name":"aac","tags":{"language":"jpn"}}]`)
+	os := []api.OpenSubtitleTrack{osTrack("7", "en")}
+	ud := &models.VideoStreamUserData{FallbackLangTag: language.English}
+	items := NewHelper().GetSubtitles(ud, mp, &ra.ExportTag{}, os, &models.ExternalData{}, nil, SubtitleOpts{PreferredLang: "pt"})
+	if d := defaultID(items); d != "os-7" {
+		t.Fatalf("default=%s want os-7: a ladder miss must not take subtitles away", d)
+	}
+}
+
+// TestLadderUnknownLanguageHasNoAIItem: a preferred language the
+// translation service does not know gets no AI item at all -- an item that
+// leads to a rejected request is worse than no item.
+func TestLadderUnknownLanguageHasNoAIItem(t *testing.T) {
+	tag, os := humanTracks()
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{FallbackLangTag: language.English}, audioProbe("eng"), tag, os, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "eo", Translate: true, Paid: true})
+	if _, ok := byID(items)["tr-eo"]; ok {
+		t.Fatal("no AI item for a language the service does not support")
+	}
+}
+
+// TestLadderSavedChoiceClearsExternalDefault: an embed marks a track
+// Default, the viewer has since picked another one. Exactly one item may
+// end up Default, and it is the viewer's.
+func TestLadderSavedChoiceClearsExternalDefault(t *testing.T) {
+	ext := &models.ExternalData{Tracks: []models.ExternalTrack{{Src: "https://x/e.vtt", SrcLang: "en", Label: "External", Default: true}}}
+	os := []api.OpenSubtitleTrack{osTrack("7", "de")}
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{SubtitleID: "os-7"}, audioProbe("eng"), &ra.ExportTag{}, os, ext, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	n := 0
+	for _, it := range items {
+		if it.Default {
+			n++
+		}
+	}
+	if n != 1 || defaultID(items) != "os-7" {
+		t.Fatalf("want exactly one default (os-7), got %d, default=%s", n, defaultID(items))
+	}
+}
+
+// TestLadderLockedNeverWinsLanguageFallback: the ladder-miss fallback runs
+// the legacy Accept-Language match, which must not see AI items at all --
+// otherwise the locked tr-pt item is the only "pt" track in the list and
+// wins the match with an empty Src.
+func TestLadderLockedNeverWinsLanguageFallback(t *testing.T) {
+	tag, os := humanTracks()
+	ud := &models.VideoStreamUserData{AcceptLangTags: []language.Tag{language.Portuguese}, FallbackLangTag: language.English}
+	items := NewHelper().GetSubtitles(ud, audioProbe("eng"), tag, os, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: false})
+	tr, ok := byID(items)["tr-pt"]
+	if !ok || !tr.Locked {
+		t.Fatalf("the locked AI item must still be listed: %+v", tr)
+	}
+	if d := defaultID(items); d == "tr-pt" {
+		t.Fatal("a locked item must never be the Accept-Language match")
+	}
+}
+
+// TestLadderLockedNeverWinsEnglishFallback is the same hole reached through
+// the fallback language rather than Accept-Language: FallbackLangTag is
+// always English, so a locked tr-en item would win whenever the file has no
+// English human track.
+func TestLadderLockedNeverWinsEnglishFallback(t *testing.T) {
+	tag := &ra.ExportTag{Tracks: []ra.ExportTrack{{Src: "https://x/sc-de.vtt", SrcLang: "de", Label: "German.srt", Kind: "subtitles"}}}
+	mp := probeWith(`[{"codec_type":"audio","codec_name":"aac","tags":{"language":"jpn"}}]`)
+	ud := &models.VideoStreamUserData{FallbackLangTag: language.English}
+	items := NewHelper().GetSubtitles(ud, mp, tag, nil, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "en", Translate: true, Paid: false})
+	tr, ok := byID(items)["tr-en"]
+	if !ok || !tr.Locked {
+		t.Fatalf("the locked AI item must still be listed: %+v", tr)
+	}
+	if d := defaultID(items); d == "tr-en" {
+		t.Fatalf("a locked item must never be the English fallback, default=%s", d)
+	}
+}
+
+// TestLadderSavedLockedChoiceIgnored: the viewer saved the AI track while
+// they were paying and has since dropped to free. The stale choice must not
+// select a track they cannot turn on.
+func TestLadderSavedLockedChoiceIgnored(t *testing.T) {
+	tag, os := humanTracks()
+	ud := &models.VideoStreamUserData{SubtitleID: "tr-pt", FallbackLangTag: language.English}
+	items := NewHelper().GetSubtitles(ud, audioProbe("eng"), tag, os, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: false})
+	if d := defaultID(items); d == "tr-pt" {
+		t.Fatal("a saved choice pointing at a locked item must be ignored")
+	}
+	if tr := byID(items)["tr-pt"]; !tr.Locked || tr.Src != "" {
+		t.Fatalf("the item stays listed and locked: %+v", tr)
+	}
+}
+
+// TestLadderSavedAIChoiceHonouredWhenPaid is the other half: the same saved
+// choice is still honoured for a viewer who may activate it.
+func TestLadderSavedAIChoiceHonouredWhenPaid(t *testing.T) {
+	tag, os := humanTracks()
+	ud := &models.VideoStreamUserData{SubtitleID: "tr-pt", FallbackLangTag: language.English}
+	items := NewHelper().GetSubtitles(ud, audioProbe("eng"), tag, os, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	if d := defaultID(items); d != "tr-pt" {
+		t.Fatalf("default=%s: the saved AI choice must win for a paid viewer", d)
+	}
+}
+
+// TestUserSubtitleViewCarriesDefaultAndSaved pins the seam between the
+// ladder and the "My Subtitles" tab. That tab renders from its own view
+// model, so the items it produces never carried Default/Saved — a viewer
+// whose saved choice is one of their own uploads got a list where nothing
+// is marked, and the player's audio-switch rule (which reads data-saved off
+// the DOM) could not see the choice at all and re-decided over it.
+func TestUserSubtitleViewCarriesDefaultAndSaved(t *testing.T) {
+	h := NewHelper()
+	userSubs := []models.UserSubtitleTrack{
+		{ID: "us-1", Label: "a.srt", Src: "https://x/a.vtt"},
+		{ID: "us-2", Label: "b.srt", Src: "https://x/b.vtt"},
+	}
+	items := h.GetSubtitles(&models.VideoStreamUserData{SubtitleID: "us-2"}, audioProbe("eng"), &ra.ExportTag{}, nil, &models.ExternalData{}, userSubs,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	if defaultID(items) != "us-2" {
+		t.Fatalf("fixture: the saved upload must be the default, got %s", defaultID(items))
+	}
+
+	v := h.UserSubtitleView("res", "/movie.mkv", "http://ei", userSubs, items, "pt")
+	if len(v.UserSubtitles) != 2 {
+		t.Fatalf("view must keep every upload: %+v", v.UserSubtitles)
+	}
+	if v.UserSubtitles[0].Default || v.UserSubtitles[0].Saved {
+		t.Fatalf("us-1 is neither the default nor the saved choice: %+v", v.UserSubtitles[0])
+	}
+	if !v.UserSubtitles[1].Default || !v.UserSubtitles[1].Saved {
+		t.Fatalf("us-2 is the viewer's saved default: %+v", v.UserSubtitles[1])
+	}
+}
+
+// TestUserSubtitleViewLadderPickIsNotSaved is the negative half: an upload
+// the ladder picked is Default but not Saved, so the audio rule may still
+// override it.
+func TestUserSubtitleViewLadderPickIsNotSaved(t *testing.T) {
+	h := NewHelper()
+	userSubs := []models.UserSubtitleTrack{{ID: "us-1", Label: "a.pt.srt", SrcLang: "pt", Src: "https://x/a.vtt"}}
+	items := h.GetSubtitles(&models.VideoStreamUserData{}, audioProbe("eng"), &ra.ExportTag{}, nil, &models.ExternalData{}, userSubs,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	if defaultID(items) != "us-1" {
+		t.Fatalf("fixture: the ladder must pick the Portuguese upload, got %s", defaultID(items))
+	}
+	v := h.UserSubtitleView("res", "/movie.mkv", "http://ei", userSubs, items, "pt")
+	if !v.UserSubtitles[0].Default || v.UserSubtitles[0].Saved {
+		t.Fatalf("a ladder pick is Default but not Saved: %+v", v.UserSubtitles[0])
+	}
+}
+
+// TestAudioTracksAreNeverMarkedSaved pins that Saved is a subtitle-only
+// field. The audio list shares selectListItem with the subtitle list, so a
+// saved audio choice used to set Saved on an audio item — a value nothing
+// reads (the template renders data-saved on subtitle items only) and that
+// would mean something different if it ever were read: for subtitles Saved
+// switches the audio-language rule off, and the audio list has no such rule.
+func TestAudioTracksAreNeverMarkedSaved(t *testing.T) {
+	ud := &models.VideoStreamUserData{AudioID: "mp-1", FallbackLangTag: language.English}
+	mp := probeWith(`[
+		{"codec_type":"audio","codec_name":"aac","tags":{"language":"eng"}},
+		{"codec_type":"audio","codec_name":"aac","tags":{"language":"por"}}
+	]`)
+	tracks := NewHelper().GetAudioTracks(ud, mp)
+	if len(tracks) != 2 {
+		t.Fatalf("fixture: expected 2 audio tracks, got %d", len(tracks))
+	}
+	if defaultID(tracks) != "mp-1" {
+		t.Fatalf("fixture: the saved audio choice must be the default, got %s", defaultID(tracks))
+	}
+	for _, a := range tracks {
+		if a.Saved {
+			t.Errorf("audio item %s is marked Saved; Saved is a subtitle-only field", a.ID)
+		}
+	}
+}
+
+// TestLadderNoTranslatedItemWithoutAUsableURL covers the pairing between
+// TranslateURL's absolute-URL guard and the ladder: when the source track's
+// Src is not something the proxy can be pointed at, TranslateURL returns ""
+// and a paid viewer must get no item rather than one that selects and shows
+// nothing. A free viewer is unaffected — the locked item never had a Src.
+func TestLadderNoTranslatedItemWithoutAUsableURL(t *testing.T) {
+	relative := &ra.ExportTag{Tracks: []ra.ExportTrack{
+		{Src: "/ext/abc/movie.srt~vtt/movie.vtt", SrcLang: "en", Label: "Movie.srt", Kind: "subtitles"},
+	}}
+	paid := NewHelper().GetSubtitles(&models.VideoStreamUserData{}, audioProbe("eng"), relative, nil, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	if _, ok := byID(paid)["tr-pt"]; ok {
+		t.Fatalf("a paid viewer must not get an AI item with no URL behind it: %+v", byID(paid)["tr-pt"])
+	}
+
+	// Negative control on the fixture: the same source with an absolute
+	// URL does produce the item, so the test is not passing for the wrong
+	// reason (say, pickTranslationSource rejecting the track outright).
+	absolute := &ra.ExportTag{Tracks: []ra.ExportTrack{
+		{Src: "https://x.test/ext/abc/movie.srt~vtt/movie.vtt", SrcLang: "en", Label: "Movie.srt", Kind: "subtitles"},
+	}}
+	ok2 := NewHelper().GetSubtitles(&models.VideoStreamUserData{}, audioProbe("eng"), absolute, nil, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	tr, found := byID(ok2)["tr-pt"]
+	if !found || tr.Src == "" {
+		t.Fatalf("an absolute source still produces the AI item: %+v", tr)
+	}
+
+	// A free viewer gets the locked upsell either way: it never carries a
+	// Src, so there is no dead URL to protect them from.
+	free := NewHelper().GetSubtitles(&models.VideoStreamUserData{}, audioProbe("eng"), relative, nil, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: false})
+	if lock, found := byID(free)["tr-pt"]; !found || !lock.Locked || lock.Src != "" {
+		t.Fatalf("free viewer keeps the locked item: %+v", lock)
+	}
+}
+
+// suggestedID is the item the picker would turn on when the viewer flips
+// subtitles back on. Exactly one item may carry it.
+func suggestedID(t *testing.T, items []ListItem) string {
+	t.Helper()
+	id := ""
+	for _, it := range items {
+		if !it.Suggested {
+			continue
+		}
+		if id != "" {
+			t.Fatalf("more than one item is Suggested: %s and %s", id, it.ID)
+		}
+		id = it.ID
+	}
+	return id
+}
+
+// TestLadderSavedOffSuggestsWhatItWouldHavePicked: "subtitles off" is a
+// state of the picker's toggle, not the absence of a choice. The ladder
+// still has to say what the toggle would turn on, or switching it on would
+// have nothing to activate on a page the viewer opened with subtitles off.
+func TestLadderSavedOffSuggestsWhatItWouldHavePicked(t *testing.T) {
+	tag, os := humanTracks()
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{SubtitleID: "none"}, audioProbe("eng"), tag, os, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "de", Translate: true, Paid: true})
+	if d := defaultID(items); d != "none" {
+		t.Fatalf("default=%s want none: the saved off must stand", d)
+	}
+	if !byID(items)["none"].Saved {
+		t.Fatal("the saved off must be marked Saved")
+	}
+	// The same item TestLadderHumanTrackBeatsTranslation gets as Default
+	// when nothing is saved.
+	if s := suggestedID(t, items); s != "os-1" {
+		t.Fatalf("suggested=%s want os-1 (the human German track the ladder would pick)", s)
+	}
+}
+
+// TestLadderSavedOffOffersTheAIItem: saved off, and the ladder's answer for
+// the viewer's language is the translation. Since 2026-09-16 that answer is
+// an offer, not what the switch restores -- the switch gets its own
+// candidate from offSuggestion, here the embedded English track.
+func TestLadderSavedOffOffersTheAIItem(t *testing.T) {
+	tag, os := humanTracks()
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{SubtitleID: "none", FallbackLangTag: language.English}, audioProbe("eng"), tag, os, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	tr := byID(items)["tr-pt"]
+	if !tr.Offered || tr.Suggested {
+		t.Fatalf("the AI item must be offered and never suggested: %+v", tr)
+	}
+	if s := suggestedID(t, items); s != "mp-0" {
+		t.Fatalf("suggested=%s want mp-0: the switch restores a real track", s)
+	}
+}
+
+// TestLadderSavedOffNeverSuggestsALockedItem: a free viewer cannot
+// activate the AI track, so it must not be what the toggle promises. The
+// phase-1 fallback decides instead.
+func TestLadderSavedOffNeverSuggestsALockedItem(t *testing.T) {
+	tag, os := humanTracks()
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{SubtitleID: "none", FallbackLangTag: language.English}, audioProbe("eng"), tag, os, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: false})
+	s := suggestedID(t, items)
+	if s == "tr-pt" {
+		t.Fatal("a locked item cannot be suggested: turning subtitles on would show nothing")
+	}
+	// mp-0 is the embedded English track audioProbe ships: first in list
+	// order, so it is the Accept-Language match.
+	if s != "mp-0" {
+		t.Fatalf("suggested=%s want mp-0 (the phase-1 Accept-Language pick)", s)
+	}
+}
+
+// TestLegacySavedOffSuggestsThePhaseOnePick covers the path with no
+// preferred content language: the suggestion is what the Accept-Language
+// selection would have chosen.
+func TestLegacySavedOffSuggestsThePhaseOnePick(t *testing.T) {
+	tag, os := humanTracks()
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{SubtitleID: "none", FallbackLangTag: language.English}, audioProbe("eng"), tag, os, &models.ExternalData{}, nil,
+		SubtitleOpts{})
+	if d := defaultID(items); d != "none" {
+		t.Fatalf("default=%s want none", d)
+	}
+	if s := suggestedID(t, items); s != "mp-0" {
+		t.Fatalf("suggested=%s want mp-0 (the embedded English track, first in list order)", s)
+	}
+}
+
+// TestLadderSavedOffSuggestsTheEmbedsOwnTrack: an embed that asked for a
+// specific track keeps that answer even as a suggestion -- the ladder is
+// consulted only where the caller said nothing.
+func TestLadderSavedOffSuggestsTheEmbedsOwnTrack(t *testing.T) {
+	ext := &models.ExternalData{Tracks: []models.ExternalTrack{{Src: "https://x/e.vtt", SrcLang: "en", Label: "External", Default: true}}}
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{SubtitleID: "none"}, audioProbe("eng"), &ra.ExportTag{}, nil, ext, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	if d := defaultID(items); d != "none" {
+		t.Fatalf("default=%s want none", d)
+	}
+	if s := suggestedID(t, items); s != "ext-1" {
+		t.Fatalf("suggested=%s want ext-1", s)
+	}
+}
+
+// TestSuggestedOnlyExistsWhenSubtitlesAreOff is the negative control for
+// the guard: with any other saved choice -- or none at all -- there is
+// nothing to restore, and a Suggested item next to a Default one would
+// give the picker two answers to the same question.
+func TestSuggestedOnlyExistsWhenSubtitlesAreOff(t *testing.T) {
+	tag, os := humanTracks()
+	for _, saved := range []string{"", "os-1"} {
+		items := NewHelper().GetSubtitles(&models.VideoStreamUserData{SubtitleID: saved, FallbackLangTag: language.English}, audioProbe("eng"), tag, os, &models.ExternalData{}, nil,
+			SubtitleOpts{PreferredLang: "de", Translate: true, Paid: true})
+		if s := suggestedID(t, items); s != "" {
+			t.Fatalf("saved=%q: nothing may be Suggested while subtitles are on, got %s", saved, s)
+		}
+		// ...and the legacy path says the same.
+		items = NewHelper().GetSubtitles(&models.VideoStreamUserData{SubtitleID: saved, FallbackLangTag: language.English}, audioProbe("eng"), tag, os, &models.ExternalData{}, nil,
+			SubtitleOpts{})
+		if s := suggestedID(t, items); s != "" {
+			t.Fatalf("saved=%q (legacy): nothing may be Suggested while subtitles are on, got %s", saved, s)
+		}
+	}
+}
+
+// TestOffByTheLadderAlsoSuggestsATrack: the ladder reaches "no subtitles"
+// on its own whenever the audio is already in the viewer's language --
+// which is the common case, and the one where the switch would otherwise
+// have nothing to turn on. It suggests the best track in that language.
+func TestOffByTheLadderAlsoSuggestsATrack(t *testing.T) {
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{}, audioProbe("eng"), &ra.ExportTag{}, nil, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "en", Translate: true, Paid: true})
+	if d := defaultID(items); d != "none" {
+		t.Fatalf("default=%s want none (English audio, English viewer)", d)
+	}
+	if s := suggestedID(t, items); s != "mp-0" {
+		t.Fatalf("suggested=%s want mp-0 (the embedded English track)", s)
+	}
+}
+
+// TestNothingToTurnOnSuggestsNothing is the other half: a list whose only
+// subtitle is a locked AI item has nothing the switch can give, and
+// promising the item that means "off" -- or one that shows nothing -- would
+// be a lie.
+func TestNothingToTurnOnSuggestsNothing(t *testing.T) {
+	tag := &ra.ExportTag{Tracks: []ra.ExportTrack{{Src: "https://x/sc-en.vtt", SrcLang: "en", Label: "en.srt", Kind: "subtitles"}}}
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{SubtitleID: "none"}, audioProbe("eng"), tag, nil, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: false})
+	locked := byID(items)["tr-pt"]
+	if !locked.Locked {
+		t.Fatalf("fixture no longer produces a locked AI item: %+v", locked)
+	}
+	for _, it := range items {
+		if it.Suggested && (it.Locked || it.ID == "none") {
+			t.Fatalf("the switch must not promise %s (locked=%v)", it.ID, it.Locked)
+		}
+	}
+
+	// ...and with no subtitle at all on the list, nothing is suggested.
+	empty := NewHelper().GetSubtitles(&models.VideoStreamUserData{SubtitleID: "none"}, probeWith(`[{"codec_type":"audio","codec_name":"aac","tags":{"language":"eng"}}]`), &ra.ExportTag{}, nil, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	if s := suggestedID(t, empty); s != "" {
+		t.Fatalf("suggested=%s want nothing: there is no subtitle to turn on", s)
+	}
+}
+
+// TestSavedOffAndLadderOffSuggestTheSameTrack is an outcome test: the
+// suggestion is the ladder's own answer in both directions. With the audio
+// already in the viewer's language and a forced track available, the ladder
+// turns on the forced track — so that is what the switch promises, whether
+// the viewer saved "off" themselves or the ladder arrived there.
+func TestSavedOffAndLadderOffSuggestTheSameTrack(t *testing.T) {
+	// English audio, English preference, one full English track and one
+	// forced English track.
+	mp := probeWith(`[
+		{"codec_type":"audio","codec_name":"aac","tags":{"language":"eng"}},
+		{"codec_type":"subtitle","codec_name":"subrip","tags":{"language":"eng","title":"English"}},
+		{"codec_type":"subtitle","codec_name":"subrip","tags":{"language":"eng","title":"Forced (English)"}}
+	]`)
+	opts := SubtitleOpts{PreferredLang: "en", Translate: true, Paid: true}
+
+	// The ladder's own answer, nothing saved: the forced track plays.
+	on := NewHelper().GetSubtitles(&models.VideoStreamUserData{}, mp, &ra.ExportTag{}, nil, &models.ExternalData{}, nil, opts)
+	if d := defaultID(on); d != "mp-1" {
+		t.Fatalf("default=%s want mp-1 (the forced track) -- fixture no longer covers this case", d)
+	}
+
+	// The viewer saved "off" instead. The switch must promise the same
+	// track, not the full one a different order would have picked.
+	off := NewHelper().GetSubtitles(&models.VideoStreamUserData{SubtitleID: "none"}, mp, &ra.ExportTag{}, nil, &models.ExternalData{}, nil, opts)
+	if s := suggestedID(t, off); s != "mp-1" {
+		t.Fatalf("suggested=%s want mp-1: saved-off and the ladder must agree", s)
+	}
+}
+
+// TestOffSuggestsAForcedTrackInThePreferredLanguage pins the rung between
+// "a full track in your language" and "an AI translation": a forced
+// (signs-only) track in the viewer's language beats a full track in a
+// language they did not ask for.
+//
+// Reachable exactly because the audio is in a third language: the ladder
+// never turns a forced track on here (that rule is for audio already in the
+// viewer's language), so it lands on "None" — and the switch then has the
+// forced track to offer. It is a real subtitle in the right language; the
+// English one is neither.
+func TestOffSuggestsAForcedTrackInThePreferredLanguage(t *testing.T) {
+	tag := &ra.ExportTag{Tracks: []ra.ExportTrack{
+		{Src: "https://x/full-en.vtt", SrcLang: "en", Label: "Movie.en.srt", Kind: "subtitles"},
+		{Src: "https://x/forced-pt.vtt", SrcLang: "pt", Label: "Movie.pt.forced.srt", Kind: "subtitles"},
+	}}
+	// Japanese audio, Portuguese viewer, no AI (Translate off) and no
+	// Accept-Language match at all.
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{}, audioProbe("jpn"), tag, nil, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt"})
+
+	forced := byID(items)["et-2"]
+	if !forced.Forced || forced.SrcLang != "pt" {
+		t.Fatalf("fixture no longer produces a forced pt track: %+v", forced)
+	}
+	if d := defaultID(items); d != "none" {
+		t.Fatalf("default=%s want none -- the ladder must not turn the forced track on here", d)
+	}
+	if s := suggestedID(t, items); s != "et-2" {
+		t.Fatalf("suggested=%s want et-2 (the forced track in the viewer's language)", s)
+	}
+}
+
+// TestLadderNeverDefaultsTheTranslation is the owner's rule of 2026-09-16:
+// a translation costs tokens, so it is never turned on for the viewer. The
+// ladder marks it Offered -- the picker draws that as an action, not as a
+// selection -- and offeredDefault decides what actually plays.
+//
+// Negative control for the same guard: TestLadderTranslatedIsOfferedNotDefault
+// below asserts the item is still offered, so "never Default" cannot be
+// satisfied by dropping the item altogether.
+func TestLadderNeverDefaultsTheTranslation(t *testing.T) {
+	tag, os := humanTracks()
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{FallbackLangTag: language.English}, audioProbe("eng"), tag, os, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	// Fixture guard: with no AI item in the list "never Default" would hold
+	// vacuously, and the test would go on passing after the ladder stopped
+	// producing one at all.
+	if tr, ok := byID(items)["tr-pt"]; !ok || tr.Locked {
+		t.Fatalf("fixture must produce an unlocked AI item, got %+v", tr)
+	}
+	for _, it := range items {
+		if it.Provider == "Translated" && it.Default {
+			t.Fatalf("the AI translation must never be the default: %+v", it)
+		}
+	}
+	// What plays in its place is the best English track by ladder rank
+	// (owner, 2026-09-28: "show the main subtitles and offer to translate
+	// them") -- here the embedded English track, rank 1, ahead of the
+	// sidecar (2) and the hash-matched OpenSubtitles track (3). From
+	// 2026-09-18 to then an offer left subtitles off. The rule has its own
+	// tests in english_fallback_test.go; this one only checks that the
+	// translation is not what came back on.
+	if d := defaultID(items); d != "mp-0" {
+		t.Fatalf("default=%s want mp-0: the best English track plays beside the offer", d)
+	}
+}
+
+// TestLadderTranslatedIsOfferedNotDefault: where the ladder would have
+// turned the translation on, it offers it instead.
+func TestLadderTranslatedIsOfferedNotDefault(t *testing.T) {
+	tag, os := humanTracks()
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{FallbackLangTag: language.English}, audioProbe("eng"), tag, os, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	tr := byID(items)["tr-pt"]
+	if !tr.Offered || tr.Default {
+		t.Fatalf("the AI item must be offered and never default: %+v", tr)
+	}
+}
+
+// TestLadderTranslationOfferSurvivesWithNoOtherTrack: nothing else is
+// activatable at all, so the list falls to "None" -- subtitles off, with
+// the translation offered. The picker's switch will refuse to start it (an
+// explicit click only) and show the hint instead; here we pin the server
+// half: off, and the offer standing.
+func TestLadderTranslationOfferSurvivesWithNoOtherTrack(t *testing.T) {
+	tag := &ra.ExportTag{Tracks: []ra.ExportTrack{{Src: "https://x/sc-ja.vtt", SrcLang: "ja", Label: "jp.srt", Kind: "subtitles"}}}
+	// Audio only: audioProbe also ships an embedded English subtitle, which
+	// would play beside the offer (offeredDefault) -- "no other track" has
+	// to mean no English one either.
+	audio := probeWith(`[{"codec_type":"audio","codec_name":"aac","tags":{"language":"jpn"}}]`)
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{FallbackLangTag: language.English}, audio, tag, nil, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	if d := defaultID(items); d != "none" {
+		t.Fatalf("default=%s want none", d)
+	}
+	tr := byID(items)["tr-pt"]
+	if !tr.Offered {
+		t.Fatalf("the offer is what the picker has to show: %+v", tr)
+	}
+}
+
+// TestOffSuggestionNeverOffersTheTranslation: the rung that used to hand an
+// unlocked AI item to the switch is gone. Turning subtitles on must not
+// spend tokens; only a chip the viewer clicks, or one they chose earlier in
+// this session (already translated, hence free), may start one.
+func TestOffSuggestionNeverOffersTheTranslation(t *testing.T) {
+	// Saved off, audio in the viewer's language (so the ladder's own answer
+	// is "no subtitles" and it marks nothing), and an English sidecar whose
+	// absolute URL lets the AI item exist and be unlocked.
+	tag := &ra.ExportTag{Tracks: []ra.ExportTrack{{Src: "https://x/sc-en.vtt", SrcLang: "en", Label: "en.srt", Kind: "subtitles"}}}
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{SubtitleID: "none"}, audioProbe("por"), tag, nil, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	// Fixture guard: a test that finds no AI item would pass for the wrong
+	// reason — there would be nothing to refuse.
+	tr, ok := byID(items)["tr-pt"]
+	if !ok || tr.Locked {
+		t.Fatalf("fixture must produce an unlocked AI item, got %+v", tr)
+	}
+	if s := suggestedID(t, items); s == "tr-pt" {
+		t.Fatal("the switch must never promise to start a translation")
+	}
+}
+
+// TestOfferedAndSuggestedAreDifferentSlots pins the split (owner review,
+// 2026-09-16): the AI chip the ladder would have chosen is Offered -- an
+// action the viewer may take -- and it must not consume the slot that says
+// what the subtitles switch restores. Both can be true of one list, of two
+// different items, and they are drawn differently.
+//
+// Fixture: Japanese audio, Portuguese viewer, one forced Portuguese
+// sidecar (never a full track, so the ladder does not turn it on) and a
+// Japanese sidecar to translate from. Japanese and not English since
+// 2026-09-28: an English track would play beside the offer
+// (offeredDefault), and subtitles would not be off at all.
+func TestOfferedAndSuggestedAreDifferentSlots(t *testing.T) {
+	tag := &ra.ExportTag{Tracks: []ra.ExportTrack{
+		{Src: "https://x/sc-ja.vtt", SrcLang: "ja", Label: "Movie.ja.srt", Kind: "subtitles"},
+		{Src: "https://x/sc-pt.vtt", SrcLang: "pt", Label: "Movie.pt.forced.srt", Kind: "subtitles"},
+	}}
+	audio := probeWith(`[{"codec_type":"audio","codec_name":"aac","tags":{"language":"jpn"}}]`)
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{FallbackLangTag: language.English}, audio, tag, nil, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	got := byID(items)
+
+	forced := got["et-2"]
+	if !forced.Forced {
+		t.Fatalf("fixture must produce a forced pt track, got %+v", forced)
+	}
+	tr, ok := got["tr-pt"]
+	if !ok || tr.Locked {
+		t.Fatalf("fixture must produce an unlocked AI item, got %+v", tr)
+	}
+
+	if !tr.Offered || tr.Suggested || tr.Default {
+		t.Errorf("the AI item is an offer and nothing else: offered=%v suggested=%v default=%v", tr.Offered, tr.Suggested, tr.Default)
+	}
+	// Subtitles are off (a forced track is not what the ladder turns on when
+	// the audio is foreign), so the switch needs something to restore -- and
+	// the forced track in the viewer's own language is it.
+	if d := defaultID(items); d != "none" {
+		t.Fatalf("default=%s want none", d)
+	}
+	if s := suggestedID(t, items); s != "et-2" {
+		t.Errorf("suggested=%s want et-2: the switch restores the forced track, not the offer", s)
+	}
+	if forced.Offered {
+		t.Error("only a translation is ever Offered")
+	}
+}
+
+// TestOfferedIsNeverLocked: a free viewer cannot run the translation, so it
+// is not an action on offer -- the chip keeps its old shape (name + lock +
+// CTA), which TestStreamVideoRendersTranslateBadgesAndCTA pins in markup.
+func TestOfferedIsNeverLocked(t *testing.T) {
+	tag, os := humanTracks()
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{FallbackLangTag: language.English}, audioProbe("eng"), tag, os, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: false})
+	tr := byID(items)["tr-pt"]
+	if !tr.Locked {
+		t.Fatalf("fixture must produce a locked AI item, got %+v", tr)
+	}
+	if tr.Offered {
+		t.Error("a locked translation is not an offer")
+	}
+}
+
+// TestSavedTranslationIsPlayingNotOffered: the viewer chose the
+// translation in an earlier session, so this page is playing it -- an
+// offer to start what is already on screen is nonsense, and the chip must
+// read as a track (name + progress), not as a verb.
+//
+// The property holds through applyLadder's ordering (the saved-choice
+// branch returns before anything is offered) and is written down in
+// markOffered; this test is what would catch a reordering.
+func TestSavedTranslationIsPlayingNotOffered(t *testing.T) {
+	tag := &ra.ExportTag{Tracks: []ra.ExportTrack{{Src: "https://x/sc-en.vtt", SrcLang: "en", Label: "en.srt", Kind: "subtitles"}}}
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{SubtitleID: "tr-pt"}, audioProbe("jpn"), tag, nil, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	tr := byID(items)["tr-pt"]
+	if !tr.Default || !tr.Saved {
+		t.Fatalf("the saved translation must be the one playing: %+v", tr)
+	}
+	if tr.Offered {
+		t.Error("what is playing is never on offer")
+	}
+	for _, it := range items {
+		if it.Offered && it.Default {
+			t.Errorf("%s is both playing and on offer", it.ID)
+		}
+	}
+}
+
+// TestGetSubtitlesEmbeddedGetsPlaylistSrcInSession: inside a transcoder
+// session, an embedded (MediaProbe) track's Src is the session's own
+// s<N>.m3u8 playlist -- the same variant hls.js plays -- so it can feed
+// pickTranslationSource. Outside a session (native MP4 path,
+// HLSSessionBase empty) it stays Src-less, as before.
+func TestGetSubtitlesEmbeddedGetsPlaylistSrcInSession(t *testing.T) {
+	h := NewHelper()
+	mp := probeWith(`[
+		{"codec_type":"video","codec_name":"h264"},
+		{"codec_type":"subtitle","codec_name":"hdmv_pgs_subtitle"},
+		{"codec_type":"subtitle","codec_name":"dvd_subtitle"},
+		{"codec_type":"subtitle","codec_name":"subrip","tags":{"language":"rus","title":"Full"}}
+	]`)
+	opts := SubtitleOpts{PreferredLang: "pt", HLSSessionBase: "https://edge.example/h/a.mkv~hls/session/0123456789abcdef0123456789abcdef?api-key=K&token=T"}
+	lis := h.GetSubtitles(&models.VideoStreamUserData{}, mp, &ra.ExportTag{}, nil, &models.ExternalData{}, nil, opts)
+	var emb *ListItem
+	for i := range lis {
+		if lis[i].Provider == "MediaProbe" {
+			emb = &lis[i]
+		}
+	}
+	if emb == nil || emb.MPID != "1" {
+		t.Fatalf("embedded item: %+v", emb)
+	}
+	if want := "https://edge.example/h/a.mkv~hls/session/0123456789abcdef0123456789abcdef/s1.m3u8?api-key=K&token=T"; emb.Src != want {
+		t.Fatalf("src=%q want %q", emb.Src, want)
+	}
+	// Negative control: no session -> no Src (native MP4 path).
+	lis = h.GetSubtitles(&models.VideoStreamUserData{}, mp, &ra.ExportTag{}, nil, &models.ExternalData{}, nil, SubtitleOpts{PreferredLang: "pt"})
+	for _, li := range lis {
+		if li.Provider == "MediaProbe" && li.Src != "" {
+			t.Fatalf("Src without a session: %q", li.Src)
+		}
+	}
+}
+
+// TestLadderTranslationFromEmbeddedTrack: an embedded track carrying a
+// session playlist Src (see above) is a valid translation source -- the
+// pickTranslationSource guard against MediaProbe was only ever about
+// having no URL, not about the provider itself.
+func TestLadderTranslationFromEmbeddedTrack(t *testing.T) {
+	lis := []ListItem{
+		{ID: "none", Kind: "subtitles"},
+		{ID: "mp-0", MPID: "0", Provider: "MediaProbe", Kind: "subtitles", SrcLang: "rus", Badge: "embedded",
+			Src: "https://edge.example/h/a.mkv~hls/session/0123456789abcdef0123456789abcdef/s0.m3u8?token=T"},
+	}
+	h := NewHelper()
+	out := h.applyLadder(lis, &models.VideoStreamUserData{}, "rus", SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	tr, ok := byID(out)["tr-pt"]
+	if !ok || tr.SourceBadge != "embedded" || tr.SourceID != "mp-0" {
+		t.Fatalf("translated item: %+v", tr)
+	}
+	if want := "https://edge.example/h/a.mkv~hls/session/0123456789abcdef0123456789abcdef/s0.m3u8~tr:pt/s0.vtt?token=T"; tr.Src != want {
+		t.Fatalf("src=%q want %q", tr.Src, want)
+	}
+	// Negative control: an embedded track without Src is still no source.
+	lis[1].Src = ""
+	if _, ok := byID(h.applyLadder(lis, &models.VideoStreamUserData{}, "rus", SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true}))["tr-pt"]; ok {
+		t.Fatal("Src-less embedded track became a source")
+	}
+}
+
+// matchLang used to build language.NewMatcher's supported list by ranging a
+// map. The matcher breaks a tie by position in that list, so two candidates
+// equally distant from the request (es-AR / es-CL / es-CO against
+// Accept: es-MX) came back in whatever order the runtime felt like: 74/13/12
+// over 3000 draws on x/text v0.41.0. That is reachable with regional MKV
+// language tags and uploads named movie.es-MX.srt, and the template makes it
+// worse by running the ladder twice per render -- the <track default> and the
+// picker's own check could land on different tracks.
+//
+// 200 iterations rather than one, because a single run of a randomized map
+// passes 74% of the time.
+func TestMatchLangIsDeterministicAcrossRegionalTies(t *testing.T) {
+	h := NewHelper()
+	lis := []ListItem{
+		{ID: "none", Kind: "subtitles"},
+		{ID: "os-ar", SrcLang: "es-AR", Kind: "subtitles"},
+		{ID: "os-cl", SrcLang: "es-CL", Kind: "subtitles"},
+		{ID: "os-co", SrcLang: "es-CO", Kind: "subtitles"},
+	}
+	accept, _, err := language.ParseAcceptLanguage("es-MX")
+	if err != nil {
+		t.Fatalf("ParseAcceptLanguage: %v", err)
+	}
+	ud := &models.VideoStreamUserData{AcceptLangTags: accept, FallbackLangTag: language.English}
+	want, err := h.matchLang(lis, ud)
+	if err != nil {
+		t.Fatalf("matchLang: %v", err)
+	}
+	// The first candidate on the list, i.e. the earliest on the ladder --
+	// the tie-break the rest of this file already uses.
+	if lis[want].ID != "os-ar" {
+		t.Errorf("tie went to %q, want the first listed candidate os-ar", lis[want].ID)
+	}
+	for i := 0; i < 200; i++ {
+		got, err := h.matchLang(lis, ud)
+		if err != nil {
+			t.Fatalf("iteration %d: %v", i, err)
+		}
+		if got != want {
+			t.Fatalf("iteration %d picked %q, first run picked %q", i, lis[got].ID, lis[want].ID)
+		}
+	}
+}
+
+// GetSubtitles is bound into the templates by reflection and called with
+// whatever the export response carried. sc.ExportTag comes straight from
+// exportResponse.ExportItems["stream"].Tag and ExternalData from the embed,
+// so either can be nil -- and a nil dereference inside a template func is
+// re-panicked by text/template rather than wrapped, which surfaces as a 500
+// with no route context.
+func TestGetSubtitlesSurvivesNilExportTagAndExternalData(t *testing.T) {
+	ud := &models.VideoStreamUserData{AcceptLangTags: []language.Tag{language.English}, FallbackLangTag: language.English}
+	items := NewHelper().GetSubtitles(ud, nil, nil, nil, nil, nil, SubtitleOpts{})
+	if len(items) != 1 || items[0].ID != "none" {
+		t.Fatalf("want just the None entry, got %v", items)
+	}
+}
+
+// srcItem is one translation-source candidate: everything
+// pickTranslationSource reads and nothing else.
+func srcItem(id, provider, lang, src, source string) ListItem {
+	return ListItem{ID: id, Provider: provider, SrcLang: lang, Src: src, Source: source,
+		Kind: "subtitles", Badge: badgeFor(provider, false)}
+}
+
+// TestPickTranslationSourcePrefersAFileOverTheLivePlaylist pins the owner's
+// 2026-09-16 ruling as narrowed on 2026-09-18: WITHIN one language tier
+// (audio language, then English, then any) a file source beats the embedded
+// live playlist, which costs a transcoder session for the length of the film
+// and caches a final artifact only for a contiguous run from 0. The tier
+// itself is decided first: an embedded track in the audio language or in
+// English beats a file in some third language.
+func TestPickTranslationSourcePrefersAFileOverTheLivePlaylist(t *testing.T) {
+	embedded := srcItem("mp-0", "MediaProbe", "rus", "https://edge/s0.m3u8", "")
+	for _, c := range []struct {
+		name  string
+		lis   []ListItem
+		audio string
+		want  string
+	}{
+		{
+			// Same language, and the embedded one is appended first: the
+			// case that used to answer "mp-0".
+			name:  "file and embedded in the audio language",
+			lis:   []ListItem{{ID: "none", Kind: "subtitles"}, embedded, srcItem("os-1", "OpenSubtitles", "rus", "https://x/os.vtt", "hash")},
+			audio: "ru",
+			want:  "os-1",
+		},
+		{
+			// The language is picked before the bucket is: the original
+			// in the file beats a translation beside it, live playlist or
+			// not. (Until 2026-09-18 this answered "et-1".)
+			name:  "embedded in the audio language beats a file in another",
+			lis:   []ListItem{{ID: "none", Kind: "subtitles"}, embedded, srcItem("et-1", "ExportTag", "fra", "https://x/fr.vtt", "")},
+			audio: "ru",
+			want:  "mp-0",
+		},
+		{
+			// The case that prompted the change: English audio, English
+			// embedded, and only Croatian/Czech/Romanian hash matches.
+			name: "embedded English beats third-language hash matches",
+			lis: []ListItem{{ID: "none", Kind: "subtitles"},
+				srcItem("mp-0", "MediaProbe", "eng", "https://edge/s0.m3u8", ""),
+				srcItem("os-hr", "OpenSubtitles", "hrv", "https://x/hr.vtt", "hash"),
+				srcItem("os-cs", "OpenSubtitles", "cze", "https://x/cs.vtt", "hash")},
+			audio: "en",
+			want:  "mp-0",
+		},
+		{
+			// Unknown audio, English embedded: the English tier, same answer.
+			name: "embedded English beats a third-language file with unknown audio",
+			lis: []ListItem{{ID: "none", Kind: "subtitles"},
+				srcItem("mp-0", "MediaProbe", "eng", "https://edge/s0.m3u8", ""),
+				srcItem("os-hr", "OpenSubtitles", "hrv", "https://x/hr.vtt", "hash")},
+			audio: "",
+			want:  "mp-0",
+		},
+		{
+			// A file in English against an embedded track in the audio
+			// language: the audio tier comes first, so the embedded wins.
+			name: "embedded audio language beats an English file",
+			lis: []ListItem{{ID: "none", Kind: "subtitles"}, embedded,
+				srcItem("os-en", "OpenSubtitles", "eng", "https://x/en.vtt", "hash")},
+			audio: "ru",
+			want:  "mp-0",
+		},
+		{
+			// Neither side is in the audio language or in English: the
+			// tier is a tie, and there the cost argument decides -- file.
+			name: "third language on both sides: the file",
+			lis: []ListItem{{ID: "none", Kind: "subtitles"},
+				srcItem("mp-0", "MediaProbe", "ger", "https://edge/s0.m3u8", ""),
+				srcItem("os-hr", "OpenSubtitles", "hrv", "https://x/hr.vtt", "hash")},
+			audio: "ja",
+			want:  "os-hr",
+		},
+		{
+			name:  "embedded only",
+			lis:   []ListItem{{ID: "none", Kind: "subtitles"}, embedded},
+			audio: "ru",
+			want:  "mp-0",
+		},
+		{
+			// A session-less embedded track has no Src and is no source at
+			// all, so this list has nothing to translate.
+			name:  "embedded without a session src",
+			lis:   []ListItem{{ID: "none", Kind: "subtitles"}, srcItem("mp-0", "MediaProbe", "rus", "", "")},
+			audio: "ru",
+			want:  "",
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got := pickTranslationSource(c.lis, c.audio)
+			id := ""
+			if got != nil {
+				id = got.ID
+			}
+			if id != c.want {
+				t.Fatalf("source=%q want %q", id, c.want)
+			}
+		})
+	}
+}
+
+// TestPickTranslationSourceOrdersEqualFileSources: within one language the
+// order is the viewer's own upload, then a sidecar from the torrent, then a
+// hash-matched OpenSubtitles track, then an imdb-matched one. The hash
+// match fits the timing to this very file but says nothing about the text,
+// and community uploads routinely carry injected ad cues (owner ruling
+// 2026-09-17, after Sintel's hash match turned out to be mostly ads);
+// still not ladderRank, which ranks both OpenSubtitles rungs below the
+// sidecar for reading.
+func TestPickTranslationSourceOrdersEqualFileSources(t *testing.T) {
+	// Appended in the order GetSubtitles uses, so a "first wins" rule would
+	// answer et-1 every time.
+	all := []ListItem{
+		{ID: "none", Kind: "subtitles"},
+		srcItem("et-1", "ExportTag", "rus", "https://x/sc.vtt", ""),
+		srcItem("os-imdb", "OpenSubtitles", "rus", "https://x/oi.vtt", "imdb"),
+		srcItem("os-hash", "OpenSubtitles", "rus", "https://x/oh.vtt", "hash"),
+		srcItem("us-1", "UserSubtitle", "rus", "https://x/my.vtt", ""),
+	}
+	for i, want := range []string{"us-1", "et-1", "os-hash", "os-imdb"} {
+		// Drop the winners one by one: each remaining list must answer the
+		// next rung down.
+		lis := append([]ListItem{}, all...)
+		for _, gone := range []string{"us-1", "et-1", "os-hash", "os-imdb"}[:i] {
+			for j := range lis {
+				if lis[j].ID == gone {
+					lis = append(lis[:j], lis[j+1:]...)
+					break
+				}
+			}
+		}
+		got := pickTranslationSource(lis, "ru")
+		if got == nil || got.ID != want {
+			t.Fatalf("rung %d: got %+v want %q", i, got, want)
+		}
+	}
+}
+
+// TestPickTranslationSourceKeepsTheLanguagePreference is the negative
+// control for the bucket rule: inside the file bucket the language order is
+// unchanged (audio language, then English, then any), so the new rule can
+// only be seen to reorder buckets and not languages.
+func TestPickTranslationSourceKeepsTheLanguagePreference(t *testing.T) {
+	lis := []ListItem{
+		{ID: "none", Kind: "subtitles"},
+		srcItem("os-fr", "OpenSubtitles", "fra", "https://x/fr.vtt", "hash"),
+		srcItem("os-en", "OpenSubtitles", "eng", "https://x/en.vtt", "imdb"),
+		srcItem("et-ru", "ExportTag", "rus", "https://x/ru.vtt", ""),
+	}
+	// Audio language wins even from the worst rung of the file order.
+	if got := pickTranslationSource(lis, "en"); got == nil || got.ID != "os-en" {
+		t.Fatalf("audio language: %+v", got)
+	}
+	// No track in the audio language: English next, whatever its rank.
+	if got := pickTranslationSource(lis, "de"); got == nil || got.ID != "os-en" {
+		t.Fatalf("english fallback: %+v", got)
+	}
+	// Neither the audio language nor English is present: the best-ranked
+	// of what is left, in list order for ties — and since 2026-09-17 the
+	// sidecar is the best-ranked file rung after an upload.
+	noEnglish := []ListItem{lis[0], lis[1], lis[3]}
+	if got := pickTranslationSource(noEnglish, "de"); got == nil || got.ID != "et-ru" {
+		t.Fatalf("any: %+v", got)
+	}
+}
+
+// TestLadderTranslationPrefersTheUploadOverTheLivePlaylist is the same rule
+// through applyLadder, where it is visible to the viewer: the AI chip says
+// "· from MY", not "· from EM", and the URL is built on the upload.
+func TestLadderTranslationPrefersTheUploadOverTheLivePlaylist(t *testing.T) {
+	lis := []ListItem{
+		{ID: "none", Kind: "subtitles"},
+		srcItem("mp-0", "MediaProbe", "rus", "https://edge/h/a.mkv~hls/session/x/s0.m3u8?token=T", ""),
+		srcItem("us-1", "UserSubtitle", "rus", "https://edge/ext/my.srt~vtt?token=T", ""),
+	}
+	out := NewHelper().applyLadder(lis, &models.VideoStreamUserData{}, "ru",
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	tr, ok := byID(out)["tr-pt"]
+	if !ok {
+		t.Fatal("no translated item")
+	}
+	if tr.SourceBadge != "user" || tr.SourceID != "us-1" {
+		t.Fatalf("source badge=%q id=%q, want the upload", tr.SourceBadge, tr.SourceID)
+	}
+	if want := "https://edge/ext/my.srt~vtt~tr:pt/my.vtt?token=T"; tr.Src != want {
+		t.Fatalf("src=%q want %q", tr.Src, want)
+	}
+}
+
+// TestLadderRankReadsTheMovieHashBool: video-info reports moviehash_match
+// alongside the source enum since 2026-09-16, and the bool is the ground
+// truth the enum is derived from. The ladder reads it where it exists and
+// falls back to the enum where it does not -- an older video-info sends only
+// the enum, and a deployment mixing the two must not reshuffle the ladder.
+// Rank 4 for an imdb match is unchanged either way.
+func TestLadderRankReadsTheMovieHashBool(t *testing.T) {
+	yes, no := true, false
+	for _, c := range []struct {
+		name string
+		li   ListItem
+		want int
+	}{
+		{"bool true", ListItem{Provider: "OpenSubtitles", MovieHashMatch: &yes}, 3},
+		{"bool false", ListItem{Provider: "OpenSubtitles", MovieHashMatch: &no}, 4},
+		{"enum only, hash", ListItem{Provider: "OpenSubtitles", Source: "hash"}, 3},
+		{"enum only, imdb", ListItem{Provider: "OpenSubtitles", Source: "imdb"}, 4},
+		{"neither", ListItem{Provider: "OpenSubtitles"}, 4},
+		// The bool wins: a service that disagrees with itself is answered
+		// from the field that is not derived.
+		{"bool false over enum hash", ListItem{Provider: "OpenSubtitles", Source: "hash", MovieHashMatch: &no}, 4},
+		{"bool true over enum imdb", ListItem{Provider: "OpenSubtitles", Source: "imdb", MovieHashMatch: &yes}, 3},
+	} {
+		if got := ladderRank(c.li); got != c.want {
+			t.Errorf("%s: rank=%d want %d", c.name, got, c.want)
+		}
+	}
+
+	// And the same bool decides the translation order: a hash match
+	// outranks an imdb match (translationSourceRank), though since
+	// 2026-09-17 both rank below the sidecar.
+	lis := []ListItem{
+		{ID: "none", Kind: "subtitles"},
+		{ID: "os-imdb", Provider: "OpenSubtitles", SrcLang: "rus", Src: "https://x/oi.vtt", Kind: "subtitles", MovieHashMatch: &no},
+		{ID: "os-1", Provider: "OpenSubtitles", SrcLang: "rus", Src: "https://x/os.vtt", Kind: "subtitles", MovieHashMatch: &yes},
+	}
+	if got := pickTranslationSource(lis, "ru"); got == nil || got.ID != "os-1" {
+		t.Fatalf("hash match by bool must beat the imdb match: %+v", got)
+	}
+	lis[2].MovieHashMatch = &no
+	if got := pickTranslationSource(lis, "ru"); got == nil || got.ID != "os-imdb" {
+		t.Fatalf("both by bool imdb: list order keeps the first: %+v", got)
+	}
+}
+
+// TestGetSubtitlesCarriesTheMovieHashBool: the field survives the mapping
+// from the api track to the list item -- without that every OpenSubtitles
+// item would read as "origin unknown" and fall back to the enum forever.
+func TestGetSubtitlesCarriesTheMovieHashBool(t *testing.T) {
+	yes := true
+	os := []api.OpenSubtitleTrack{
+		{ID: "1", Source: "imdb", MovieHashMatch: &yes,
+			ExportTrack: &ra.ExportTrack{Src: "https://x/os.vtt", SrcLang: "en", Label: "English", Kind: "subtitles"}},
+		{ID: "2", Source: "imdb",
+			ExportTrack: &ra.ExportTrack{Src: "https://x/os2.vtt", SrcLang: "de", Label: "German", Kind: "subtitles"}},
+	}
+	got := byID(NewHelper().GetSubtitles(&models.VideoStreamUserData{}, nil, nil, os, &models.ExternalData{}, nil, SubtitleOpts{}))
+	if m := got["os-1"].MovieHashMatch; m == nil || !*m {
+		t.Errorf("os-1 moviehash=%v, want true", m)
+	}
+	if got["os-1"].Rank != 3 {
+		t.Errorf("os-1 rank=%d, want 3: the bool contradicts the enum and wins", got["os-1"].Rank)
+	}
+	if got["os-2"].MovieHashMatch != nil {
+		t.Errorf("os-2 moviehash=%v, want nil: the service said nothing", got["os-2"].MovieHashMatch)
+	}
+	if got["os-2"].Rank != 4 {
+		t.Errorf("os-2 rank=%d, want 4", got["os-2"].Rank)
+	}
+}
+
+// TestUpsellMarksTheLockedTranslationTheLadderWouldOffer: the free account's
+// side of Offered. Same fixture as TestOfferedIsNeverLocked -- English audio,
+// Portuguese viewer, no Portuguese track -- so the ladder's answer for a
+// paying viewer is the translation, and the locked item says so.
+func TestUpsellMarksTheLockedTranslationTheLadderWouldOffer(t *testing.T) {
+	tag, os := humanTracks()
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{FallbackLangTag: language.English}, audioProbe("eng"), tag, os, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: false})
+	tr := byID(items)["tr-pt"]
+	if !tr.Locked {
+		t.Fatalf("fixture must produce a locked AI item, got %+v", tr)
+	}
+	if !tr.Upsell || tr.Offered {
+		t.Fatalf("locked and wanted is an upsell, never an offer: upsell=%v offered=%v", tr.Upsell, tr.Offered)
+	}
+	// The phase-1 selection still decides what plays.
+	if d := defaultID(items); d != "mp-0" {
+		t.Fatalf("default=%s want mp-0", d)
+	}
+}
+
+// TestUpsellNotMarkedWhenAudioIsInThePreferredLanguage: the locked item is
+// still in the list (Locked does not know about the audio), but nobody needs
+// subtitles here, so nothing is pitched on screen.
+func TestUpsellNotMarkedWhenAudioIsInThePreferredLanguage(t *testing.T) {
+	tag, os := humanTracks()
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{FallbackLangTag: language.English}, audioProbe("por"), tag, os, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: false})
+	tr, ok := byID(items)["tr-pt"]
+	if !ok || !tr.Locked {
+		t.Fatalf("fixture must still produce the locked AI item, got %+v", tr)
+	}
+	if tr.Upsell {
+		t.Fatal("audio already in the viewer's language: no upsell")
+	}
+}
+
+// TestUpsellIsNeverSetOnAnUnlockedTranslation: a paying viewer gets Offered.
+func TestUpsellIsNeverSetOnAnUnlockedTranslation(t *testing.T) {
+	tag, os := humanTracks()
+	items := NewHelper().GetSubtitles(&models.VideoStreamUserData{FallbackLangTag: language.English}, audioProbe("eng"), tag, os, &models.ExternalData{}, nil,
+		SubtitleOpts{PreferredLang: "pt", Translate: true, Paid: true})
+	tr := byID(items)["tr-pt"]
+	if !tr.Offered || tr.Upsell {
+		t.Fatalf("offered=%v upsell=%v", tr.Offered, tr.Upsell)
+	}
+}
+
+// One language for audio and subtitles (owner, 2026-09-19): the default
+// audio track follows the viewer's preferred language, and only then the
+// browser's Accept-Language list.
+func TestAudioDefaultFollowsThePreferredLanguage(t *testing.T) {
+	mp := probeWith(`[
+		{"codec_type":"audio","codec_name":"aac","tags":{"language":"eng"}},
+		{"codec_type":"audio","codec_name":"aac","tags":{"language":"rus"}},
+		{"codec_type":"audio","codec_name":"aac","tags":{"language":"por"}}
+	]`)
+	accept, _, _ := language.ParseAcceptLanguage("pt-BR,pt;q=0.9,en;q=0.8")
+	ud := func(resolved string) *models.VideoStreamUserData {
+		return &models.VideoStreamUserData{AcceptLangTags: accept, FallbackLangTag: language.English, ResolvedLang: resolved}
+	}
+	// Nothing resolved (an embed, the feature off): the browser, as before.
+	if got := defaultID(NewHelper().GetAudioTracks(ud(""), mp)); got != "mp-2" {
+		t.Fatalf("no preferred language: want the browser's Portuguese (mp-2), got %s", got)
+	}
+	// The profile says Russian under a Portuguese browser.
+	if got := defaultID(NewHelper().GetAudioTracks(ud("ru"), mp)); got != "mp-1" {
+		t.Fatalf("preferred ru: want the Russian track (mp-1), got %s", got)
+	}
+	// No track in the preferred language: the browser's list decides next.
+	if got := defaultID(NewHelper().GetAudioTracks(ud("kk"), mp)); got != "mp-2" {
+		t.Fatalf("preferred kk, no such audio: want the browser's Portuguese (mp-2), got %s", got)
+	}
+	// The viewer's saved choice still outranks all of it.
+	saved := ud("ru")
+	saved.AudioID = "mp-0"
+	if got := defaultID(NewHelper().GetAudioTracks(saved, mp)); got != "mp-0" {
+		t.Fatalf("a saved audio choice wins: got %s", got)
+	}
+}

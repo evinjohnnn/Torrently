@@ -1,0 +1,10 @@
+{
+  "input": "[HorribleSubs] Detective Conan - 862 [1080p].mkv",
+  "want": {
+    "title": "Detective Conan",
+    "episode": 862,
+    "resolution": "1080p",
+    "container": "mkv",
+    "website": "HorribleSubs"
+  }
+}

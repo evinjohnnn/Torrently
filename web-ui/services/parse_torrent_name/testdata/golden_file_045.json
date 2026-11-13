@@ -1,0 +1,12 @@
+{
+  "input": "Dracula.Untold.2014.TS.XViD.AC3.MrSeeN-SiMPLE",
+  "want": {
+    "title": "Dracula Untold",
+    "year": 2014,
+    "quality": "TS",
+    "codec": "xvid",
+    "audio": "AC3",
+    "group": "SiMPLE",
+    "extra": "MrSeeN"
+  }
+}

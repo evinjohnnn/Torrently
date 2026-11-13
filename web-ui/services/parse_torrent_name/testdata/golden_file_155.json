@@ -1,0 +1,9 @@
+{
+  "input": "10bit.sicario.sample.mkv",
+  "want": {
+    "title": "sicario",
+    "color_depth": "10bit",
+    "container": "mkv",
+    "sample": true
+  }
+}

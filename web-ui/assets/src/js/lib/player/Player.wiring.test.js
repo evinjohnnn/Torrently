@@ -1,0 +1,7895 @@
+// The picker wiring, against the markup Go actually emits.
+//
+// Player.jsx was the one file `node --test` could not see: it is JSX, and
+// the suite had nothing to parse it with. Everything in here used to be a
+// by-hand step in the stage checklist. Three pieces make it runnable:
+//
+//   - assets/src/js/test/jsx-hooks.mjs transpiles .jsx with the repo's own
+//     babel config (wired into `npm test` as --import);
+//   - jsdom gives a real DOM, so `closest`, delegation, `hidden` and
+//     attribute reads behave the way they do in a browser rather than the
+//     way a stand-in was written to;
+//   - __fixtures__/subtitles-dialog.html is the dialog rendered by
+//     services/template/subtitles_dialog_fixture_test.go. A hand-written
+//     fixture drifts from the template in silence, and a wiring test that
+//     passes against markup the server stopped producing is worse than no
+//     test at all. That Go test fails when the two disagree and prints how
+//     to regenerate.
+//
+// What is NOT faked: the DOM, the delegation, track-picker.js, the pure
+// rules. What is: `fetch` (every test asserts on the calls), `window.umami`
+// (the events are the assertion), and `video.textTracks`, which jsdom does
+// not implement — a small live view over the <track> elements, so
+// activateSubtitle's mode writes are observable.
+
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import { JSDOM } from 'jsdom';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const DIALOG = readFileSync(path.join(HERE, '__fixtures__/subtitles-dialog.html'), 'utf8');
+
+// One jsdom for the file, rebuilt per test. The globals have to exist
+// before Player.jsx is imported: hls-manager.js reads navigator.userAgent
+// at module scope, and lib/i18n.js reads __SUPPORTED_LOCALES__ (webpack's
+// DefinePlugin supplies it in a build).
+const dom = new JSDOM('<!doctype html><html><body></body></html>', {
+    url: 'https://webtor.io/res?file=movie.mkv',
+    pretendToBeVisual: true,
+});
+globalThis.window = dom.window;
+globalThis.document = dom.window.document;
+// Node 21+ has its own read-only `navigator`, and hls-manager.js reads
+// userAgent/platform off it at module scope. defineProperty, not
+// assignment.
+Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: dom.window.navigator,
+});
+globalThis.HTMLElement = dom.window.HTMLElement;
+globalThis.CustomEvent = dom.window.CustomEvent;
+globalThis.Event = dom.window.Event;
+globalThis.requestAnimationFrame = dom.window.requestAnimationFrame.bind(dom.window);
+// preact's hook scheduler pairs the two, and jsdom only exposes them on its
+// own window.
+globalThis.cancelAnimationFrame = dom.window.cancelAnimationFrame.bind(dom.window);
+globalThis.MouseEvent = dom.window.MouseEvent;
+globalThis.__SUPPORTED_LOCALES__ = ['en'];
+// jsdom has no requestIdleCallback, and the codec-support report waits for
+// one (2 s without it). A prompt stand-in keeps a report inside the test
+// whose `playing` caused it, instead of landing in a later test's events.
+dom.window.requestIdleCallback = (fn) => setTimeout(fn, 0);
+
+// The one media API these tests need and jsdom does not implement, taught
+// to the prototypes so every <track> in the document has it — including the
+// ones activateSubtitle creates on first selection.
+//
+// Both halves matter and they are not the same object in the browser
+// either: activateSubtitle writes modes through video.textTracks, while
+// dropDeletedTracks reads el.track.mode off the element. They share one
+// per-element store here, so a mode written through either is seen through
+// both. `default` seeds "showing", as a browser does.
+const trackModes = new WeakMap();
+// Cues, per element, for the tests that are about cue times (the session
+// offset). Empty unless a test puts some in; `addCue` is what the reload's
+// cue restore calls.
+const trackCues = new WeakMap();
+const cuesOf = (el) => {
+    if (!trackCues.has(el)) trackCues.set(el, []);
+    return trackCues.get(el);
+};
+Object.defineProperty(dom.window.HTMLTrackElement.prototype, 'track', {
+    configurable: true,
+    get() {
+        const el = this;
+        return {
+            get id() { return el.id; },
+            get mode() {
+                if (trackModes.has(el)) return trackModes.get(el);
+                return el.hasAttribute('default') ? 'showing' : 'disabled';
+            },
+            set mode(v) { trackModes.set(el, v); },
+            get cues() { return cuesOf(el); },
+            addCue(c) { cuesOf(el).push(c); },
+        };
+    },
+});
+Object.defineProperty(dom.window.HTMLMediaElement.prototype, 'textTracks', {
+    configurable: true,
+    get() { return Array.from(this.querySelectorAll('track')).map((el) => el.track); },
+});
+
+// jsdom implements no playback: `paused` is a getter that is always true,
+// and play()/pause() do nothing. Made settable here (defaulting to true,
+// the value jsdom reports) so a test can put the element in the state a
+// browser would be in when it fires `play` or `pause` — the events
+// themselves are dispatched by hand for the same reason.
+const pausedState = new WeakMap();
+Object.defineProperty(dom.window.HTMLMediaElement.prototype, 'paused', {
+    configurable: true,
+    get() { return pausedState.has(this) ? pausedState.get(this) : true; },
+    set(v) { pausedState.set(this, !!v); },
+});
+
+const {
+    initPlayer,
+    destroyPlayer,
+    wireTrackHandlers,
+    syncUploadMarks,
+    markTrack,
+    activateSubtitle,
+    findSubtitleItem,
+    PUT_RETRY_DELAY_MS,
+    swapSubtitlesDialog,
+} = await import('./Player.jsx');
+const { readCarry } = await import('./next-item.js');
+// Imported the same way and for the same reason as Player.jsx: hls-manager
+// reads navigator at module scope, so it cannot be a static import above
+// the globals.
+const { Hls, initDefaultTracks } = await import('./hls-manager.js');
+const { createSessionSeeker } = await import('./session-seek.js');
+const { createGraceHold } = await import('./grace-hold.js');
+const { createPlayerActivity } = await import('../playerActivity.js');
+const { catchUpTiming } = await import('./subtitle-catchup.js');
+
+// ---- the harness ----------------------------------------------------
+
+// mount builds the page around the fixture: the dialog as rendered, plus
+// the <video> the player drives and the preloaded <track> elements the
+// server would have written for the tracks marked Preload.
+//
+// `tracks` lists those preloads as [id, showing]. They matter to two
+// paths — dropDeletedTracks (a delete has to take the orphan <track> with
+// it) and syncUploadMarks (what is playing is read off them).
+//
+// `hlsTracks` lists the tracks hls.js makes from the transcoder's manifest,
+// as [label, mode]. In a browser those are created with addTextTrack and
+// have no element behind them; here they are <track>s without an id, which
+// is exactly the property every caller keys on — an id means element-backed
+// and ours, no id means hls.js's.
+function mount({ tracks = [], hlsTracks = [], tag = 'video' } = {}) {
+    document.body.innerHTML = `
+        <div id="page">
+            <${tag} class="player" data-resource-id="res" data-path="movie.mkv">
+                ${tracks.map(([id, showing]) => `<track id="${id}" src="https://x.test/${id}.vtt" srclang="en" label="${id}" kind="subtitles"${showing ? ' default="default"' : ''}>`).join('')}
+                ${hlsTracks.map(([label]) => `<track src="https://x.test/manifest.vtt" srclang="ru" label="${label}" kind="subtitles">`).join('')}
+            </${tag}>
+            ${DIALOG}
+        </div>`;
+    const container = document.getElementById('page');
+    const video = container.querySelector(`${tag}.player`);
+    const hlsTrackEls = Array.from(video.querySelectorAll('track')).filter((el) => !el.id);
+    hlsTracks.forEach(([, mode], i) => { if (mode) hlsTrackEls[i].track.mode = mode; });
+    // A fake left on window by an earlier test would be picked up by the
+    // next mount's activateSubtitle. Cleared before prepare() installs one.
+    window.hlsPlayer = null;
+
+    const calls = [];
+    let respond = () => ({ ok: true, status: 200, headers: new dom.window.Headers() });
+    globalThis.fetch = (url, params) => {
+        calls.push({ url, params, body: params && params.body ? (params.body instanceof dom.window.FormData ? Object.fromEntries(params.body) : JSON.parse(params.body)) : null });
+        return Promise.resolve(respond(url, params, calls.length));
+    };
+    window.fetch = globalThis.fetch;
+    window._CSRF = 'csrf-token';
+
+    const events = [];
+    window.umami = { track: (name, data) => events.push({ name, data }) };
+
+    // The hooks object the mounted component fills in. wireTrackHandlers
+    // only calls through it, so a test that is not about the component's
+    // own state records the calls instead.
+    const hooks = { selected: [], audio: [] };
+    hooks.onSubtitleSelect = (el) => hooks.selected.push(el.getAttribute('data-id'));
+    hooks.onAudioSelect = (el) => hooks.audio.push(el.getAttribute('data-id'));
+
+    const modal = container.querySelector('#subtitles');
+    return {
+        container, video, modal, calls, events, hooks,
+        setResponse: (fn) => { respond = fn; },
+        wire: () => wireTrackHandlers(container, hooks),
+        chip: (id) => findSubtitleItem(modal, id),
+        audioChip: (id) => modal.querySelector(`.audio[data-id="${id}"]`),
+        lang: (code) => modal.querySelector(`.lang[data-lang="${code}"]`),
+        puts: () => calls.filter((c) => String(c.url).startsWith('/stream-video/')),
+        // The two renderers, as the code under test sees them.
+        installHls: (init) => { window.hlsPlayer = makeHls({ video, ...init }); return window.hlsPlayer; },
+        hlsTrack: (i) => hlsTrackEls[i].track,
+        hlsModes: () => hlsTrackEls.map((el) => el.track.mode),
+        mode: (id) => {
+            const t = video.textTracks.find((tt) => tt.id === id);
+            return t ? t.mode : null;
+        },
+    };
+}
+
+// makeHls is hls.js as this code touches it — and, in the two places where
+// hls.js does something back, as hls.js *behaves*. Those two are not an
+// implementation of the library, they are the contract this fix is defined
+// against, and leaving them out is what let a stack-exhausting recursion
+// through the first round of these tests:
+//
+//   - the `subtitleTrack` setter runs a toggleTrackModes pass (hls.js:28415)
+//     — every labeled subtitle track that is not its own current one goes to
+//     'disabled', ours included — and then triggers SUBTITLE_TRACK_SWITCH
+//     *synchronously* (hls.js:28448, and `trigger` is eventemitter3).
+//     setSubtitleTrack has no "already -1" exit, so a write of the value it
+//     already holds does all of this too;
+//   - the `subtitleDisplay` setter toggles modes only while a track is
+//     selected (`if (this.trackId > -1)`, hls.js:28505).
+//
+// What is still driven by hand is hls.js's *asynchronous* half —
+// onTextTracksChanged, which reacts to the browser's textTracks `change`
+// event and is what a test that wants the latch simulates directly.
+function makeHls({ video = null, subtitleTrack = -1, subtitleDisplay = true } = {}) {
+    const listeners = new Map();
+    const writes = [];
+    let t = subtitleTrack;
+    let d = subtitleDisplay;
+    const add = (ev, fn) => listeners.set(ev, [...(listeners.get(ev) || []), fn]);
+    const fire = (ev, data) => { for (const fn of [...(listeners.get(ev) || [])]) fn(ev, data); };
+    // The manifest tracks, as this harness models them: the <track>s with
+    // no id (see mount). Read live — a side-loaded track is created on
+    // first selection, so the list changes under us.
+    const trackEls = () => (video ? Array.from(video.querySelectorAll('track')) : []);
+    const manifestEls = () => trackEls().filter((el) => !el.id);
+    const toggleTrackModes = () => {
+        const current = t >= 0 ? manifestEls()[t] : null;
+        for (const el of trackEls()) {
+            // Labeled only, like filterSubtitleTracks — every track in this
+            // harness is labeled, as every track in the page is.
+            if (el !== current && el.track.mode !== 'disabled') el.track.mode = 'disabled';
+        }
+        if (current) current.track.mode = d ? 'showing' : 'hidden';
+    };
+    return {
+        writes,
+        audioTrack: -1,
+        get subtitleTrack() { return t; },
+        set subtitleTrack(v) {
+            t = v;
+            writes.push(['subtitleTrack', v]);
+            toggleTrackModes();
+            fire(Hls.Events.SUBTITLE_TRACK_SWITCH, { id: v });
+        },
+        get subtitleDisplay() { return d; },
+        set subtitleDisplay(v) {
+            d = v;
+            writes.push(['subtitleDisplay', v]);
+            if (t > -1) toggleTrackModes();
+        },
+        on: add,
+        once: (ev, fn) => {
+            const wrap = (...args) => {
+                listeners.set(ev, (listeners.get(ev) || []).filter((f) => f !== wrap));
+                fn(...args);
+            };
+            wrap.__wrapped = fn;
+            add(ev, wrap);
+        },
+        off: (ev, fn) => listeners.set(ev, (listeners.get(ev) || []).filter((f) => f !== fn && f.__wrapped !== fn)),
+        emit: fire,
+        listenerCount: (ev) => (listeners.get(ev) || []).length,
+        stopLoad: () => {},
+        loadSource: () => {},
+        destroy: () => {},
+    };
+}
+
+// A real click, so the delegation does the work: the listener is on the
+// dialog, not on the chip.
+const click = (el) => el.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true, cancelable: true }));
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+// settle waits past an animation frame: preact's effect scheduler runs
+// there, so anything a mount does asynchronously has happened by now.
+const settle = () => new Promise((resolve) => setTimeout(resolve, 50));
+const active = (el) => el.classList.contains('track-chip-active');
+
+// ---- selecting a track ----------------------------------------------
+
+test('a subtitle click marks the chip and PUTs the choice', async () => {
+    const p = mount();
+    p.wire();
+    const en = p.chip('os-os-en');
+    assert.ok(en, 'the fixture must carry an OpenSubtitles English track');
+
+    click(en);
+    await flush();
+
+    assert.ok(active(en), 'the clicked chip takes the fill');
+    assert.equal(en.getAttribute('aria-checked'), 'true');
+    assert.equal(en.getAttribute('data-default'), 'true');
+    // Exactly one per group: the marker moved, it was not added.
+    assert.equal(p.modal.querySelectorAll('.subtitle[data-default="true"]').length, 1);
+
+    assert.equal(p.puts().length, 1);
+    const put = p.puts()[0];
+    assert.equal(put.url, '/stream-video/subtitle');
+    assert.equal(put.params.method, 'PUT');
+    assert.equal(put.params.headers['X-CSRF-TOKEN'], 'csrf-token');
+    assert.deepEqual(put.body, { id: 'os-os-en', resourceID: 'res', itemID: 'item' });
+
+    // The track was side-loaded on selection rather than shipped in the
+    // page, and its <track label> is the plain name — not the decorated
+    // chip text (the native iOS menu shows this string).
+    const track = p.video.querySelector('track#os-os-en');
+    assert.ok(track, 'a side-loaded track is created on first selection');
+    assert.equal(track.getAttribute('label'), 'Movie.en.srt');
+    assert.equal(p.video.textTracks.find((t) => t.id === 'os-os-en').mode, 'showing');
+
+    assert.deepEqual(p.hooks.selected, ['os-os-en'], 'the component hears a manual choice');
+    assert.ok(p.events.some((e) => e.name === 'subtitle-select'));
+});
+
+test('a click landing on a chip’s inner span still selects the chip', async () => {
+    const p = mount();
+    p.wire();
+    const dub = p.audioChip('mp-1');
+    const inner = dub.querySelector('span');
+    assert.ok(inner, 'the audio chip must have an inner span to click');
+
+    click(inner);
+    await flush();
+
+    assert.equal(dub.getAttribute('data-default'), 'true', 'closest() found the chip, not the span');
+    assert.ok(active(dub));
+    assert.equal(p.audioChip('mp-0').getAttribute('data-default'), null);
+    assert.deepEqual(p.puts().map((c) => c.url), ['/stream-video/audio']);
+    assert.deepEqual(p.puts()[0].body, { id: 'mp-1', resourceID: 'res', itemID: 'item' });
+    assert.deepEqual(p.hooks.audio, ['mp-1']);
+});
+
+// ---- the switch ------------------------------------------------------
+
+test('the switch turns subtitles on with the suggested track, and off again', async () => {
+    const p = mount();
+    p.wire();
+    const toggle = p.modal.querySelector('#subtitles-toggle');
+    assert.equal(p.modal.getAttribute('data-subtitles-off'), 'true', 'the fixture opens with subtitles off');
+
+    // On: the server named what comes back (data-suggested) and nothing
+    // else has been chosen this session.
+    toggle.checked = true;
+    toggle.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+    await flush();
+
+    assert.equal(p.modal.getAttribute('data-subtitles-off'), 'false');
+    assert.equal(p.chip('mp-0').getAttribute('data-default'), 'true');
+    assert.equal(p.chip('none').getAttribute('data-default'), null);
+    assert.equal(p.puts().length, 1, 'one activation, one PUT');
+    assert.deepEqual(p.puts()[0].body.id, 'mp-0');
+
+    // Off: the "None" carrier becomes the default, the outgoing track is
+    // remembered, and the block is muted rather than emptied.
+    toggle.checked = false;
+    toggle.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+    await flush();
+
+    assert.equal(p.modal.getAttribute('data-subtitles-off'), 'true');
+    assert.equal(p.modal.getAttribute('data-last-subtitle'), 'mp-0');
+    assert.equal(p.chip('none').getAttribute('data-default'), 'true');
+    assert.ok(active(p.chip('mp-0')), 'the track that comes back keeps the mark');
+    assert.equal(p.chip('mp-0').getAttribute('aria-checked'), 'true');
+    assert.ok(p.modal.querySelector('#subtitle-tracks').classList.contains('picker-off'));
+    assert.equal(p.chip('os-os-en').getAttribute('aria-disabled'), 'true');
+    assert.equal(p.puts().length, 2);
+    assert.equal(p.puts()[1].body.id, 'none');
+
+    // The "None" carrier never takes the look, however often it is
+    // activated: an invisible chip drawn as the chosen one, in a group
+    // where nothing appears checked, is the worst of both.
+    assert.equal(active(p.chip('none')), false);
+
+    // And back on: the same track, through the session memory this time.
+    toggle.checked = true;
+    toggle.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+    await flush();
+    assert.equal(p.chip('mp-0').getAttribute('data-default'), 'true');
+    assert.equal(p.puts().length, 3);
+});
+
+test('clicking a chip while subtitles are off is one act: on, with that track', async () => {
+    const p = mount();
+    p.wire();
+    assert.equal(p.modal.getAttribute('data-subtitles-off'), 'true');
+
+    click(p.chip('os-os-ru'));
+    await flush();
+
+    assert.equal(p.modal.getAttribute('data-subtitles-off'), 'false', 'the switch follows the activation');
+    assert.equal(p.modal.querySelector('#subtitles-toggle').checked, true);
+    assert.ok(active(p.chip('os-os-ru')));
+    assert.equal(p.puts().length, 1, 'one act, one PUT');
+    assert.equal(p.puts()[0].body.id, 'os-os-ru');
+});
+
+// ---- the language row ------------------------------------------------
+
+test('a language chip filters and changes nothing else', async () => {
+    const p = mount();
+    p.wire();
+    const before = p.modal.querySelector('.subtitle[data-default="true"]');
+
+    click(p.lang('ru'));
+    await flush();
+
+    assert.equal(p.lang('ru').getAttribute('aria-pressed'), 'true');
+    assert.equal(p.lang('pt').getAttribute('aria-pressed'), 'false');
+    assert.equal(p.chip('os-os-ru').hidden, false);
+    assert.equal(p.chip('os-os-en').hidden, true);
+    assert.equal(p.chip('none').hidden, true, 'the carrier is hidden in every language');
+    assert.equal(p.modal.querySelector('.subtitle[data-default="true"]'), before, 'playback is untouched');
+    assert.equal(p.puts().length, 0, 'a filter is not a choice');
+});
+
+test('"+N" is a toggle, not a one-way reveal', async () => {
+    const p = mount();
+    p.wire();
+    const more = p.modal.querySelector('#subtitle-lang-more');
+    const label = more.querySelector('.more-count');
+    const collapsed = label.textContent;
+    assert.match(collapsed, /^\+[1-9]/, 'the fixture must overflow the row');
+    const hiddenBefore = Array.from(p.modal.querySelectorAll('.lang[data-lang]')).filter((el) => el.hidden).length;
+    assert.ok(hiddenBefore > 0);
+
+    click(more);
+    await flush();
+    assert.equal(more.getAttribute('aria-expanded'), 'true');
+    assert.equal(label.textContent, '×');
+    assert.equal(Array.from(p.modal.querySelectorAll('.lang[data-lang]')).filter((el) => el.hidden).length, 0);
+
+    click(more);
+    await flush();
+    assert.equal(more.getAttribute('aria-expanded'), 'false');
+    assert.equal(label.textContent, collapsed);
+    assert.equal(Array.from(p.modal.querySelectorAll('.lang[data-lang]')).filter((el) => el.hidden).length, hiddenBefore);
+});
+
+// ---- the uploads swap ------------------------------------------------
+
+// asyncSwap is what loadAsyncView leaves behind: #my-subtitles' innerHTML
+// replaced by the partial's response, then an 'async' CustomEvent naming
+// that element.
+//
+// The response is a Go-rendered fixture, not markup written here. Writing it
+// by hand was the one place the drift this whole machinery exists to stop
+// was still possible — and the worst place for it, since the chip
+// attributes it carries (data-lang, data-provider, data-rank,
+// data-autoselect) are exactly what adoptUploadChips, the language row and
+// the filter read. A hand-written copy would have stayed green while the
+// partial stopped emitting one of them.
+//
+//   'upload' — two uploads, the second freshly added (Selected, so it
+//              carries data-autoselect). us-1 is also in the dialog
+//              fixture, so replaying this exercises replace-in-place and
+//              not only the add path.
+//   'empty'  — the list after the last file was deleted. An empty
+//              #my-upload-chips is an answer, not an absence.
+const ASYNC = {
+    upload: readFileSync(path.join(HERE, '__fixtures__/user-subtitles-async.html'), 'utf8'),
+    empty: readFileSync(path.join(HERE, '__fixtures__/user-subtitles-async-empty.html'), 'utf8'),
+};
+
+function asyncSwap(modal, which) {
+    const wrap = modal.querySelector('#my-subtitles');
+    wrap.innerHTML = ASYNC[which];
+    window.dispatchEvent(new dom.window.CustomEvent('async', { detail: { target: wrap } }));
+}
+
+test('an upload lands in the radiogroup, selected, exactly once', async () => {
+    const p = mount();
+    p.wire();
+    assert.ok(p.chip('us-1'), 'the fixture carries one upload already');
+
+    asyncSwap(p.modal, 'upload');
+    await flush();
+
+    const row = p.modal.querySelector('#subtitle-tracks');
+    const fresh = p.chip('us-2');
+    assert.ok(fresh, 'the fresh chip exists');
+    assert.equal(fresh.parentElement, row, 'and it is in the radiogroup, not in #my-subtitles');
+    assert.equal(p.chip('us-1').parentElement, row);
+    // No duplicate of the id the response re-rendered.
+    assert.equal(p.modal.querySelectorAll('.subtitle[data-id="us-1"]').length, 1);
+    // Nothing is left behind in the wrapper, and the marker is consumed.
+    assert.equal(p.modal.querySelectorAll('#my-subtitles .subtitle').length, 0);
+    assert.equal(p.modal.querySelector('#my-upload-chips'), null);
+
+    // Autoselect: the viewer uploaded a file to watch with.
+    assert.ok(active(fresh));
+    assert.equal(fresh.getAttribute('data-default'), 'true');
+    assert.equal(p.modal.querySelectorAll('.subtitle[data-default="true"]').length, 1);
+    assert.equal(p.modal.getAttribute('data-subtitles-off'), 'false');
+    assert.deepEqual(p.puts().map((c) => c.body.id), ['us-2']);
+
+    // The row caught up with the new chip: English now counts three.
+    assert.equal(p.lang('en').querySelector('.lang-count').textContent, '3');
+
+    // And the MY block is where the server puts it — before the AI item,
+    // since an upload is rank 0. Appending instead would move the uploads
+    // past the AI chip on every upload and delete, and the next page load
+    // would move them back: the row reordering for reasons unrelated to
+    // anything the viewer did.
+    const order = Array.from(p.modal.querySelectorAll('#subtitle-tracks .subtitle[data-id]'))
+        .map((el) => el.getAttribute('data-id'));
+    assert.deepEqual(order.slice(-3), ['us-1', 'us-2', 'tr-pt']);
+});
+
+test('deleting the upload that is playing lands on Off, without a PUT', async () => {
+    const p = mount({ tracks: [] });
+    p.wire();
+
+    click(p.chip('us-1'));
+    await flush();
+    assert.equal(p.puts().length, 1);
+    assert.ok(p.video.querySelector('track#us-1'), 'selecting it side-loaded the track');
+
+    // The delete response: the list is empty now.
+    asyncSwap(p.modal, 'empty');
+    await flush();
+
+    assert.equal(p.chip('us-1'), null, 'the chip left the row with the file');
+    assert.equal(p.video.querySelector('track#us-1'), null, 'and so did the orphaned <track>');
+    assert.equal(p.modal.getAttribute('data-subtitles-off'), 'true');
+    assert.equal(p.chip('none').getAttribute('data-default'), 'true');
+    // The viewer chose a deletion, not a track: nothing new is persisted.
+    assert.equal(p.puts().length, 1);
+});
+
+test('deleting an upload that is not playing leaves playback alone', async () => {
+    const p = mount();
+    p.wire();
+    click(p.chip('os-os-en'));
+    await flush();
+
+    asyncSwap(p.modal, 'empty');
+    await flush();
+
+    assert.equal(p.chip('us-1'), null);
+    assert.equal(p.chip('os-os-en').getAttribute('data-default'), 'true');
+    assert.equal(p.modal.getAttribute('data-subtitles-off'), 'false');
+    assert.equal(p.puts().length, 1);
+});
+
+test('the uploads panel survives the swap it is replaced by', async () => {
+    const p = mount();
+    p.wire();
+
+    click(p.modal.querySelector('#my-uploads-toggle'));
+    await flush();
+    assert.equal(p.modal.querySelector('#my-uploads-panel').hidden, false);
+    assert.equal(p.modal.querySelector('#my-subtitles').getAttribute('data-upload-open'), 'true');
+
+    // A delete replaces the toggle and the panel; the wrapper, which is
+    // what remembers, is not replaced.
+    asyncSwap(p.modal, 'upload');
+    await flush();
+    assert.equal(p.modal.querySelector('#my-uploads-panel').hidden, false,
+        'removing two files in a row must not mean re-opening the panel between them');
+
+    // The panel's own "×" closes it exactly as the chip does.
+    click(p.modal.querySelector('#my-uploads-toggle'));
+    await flush();
+    assert.equal(p.modal.querySelector('#my-uploads-panel').hidden, true);
+    assert.equal(p.modal.querySelector('#my-subtitles').getAttribute('data-upload-open'), 'false');
+});
+
+// ---- syncUploadMarks -------------------------------------------------
+
+test('syncUploadMarks marks the upload that is playing, and only then', async () => {
+    const p = mount({ tracks: [['us-1', true]] });
+    syncUploadMarks(p.container, p.modal);
+
+    assert.ok(active(p.chip('us-1')), 'the <track default> says the upload is what plays');
+    assert.equal(p.chip('us-1').getAttribute('data-default'), 'true');
+    assert.equal(p.modal.querySelectorAll('.subtitle[data-default="true"]').length, 1);
+});
+
+test('syncUploadMarks refuses a stale default when an embedded track is playing', async () => {
+    // An embedded track is driven by hls.js and has no <track> element of
+    // its own, so "no showing textTrack" is also what it playing looks
+    // like. Reading the stale `default` attribute as the answer there
+    // handed the marker to the upload as well and left two chips checked.
+    //
+    // Reached the way a viewer reaches it: the page shipped the upload as
+    // the preloaded default, then the viewer picked the embedded Japanese
+    // track, which disables every side-loaded <track> and leaves the
+    // `default` attribute behind.
+    const p = mount({ tracks: [['us-1', true]] });
+    p.wire();
+    click(p.chip('mp-0'));
+    await flush();
+    assert.equal(p.video.querySelector('track#us-1').hasAttribute('default'), true, 'the stale attribute is still there');
+    assert.equal(p.video.textTracks.find((t) => t.id === 'us-1').mode, 'disabled');
+
+    syncUploadMarks(p.container, p.modal);
+
+    assert.equal(p.chip('us-1').getAttribute('data-default'), null, 'the upload must not claim the marker');
+    assert.equal(active(p.chip('us-1')), false);
+    assert.equal(p.modal.querySelectorAll('.subtitle[data-default="true"]').length, 1);
+    assert.equal(p.chip('mp-0').getAttribute('data-default'), 'true');
+});
+
+// ---- persisting the choice ------------------------------------------
+
+test('a 503 on the PUT is retried once, and the retry lands', async () => {
+    const p = mount();
+    p.wire();
+    p.setResponse((url, params, n) => (n === 1
+        ? { ok: false, status: 503 }
+        : { ok: true, status: 200 }));
+
+    const startedAt = Date.now();
+    await markTrack(p.container, p.chip('os-os-en'), 'subtitle');
+
+    const puts = p.puts();
+    assert.equal(puts.length, 2, 'the choice is not lost to an edge blip');
+    assert.deepEqual(puts[1].body, puts[0].body, 'the retry sends the same choice');
+    // Deferred, not immediate: an instant resend arrives at the same edge
+    // that just refused, and is the stampede this deliberately is not.
+    assert.ok(Date.now() - startedAt >= PUT_RETRY_DELAY_MS - 50,
+        `the retry waited ${Date.now() - startedAt} ms, expected about ${PUT_RETRY_DELAY_MS}`);
+});
+
+test('a network error is retried once too, and a second failure gives up', async () => {
+    const p = mount();
+    p.wire();
+    let n = 0;
+    const rejecting = () => { n++; return Promise.reject(new Error('ECONNRESET')); };
+    const restore = globalThis.fetch;
+    globalThis.fetch = window.fetch = rejecting;
+    try {
+        await markTrack(p.container, p.chip('os-os-en'), 'subtitle');
+    } finally {
+        // Put it back rather than leaving a permanently rejecting fetch
+        // installed. Every later test calls mount() first today, so this
+        // is safe either way — which is exactly why it would be missed the
+        // day one does not.
+        globalThis.fetch = window.fetch = restore;
+    }
+
+    assert.equal(n, 2, 'one retry, not a stampede');
+});
+
+test('a 4xx is an answer, not a blip: no retry', async () => {
+    const p = mount();
+    p.wire();
+    p.setResponse(() => ({ ok: false, status: 403 }));
+
+    await markTrack(p.container, p.chip('os-os-en'), 'subtitle');
+
+    assert.equal(p.puts().length, 1, 'repeating a refused request gets it refused again');
+});
+
+test('a retry stands down when a newer choice has already been written', async () => {
+    // The failure the sequence guard exists for. Click A, it 503s and
+    // queues a retry; click B inside the retry window and it succeeds. If
+    // A's retry still fired, the session would end up holding A and the
+    // next page load would restore the wrong track — a corruption the old
+    // fire-and-forget PUT could not cause, because a lost write only lost
+    // itself.
+    const p = mount();
+    p.wire();
+    p.setResponse((url, params, n) => (n === 1 ? { ok: false, status: 503 } : { ok: true, status: 200 }));
+
+    const first = markTrack(p.container, p.chip('os-os-en'), 'subtitle');
+    // Inside the retry window, and it wins.
+    const second = markTrack(p.container, p.chip('os-os-ru'), 'subtitle');
+    // Awaiting both is already past the point A's retry would have fired:
+    // the returned promise resolves after the delay, having decided.
+    await Promise.all([first, second]);
+
+    const puts = p.puts();
+    assert.equal(puts.length, 2, 'two clicks, two writes -- the stale retry was skipped');
+    assert.deepEqual(puts.map((c) => c.body.id), ['os-os-en', 'os-os-ru']);
+    assert.equal(puts[puts.length - 1].body.id, 'os-os-ru', 'the session ends up holding the newer choice');
+});
+
+test('a retry does not outlive the player that queued it', async () => {
+    const p = mount();
+    p.wire();
+    p.setResponse(() => ({ ok: false, status: 503 }));
+
+    const done = markTrack(p.container, p.chip('os-os-en'), 'subtitle');
+    destroyPlayer();
+    await done;
+
+    assert.equal(p.puts().length, 1, 'a write queued by a page the viewer left must not land');
+});
+
+test('audio and subtitle are sequenced apart', async () => {
+    // Two independent choices. A subtitle click must not cancel the retry
+    // of an audio write made a moment earlier, or the guard would turn
+    // "pick a track, then pick a language" into a lost audio choice.
+    const p = mount();
+    p.wire();
+    p.setResponse((url, params, n) => (n === 1 ? { ok: false, status: 503 } : { ok: true, status: 200 }));
+
+    const audio = markTrack(p.container, p.audioChip('mp-1'), 'audio');
+    const subtitle = markTrack(p.container, p.chip('os-os-en'), 'subtitle');
+    await Promise.all([audio, subtitle]);
+
+    const puts = p.puts();
+    assert.equal(puts.length, 3, 'the audio retry still fires');
+    assert.deepEqual(puts.map((c) => c.url), [
+        '/stream-video/audio', '/stream-video/subtitle', '/stream-video/audio',
+    ]);
+});
+
+// The saved mark follows the viewer's choice and nothing else: a persisted
+// pick moves it (it is what the server renders as ListItem.Saved on the next
+// load), a pick the player made for the viewer does not. readCarry reads it
+// to decide what travels to the next episode (review 2026-09-28: the
+// ladder's English track beside an offer used to travel as a choice).
+//
+// Negative control: without the data-saved move in markTrack the first
+// assertion fails, and the carry of a clicked track is lost.
+test('a persisted pick carries the saved mark; a rule\'s activation does not', async () => {
+    const p = mount();
+    p.wire();
+    const saved = () => Array.from(p.modal.querySelectorAll('.subtitle[data-saved="true"]')).map((el) => el.getAttribute('data-id'));
+
+    await markTrack(p.container, p.chip('os-os-en'), 'subtitle');
+    assert.deepEqual(saved(), ['os-os-en'], 'the viewer\'s pick is the one saved track');
+    assert.equal(readCarry(p.modal)['carry-sub-lang'], 'en', 'and it travels');
+
+    // What the audio-switch rule (or a deleted upload landing on None) does:
+    // an activation with persist:false. Nothing was chosen.
+    activateSubtitle(p.container, p.chip('os-os-ru'), { persist: false });
+    assert.deepEqual(saved(), ['os-os-en'], 'a rule\'s activation leaves the mark where the viewer put it');
+    assert.equal(readCarry(p.modal)['carry-sub'], undefined, 'and what it turned on does not travel');
+
+    // Pressing the chip the rule turned on is not a new choice either:
+    // markTrack returns before the PUT (the server saves nothing), and the
+    // mark agrees with the server.
+    await markTrack(p.container, p.chip('os-os-ru'), 'subtitle');
+    assert.deepEqual(saved(), ['os-os-en']);
+    assert.equal(p.puts().length, 1, 'one PUT: the first pick');
+
+    await markTrack(p.container, p.chip('os-os-de'), 'subtitle');
+    assert.deepEqual(saved(), ['os-os-de'], 'the next choice moves it');
+    assert.equal(readCarry(p.modal)['carry-sub-lang'], 'de');
+
+    await markTrack(p.container, p.chip('none'), 'subtitle');
+    assert.deepEqual(saved(), ['none'], 'an explicit off is a choice too');
+    assert.equal(readCarry(p.modal)['carry-sub'], 'off');
+});
+
+// ---- the translation offer ------------------------------------------
+
+test('an offered translation is a verb until it is the track playing', async () => {
+    const p = mount();
+    p.wire();
+    const ai = p.chip('tr-pt');
+    assert.ok(ai, 'the fixture must offer a translation');
+    assert.equal(ai.getAttribute('data-offered'), 'true');
+    assert.ok(ai.classList.contains('chip-offered'));
+    assert.equal(ai.querySelector('.ai-action').hidden, false);
+    assert.equal(ai.querySelector('.ai-label').hidden, true);
+
+    click(ai);
+    await flush();
+
+    // An offer taken is an offer spent.
+    assert.equal(ai.getAttribute('data-offered'), null);
+    assert.equal(ai.classList.contains('chip-offered'), false);
+    assert.equal(ai.querySelector('.ai-action').hidden, true);
+    assert.equal(ai.querySelector('.ai-label').hidden, false);
+    assert.ok(active(ai));
+    // ...and the sentence that explained the offer stops being shown.
+    assert.equal(p.modal.querySelector('#subtitle-hint').hidden, true);
+    assert.deepEqual(p.hooks.selected, ['tr-pt'], 'the component is told to start the run');
+});
+
+test('a locked translation sells instead of switching', async () => {
+    const p = mount();
+    p.wire();
+    const ai = p.chip('tr-pt');
+    // The free-viewer render: locked, no Src.
+    ai.setAttribute('data-locked', 'true');
+    ai.removeAttribute('data-src');
+    const before = p.modal.querySelector('.subtitle[data-default="true"]');
+
+    click(ai);
+    await flush();
+
+    assert.equal(p.modal.querySelector('#translate-cta').hidden, false, 'the upgrade card is revealed');
+    assert.equal(active(ai), false, 'a locked chip can never take the mark');
+    assert.equal(p.modal.querySelector('.subtitle[data-default="true"]'), before);
+    assert.equal(p.puts().length, 0);
+    assert.deepEqual(p.hooks.selected, [], 'nothing was selected, so no run starts');
+    assert.ok(p.events.some((e) => e.name === 'subtitle-translate-lock-click'));
+});
+
+// ---- the translation run ---------------------------------------------
+//
+// Everything above drives wireTrackHandlers with a stand-in `hooks` object,
+// because the wiring only calls through it. Starting a translation is the
+// other side of that seam: it lives in the mounted component, which fills
+// the hooks in. These three tests therefore mount the real thing through
+// initPlayer — the same entry point the page uses — so the chain under test
+// is the whole one, from a click on a chip to a poll and an event.
+
+// mountPlayer builds the page, then runs initPlayer on it. The DOM is
+// rearranged on the way (the video is wrapped, the Preact controls are
+// rendered), so the handles are re-read afterwards.
+async function mountPlayer(prepare, opts) {
+    const p = mount(opts);
+    if (prepare) prepare(p);
+    await initPlayer(p.container);
+    // preact defers effects to the next animation frame (jsdom's fires on a
+    // ~16 ms timer), and the mount-time restore of a saved translation runs
+    // inside one. Waiting on the frame rather than on a microtask is what
+    // makes this deterministic.
+    await settle();
+    return p;
+}
+
+// progressResponse is what the translate service answers a HEAD with.
+const progressResponse = (header) => ({
+    ok: true,
+    status: 200,
+    headers: { get: (n) => (n === 'X-Subtitle-Progress' ? header : null) },
+    json: async () => ({}),
+});
+
+// liveProgressResponse is the same, but for a still-growing embedded-track
+// source: X-Subtitle-Live marks `header`'s total as a snapshot, not a
+// ceiling.
+const liveProgressResponse = (header) => ({
+    ok: true,
+    status: 200,
+    headers: { get: (n) => (n === 'X-Subtitle-Progress' ? header : (n === 'X-Subtitle-Live' ? '1' : null)) },
+    json: async () => ({}),
+});
+
+test('clicking the AI chip starts a run: one start event, a poll, a percentage', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer();
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? progressResponse('12/400')
+        : { ok: true, status: 200, json: async () => ({}) }));
+
+    const ai = p.container.querySelector('#subtitles .subtitle[data-id="tr-pt"]');
+    const src = ai.getAttribute('data-src');
+    // Playing: a run polls only while somebody is watching, and jsdom's
+    // <video> is paused until a test says otherwise.
+    p.video.paused = false;
+    click(ai);
+    await settle();
+
+    const starts = p.events.filter((e) => e.name === 'subtitle-translate-start');
+    assert.equal(starts.length, 1, 'exactly one start for one click');
+    assert.equal(starts[0].data.lang, 'pt');
+    assert.equal(starts[0].data.source, ai.getAttribute('data-source-badge'),
+        'the event names the human track being translated');
+
+    // The poll is real: a HEAD against the item's own src.
+    const heads = p.calls.filter((c) => c.params && c.params.method === 'HEAD');
+    assert.ok(heads.length >= 1, 'the run polls');
+    // Against the item's own src, plus the playhead every poll carries so
+    // a file job can order its batches by it.
+    assert.equal(heads[0].url, `${src}?pos=0`);
+
+    // And the chip says so, without its markup being rebuilt — the
+    // progress span was in the template all along.
+    assert.equal(ai.querySelector('.tr-progress').hidden, false);
+    assert.equal(ai.querySelector('.tr-progress').textContent, '· 3%');
+    assert.equal(ai.querySelector('.tr-spinner').hidden, false);
+    assert.ok(ai.querySelector('.chip-origin'), 'the chip kept its badge');
+});
+
+test('a live source (X-Subtitle-Live) shows a count instead of a percent', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer();
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? liveProgressResponse('3/3')
+        : { ok: true, status: 200, json: async () => ({}) }));
+
+    const ai = p.container.querySelector('#subtitles .subtitle[data-id="tr-pt"]');
+    p.video.paused = false;
+    click(ai);
+    await settle();
+
+    // done == total does not mean final while the source is still live:
+    // the poll keeps running rather than hiding the chip.
+    const span = ai.querySelector('.tr-progress');
+    assert.equal(span.hidden, false);
+    assert.equal(span.textContent, '· 3', 'a count, not a percentage');
+    assert.equal(span.title, 'player.subtitleTranslatingLive');
+});
+
+// ---- the stream-start measurement ------------------------------------
+
+// playPast drives the rAF loop in usePlayerState past the engagement gate
+// (5 s of playback), which is what emits stream-start and subtitle-resolved.
+async function playPast(p, seconds = 6) {
+    p.video.paused = false;
+    p.video.currentTime = seconds;
+    await settle();
+}
+
+test('subtitle-resolved says when the OpenSubtitles lookup never finished', async (t) => {
+    t.after(() => destroyPlayer());
+    // The server sets this when video-info answered "not ready" twice: the
+    // page renders without those tracks and is cached for ten minutes like
+    // any other, so without the field a level of 'none' would count a file
+    // nobody got to look at as a file with nothing to find.
+    const p = await mountPlayer((page) => {
+        page.modal.setAttribute('data-subtitles-not-ready', 'true');
+    });
+    await playPast(p);
+
+    const ev = p.events.find((e) => e.name === 'subtitle-resolved');
+    assert.ok(ev, 'the engagement gate must emit subtitle-resolved');
+    assert.equal(ev.data.notReady, true);
+});
+
+test('subtitle-resolved reports a finished lookup as such', async (t) => {
+    t.after(() => destroyPlayer());
+    // The negative control: the attribute is absent on an ordinary render,
+    // and the field must then be false rather than missing — a field that
+    // is only ever present in one of the two cases cannot be filtered on.
+    const p = await mountPlayer();
+    await playPast(p);
+
+    const ev = p.events.find((e) => e.name === 'subtitle-resolved');
+    assert.ok(ev, 'the engagement gate must emit subtitle-resolved');
+    assert.equal(ev.data.notReady, false);
+    // The fixture plays nothing (subtitles off): defaultLang ships, empty.
+    assert.equal(ev.data.defaultLang, '');
+});
+
+// ---- the codec-support measurement -------------------------------------
+//
+// codec-support.js has the rules; these check the player hands it the right
+// moment and the right stream. The page flag and the weekly stamp are reset
+// first: an earlier test's `playing` may have used up this page's report.
+
+const codecEvents = (p) => p.events.filter((e) => e.name === 'codec-support');
+const freshBrowser = () => {
+    delete window.__wtCodecSupport;
+    window.localStorage.removeItem('wt-codec-support');
+};
+
+test('codec-support goes out on the first frame, not on mount, with the source codec', async (t) => {
+    t.after(() => destroyPlayer());
+    freshBrowser();
+    const p = await mountPlayer((page) => {
+        // As stream_video.html writes it: every video stream of the probe,
+        // a cover picture among them.
+        page.video.setAttribute('data-video-codecs', 'mjpeg hevc ');
+    });
+    p.video.dispatchEvent(new dom.window.Event('loadedmetadata'));
+    p.video.dispatchEvent(new dom.window.Event('canplay'));
+    p.video.dispatchEvent(new dom.window.Event('play'));
+    await settle();
+    assert.equal(codecEvents(p).length, 0, 'mounted, loaded and asked to play is not watching');
+
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await settle();
+    const got = codecEvents(p);
+    assert.equal(got.length, 1);
+    assert.equal(got[0].data.src, 'hevc');
+    assert.equal(got[0].data.tc, false, 'no data-session-id: not a transcoder session');
+    assert.equal(got[0].data.route, '', 'no route on the element: empty, not missing');
+    assert.equal(got[0].data.pl, 'direct', 'no HLS source in this harness');
+    assert.equal(got[0].data.emb, false);
+    assert.equal(got[0].data.mse, 'none', 'jsdom has no MSE; the probe ran against the page');
+
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await settle();
+    assert.equal(codecEvents(p).length, 1, 'a replayed `playing` is not a second viewer');
+});
+
+test('codec-support: a page without a probe reports the source as unknown', async (t) => {
+    t.after(() => destroyPlayer());
+    freshBrowser();
+    const p = await mountPlayer();
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await settle();
+    const got = codecEvents(p);
+    assert.equal(got.length, 1);
+    assert.equal(got[0].data.src, 'unknown');
+});
+
+test('codec-support: the audio player does not report', async (t) => {
+    t.after(() => destroyPlayer());
+    freshBrowser();
+    const p = await mountPlayer(null, { tag: 'audio' });
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await settle();
+    assert.equal(codecEvents(p).length, 0);
+});
+
+// playback-quality: the element's frame counters after a minute of
+// playback. jsdom has no getVideoPlaybackQuality and plays nothing, so the
+// test gives the element both: the counters, and time that moves.
+const qualityEvents = (p) => p.events.filter((e) => e.name === 'playback-quality');
+const playSeconds = async (p, seconds) => {
+    for (let i = 0; i < seconds; i++) {
+        p.video.currentTime += 1;
+        p.video.dispatchEvent(new dom.window.Event('timeupdate'));
+    }
+    await settle();
+};
+
+test('playback-quality goes out after a minute of playback, with the stream facts', async (t) => {
+    t.after(() => destroyPlayer());
+    delete window.__wtPlaybackQuality;
+    const p = await mountPlayer((page) => {
+        page.video.setAttribute('data-video-codecs', 'hevc ');
+        page.video.setAttribute('data-video-route', 'reencode');
+    });
+    p.video.getVideoPlaybackQuality = () => ({ droppedVideoFrames: 30, totalVideoFrames: 1500 });
+    p.video.paused = false;
+    p.video.dispatchEvent(new dom.window.Event('timeupdate'));
+    await playSeconds(p, 59);
+    assert.equal(qualityEvents(p).length, 0, 'not before a minute');
+    await playSeconds(p, 1);
+    const got = qualityEvents(p);
+    assert.equal(got.length, 1);
+    assert.equal(got[0].data.dropped, 30);
+    assert.equal(got[0].data.total, 1500);
+    assert.equal(got[0].data.drop_pct, 2);
+    assert.equal(got[0].data.played, 60);
+    assert.equal(got[0].data.src, 'hevc');
+    assert.equal(got[0].data.route, 'reencode', 'the session\'s route: tc alone cannot tell a passthrough from a re-encode');
+    assert.equal(got[0].data.pl, 'direct');
+    assert.equal(got[0].data.decode, '', 'jsdom has neither MSE nor native HLS: nothing to declare');
+
+    await playSeconds(p, 120);
+    assert.equal(qualityEvents(p).length, 1, 'once per page');
+});
+
+// discover-release-check: a release opened from Discover, what its name
+// said against the file the player got (lib/discover/release-check.js).
+const releaseEvents = (p) => p.events.filter((e) => e.name === 'discover-release-check');
+
+test('discover-release-check: the release Discover recorded is checked on its first frame, once', async (t) => {
+    t.after(() => { destroyPlayer(); window.sessionStorage.clear(); });
+    window.sessionStorage.setItem('wt-discover-release', JSON.stringify({
+        h: 'res', codec: 'hevc', hdr: 'dv', dv5: true, uhd: true, at: Date.now(),
+    }));
+    const p = await mountPlayer((page) => {
+        page.video.setAttribute('data-video-codecs', 'h264 ');
+        page.video.setAttribute('data-video-route', 'copy');
+        page.video.setAttribute('data-route-reason', 'not_hevc');
+    });
+    assert.equal(releaseEvents(p).length, 0, 'not on mount');
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await settle();
+    assert.deepEqual(releaseEvents(p).map((e) => e.data), [{
+        rel_codec: 'hevc', rel_hdr: 'dv', rel_dv5: true, rel_uhd: true, src: 'h264', route: 'copy', reason: 'not_hevc',
+    }]);
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await settle();
+    assert.equal(releaseEvents(p).length, 1);
+    assert.equal(window.sessionStorage.getItem('wt-discover-release'), null);
+});
+
+// Preact drops a component's remaining effects after one throws. The check
+// runs inside the codec effect when the element is already playing at mount
+// (whenPlaying calls at once), so a sessionStorage that throws there must
+// not take the effects after it -- player_ready among them -- down.
+test('discover-release-check: a throwing sessionStorage with the element already playing leaves the later effects alone', async (t) => {
+    const own = Object.getOwnPropertyDescriptor(window, 'sessionStorage');
+    const proto = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(window), 'sessionStorage');
+    t.after(() => {
+        destroyPlayer();
+        delete window.sessionStorage;
+        if (own) Object.defineProperty(window, 'sessionStorage', own);
+    });
+    freshBrowser();
+    Object.defineProperty(window, 'sessionStorage', { configurable: true, get() { throw new dom.window.DOMException('denied', 'SecurityError'); } });
+    let ready = 0;
+    const onReady = () => { ready++; };
+    window.addEventListener('player_ready', onReady);
+    t.after(() => window.removeEventListener('player_ready', onReady));
+    const p = await mountPlayer((page) => {
+        Object.defineProperty(page.video, 'paused', { configurable: true, get: () => false });
+        Object.defineProperty(page.video, 'readyState', { configurable: true, get: () => 4 });
+    });
+    assert.equal(codecEvents(p).length, 1, 'the codec report of the same effect went out');
+    assert.equal(releaseEvents(p).length, 0);
+    p.video.dispatchEvent(new dom.window.Event('canplay'));
+    await settle();
+    assert.equal(ready, 1, 'the next effect subscribed to canplay');
+    assert.ok(proto || own, 'the page had a sessionStorage to put back');
+});
+
+test('playback-quality: the audio player does not report', async (t) => {
+    t.after(() => destroyPlayer());
+    delete window.__wtPlaybackQuality;
+    const p = await mountPlayer(null, { tag: 'audio' });
+    p.video.getVideoPlaybackQuality = () => ({ droppedVideoFrames: 0, totalVideoFrames: 0 });
+    p.video.dispatchEvent(new dom.window.Event('timeupdate'));
+    await playSeconds(p, 61);
+    assert.equal(qualityEvents(p).length, 0);
+});
+
+test('a stopped run keeps its count, loses its spinner, and is reported', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer();
+    // The service stopped this live run incomplete (source_gone /
+    // too_large). The counts in that answer are the last ones there will
+    // ever be, and those cues are on screen.
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? {
+            ok: true,
+            status: 200,
+            headers: {
+                get: (n) => {
+                    if (n === 'X-Subtitle-Progress') return '11/40';
+                    if (n === 'X-Subtitle-Live') return '1';
+                    if (n === 'X-Subtitle-Status') return 'stopped';
+                    return null;
+                },
+            },
+            json: async () => ({}),
+        }
+        : { ok: true, status: 200, json: async () => ({}) }));
+
+    const ai = p.container.querySelector('#subtitles .subtitle[data-id="tr-pt"]');
+    p.video.paused = false;
+    click(ai);
+    await settle();
+
+    const span = ai.querySelector('.tr-progress');
+    // The count stays: it is what the viewer actually got. The spinner is
+    // the part that claims work is still happening, so it goes.
+    assert.equal(span.hidden, false, 'the last count survives a stop');
+    assert.equal(span.textContent, '· 11');
+    assert.equal(span.title, 'player.subtitleTranslationStopped');
+    assert.equal(ai.querySelector('.tr-spinner').hidden, true);
+
+    const errs = p.events.filter((e) => e.name === 'subtitle-translate-error');
+    assert.equal(errs.length, 1, 'one report for one stop');
+    assert.equal(errs[0].data.code, 'stopped');
+    assert.equal(errs[0].data.lang, 'pt');
+    assert.deepEqual(p.events.filter((e) => e.name === 'subtitle-translate-done'), [],
+        'stopped is not done');
+});
+
+test('re-clicking a stopped translation does nothing at all', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer();
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? {
+            ok: true,
+            status: 200,
+            headers: {
+                get: (n) => {
+                    if (n === 'X-Subtitle-Progress') return '11/40';
+                    if (n === 'X-Subtitle-Live') return '1';
+                    if (n === 'X-Subtitle-Status') return 'stopped';
+                    return null;
+                },
+            },
+            json: async () => ({}),
+        }
+        : { ok: true, status: 200, json: async () => ({}) }));
+
+    const ai = p.container.querySelector('#subtitles .subtitle[data-id="tr-pt"]');
+    p.video.paused = false;
+    click(ai);
+    await settle();
+    const headsAfterStop = p.calls.filter((c) => c.params && c.params.method === 'HEAD').length;
+    assert.ok(headsAfterStop >= 1, 'the first click must have polled');
+
+    // Away and back: the run is over, and the chip's own copy says the
+    // way to retry is a reload. Re-selecting must not poll again, and
+    // must not emit a second error for the same dead run.
+    click(p.chip('os-os-en'));
+    await settle();
+    click(ai);
+    await settle();
+
+    assert.equal(p.calls.filter((c) => c.params && c.params.method === 'HEAD').length, headsAfterStop,
+        'a stopped translation must not be polled again');
+    assert.equal(p.events.filter((e) => e.name === 'subtitle-translate-error').length, 1,
+        'nor reported again');
+    assert.equal(p.events.filter((e) => e.name === 'subtitle-translate-start').length, 1,
+        'and it is not a new run either');
+});
+
+test('nothing starts a translation on its own', async (t) => {
+    t.after(() => destroyPlayer());
+    // The fixture is the 2026-09-16 state: the AI item is Offered and the
+    // server did not make it Default. The engagement-gate auto-start is
+    // gone, so a mount must spend no tokens.
+    const p = await mountPlayer();
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? progressResponse('12/400')
+        : { ok: true, status: 200, json: async () => ({}) }));
+    await settle();
+
+    assert.deepEqual(p.events.filter((e) => e.name === 'subtitle-translate-start'), []);
+    assert.deepEqual(p.calls.filter((c) => c.params && c.params.method === 'HEAD'), []);
+    assert.equal(p.puts().length, 0, 'and nothing was persisted either');
+});
+
+// ---- the audio switch -------------------------------------------------
+
+test('an audio switch with no preferred language leaves the subtitles alone', async (t) => {
+    // data-preferred-lang is empty in two configurations that are live
+    // today: every embed, and any deployment with
+    // SUBTITLE_TRANSLATE_ENABLED off — subtitleOptsFor
+    // (jobs/scripts/translate_opts.go) returns the zero SubtitleOpts for
+    // both. The rule used to answer 'none' there, and since the
+    // activation is persist:false, a first-time viewer lost their
+    // subtitles to the audio menu with nothing recording why.
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer((it) => {
+        it.modal.setAttribute('data-preferred-lang', '');
+        // Subtitles on, on a ladder pick rather than a saved choice: the
+        // one state this rule is allowed to re-decide at all.
+        it.modal.setAttribute('data-subtitles-off', 'false');
+        it.chip('none').removeAttribute('data-default');
+        it.chip('os-os-en').setAttribute('data-default', 'true');
+    });
+    const modal = p.container.querySelector('#subtitles');
+    const sub = (id) => modal.querySelector(`.subtitle[data-id="${id}"]`);
+
+    click(modal.querySelector('.audio[data-id="mp-1"]'));
+    await settle();
+
+    assert.equal(sub('os-os-en').getAttribute('data-default'), 'true',
+        'the subtitle that was playing is still playing');
+    assert.equal(sub('none').getAttribute('data-default'), null);
+    assert.equal(modal.getAttribute('data-subtitles-off'), 'false');
+    // The audio choice itself still lands — the rule is inert, not the click.
+    assert.equal(modal.querySelector('.audio[data-id="mp-1"]').getAttribute('data-default'), 'true');
+    assert.deepEqual(p.puts().map((c) => c.url), ['/stream-video/audio'],
+        'the audio write and nothing else: no subtitle was re-decided');
+});
+
+// The GET that creates the <track> is the request that starts the job, and
+// the service orders its first batch by the position on record. Measured
+// 2026-09-18: with no position on that GET it used what an earlier viewing
+// of the same file had left, and a film opened at 0:00 got its first ~50
+// cues from the sixth minute.
+test('the request that starts a translation says where the viewer is', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer();
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? progressResponse('0/0')
+        : { ok: true, status: 200, json: async () => ({}) }));
+    p.video.paused = false;
+    p.video.currentTime = 754.8;
+    click(p.chip('tr-pt'));
+    await settle();
+    const src = p.video.querySelector('track#tr-pt').getAttribute('src') || '';
+    assert.match(src, /[?&]pos=754(&|$)/, `movie time, floored like a poll's: ${src}`);
+});
+
+test('in a transcoder session that position is movie time, not run time', async (t) => {
+    // Its own mount: the session helper pre-renders the <track>, and the
+    // server never does that for a translation (markPreload skips it).
+    t.after(() => destroyPlayer());
+    const p = mount();
+    p.video.dataset.sessionId = 's1';
+    p.video.dataset.sessionSeekUrl = '/session/seek';
+    p.setResponse((url, params) => {
+        if (params && params.method === 'HEAD') return catchUpResponse('0/0', null);
+        return { ok: true, status: 200, json: async () => ({ offset: 600 }) };
+    });
+    await initPlayer(p.container);
+    await settle();
+    p.video.paused = false;
+    p.video.currentTime = 12.4;
+    click(p.chip('tr-pt'));
+    await settle();
+    const src = p.video.querySelector('track#tr-pt').getAttribute('src') || '';
+    assert.match(src, /[?&]pos=612(&|$)/, `600 s run offset + 12 s into it: ${src}`);
+});
+
+test('a track that is not a translation is requested as the server wrote it', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer(null, { tracks: [] });
+    p.video.currentTime = 754.8;
+    const os = Array.from(p.container.querySelectorAll('#subtitles .subtitle'))
+        .find((el) => el.getAttribute('data-provider') !== 'Translated' && el.getAttribute('data-provider') !== 'MediaProbe'
+            && el.getAttribute('data-id') !== 'none' && el.getAttribute('data-src'));
+    assert.ok(os, 'fixture: a side-loaded, non-AI chip');
+    click(os);
+    await settle();
+    const el = Array.from(p.video.querySelectorAll('track')).find((x) => x.id === os.getAttribute('data-id'));
+    assert.equal(el.getAttribute('src'), os.getAttribute('data-src'));
+});
+
+test('a translation saved in an earlier session comes back once, unpersisted', async (t) => {
+    t.after(() => destroyPlayer());
+    // The one automatic start left. A translation is not a <track> in the
+    // page (markPreload skips it), so unlike every other saved choice it
+    // cannot resume by itself. It is the viewer's own choice coming back,
+    // which is what justifies replaying it — not that it is cached: an
+    // embedded source makes this a live job, and what bounds that is the
+    // poll sleeping with the video.
+    const p = await mountPlayer((it) => {
+        it.setResponse((url, params) => (params && params.method === 'HEAD'
+            ? progressResponse('400/400')
+            : { ok: true, status: 200, json: async () => ({}) }));
+        // Playing by the time the restore runs — autoplay did what the
+        // template asks for. When it does not, the restored run starts
+        // asleep instead; that is its own test.
+        it.video.paused = false;
+        const ai = it.chip('tr-pt');
+        ai.setAttribute('data-saved', 'true');
+        ai.setAttribute('data-default', 'true');
+        ai.removeAttribute('data-offered');
+        it.chip('none').removeAttribute('data-default');
+        it.modal.setAttribute('data-subtitles-off', 'false');
+    });
+
+    const starts = p.events.filter((e) => e.name === 'subtitle-translate-start');
+    assert.equal(starts.length, 1, 'restored exactly once');
+    assert.equal(starts[0].data.lang, 'pt');
+    // persist: false — nothing was chosen here that was not already chosen,
+    // so the saved marker must not be rewritten as a fresh choice.
+    assert.equal(p.puts().length, 0);
+
+    // A second render pass must not restore it again.
+    await settle();
+    assert.equal(p.events.filter((e) => e.name === 'subtitle-translate-start').length, 1);
+    // The cached file finishes at once, and the run reports itself done.
+    assert.equal(p.events.filter((e) => e.name === 'subtitle-translate-done').length, 1);
+});
+
+// The poll interval inside the player is not injectable (pollProgress's
+// 3 s default), so seeing that a tick did NOT happen means outwaiting one
+// whole interval. Everything else here is immediate.
+const POLL_INTERVAL_WINDOW_MS = 3300;
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// jsdom has no way to change visibility, and `hidden` is a prototype
+// getter; an own configurable property shadows it, and `delete` in the
+// test's t.after puts jsdom's back.
+const setHidden = (v) => {
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => v });
+    document.dispatchEvent(new dom.window.Event('visibilitychange'));
+};
+
+test('the translation poll sleeps with the video and wakes with it', async (t) => {
+    // The HEAD every 3 s is what tells the translate service somebody is
+    // watching, and for a live source it holds the transcoder session (and
+    // its FFmpeg run) open behind it. A paused or hidden viewer is not
+    // watching, so the poll stops — without giving up: no error, no
+    // telemetry, the chip keeps its count, and the same run continues.
+    t.after(() => { destroyPlayer(); delete document.hidden; });
+    const p = await mountPlayer();
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? liveProgressResponse('3/3')
+        : { ok: true, status: 200, json: async () => ({}) }));
+    const heads = () => p.calls.filter((c) => c.params && c.params.method === 'HEAD').length;
+
+    const ai = p.container.querySelector('#subtitles .subtitle[data-id="tr-pt"]');
+    p.video.paused = false;
+    click(ai);
+    await settle();
+    assert.equal(heads(), 1, 'the run polls on start');
+
+    p.video.paused = true;
+    p.video.dispatchEvent(new dom.window.Event('pause'));
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.equal(heads(), 1, 'a paused viewer pays for no polls');
+    // Asleep, not dead — which is the whole difference from stopping it.
+    assert.equal(ai.querySelector('.tr-progress').hidden, false);
+    assert.equal(ai.querySelector('.tr-progress').textContent, '· 3', 'the chip keeps its last count');
+    assert.equal(ai.querySelector('.tr-spinner').hidden, false);
+    assert.deepEqual(p.events.filter((e) => e.name === 'subtitle-translate-error'), [],
+        'sleeping is not a failure and must not be counted as one');
+
+    p.video.paused = false;
+    p.video.dispatchEvent(new dom.window.Event('play'));
+    await settle();
+    assert.equal(heads(), 2, 'play wakes the same run at once');
+
+    setHidden(true);
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.equal(heads(), 2, 'a hidden tab pays for no polls either');
+    setHidden(false);
+    await settle();
+    assert.equal(heads(), 3, 'and coming back wakes it');
+
+    // One run throughout: waking is not a new translation, so the start
+    // event (and the tokens behind it) happens once.
+    assert.equal(p.events.filter((e) => e.name === 'subtitle-translate-start').length, 1);
+});
+
+test('coming back to a tab whose video is still paused does not wake the poll', async (t) => {
+    // The negative control for the resume side: `visible` alone is not
+    // "watching". Without the paused check, tabbing back to a paused film
+    // would put the transcoder session back on the clock.
+    t.after(() => { destroyPlayer(); delete document.hidden; });
+    const p = await mountPlayer();
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? liveProgressResponse('3/3')
+        : { ok: true, status: 200, json: async () => ({}) }));
+    const heads = () => p.calls.filter((c) => c.params && c.params.method === 'HEAD').length;
+
+    p.video.paused = false;
+    click(p.container.querySelector('#subtitles .subtitle[data-id="tr-pt"]'));
+    await settle();
+    assert.equal(heads(), 1);
+
+    p.video.paused = true;
+    p.video.dispatchEvent(new dom.window.Event('pause'));
+    setHidden(true);
+    await settle();
+    setHidden(false);
+    await settle();
+    assert.equal(heads(), 1, 'still paused, still asleep');
+});
+
+test('a live run started on a paused video sleeps after its first answer', async (t) => {
+    // The events are only half the state. A media element that has never
+    // played fires no `pause`, so nothing would ever put this run to sleep
+    // — and since the cap for a live source is now an inactivity cap, that
+    // run would hold a transcoder session for the length of the film with
+    // nobody watching. The two entry states are this one (autoplay blocked,
+    // or the mount-time restore of a saved AI track) and the hidden tab
+    // below.
+    //
+    // The first HEAD still goes out: it is what says whether the source is
+    // live at all, and that is the only source a sleeping run saves money
+    // on (see the non-live case below).
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer();
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? liveProgressResponse('3/3')
+        : { ok: true, status: 200, json: async () => ({}) }));
+    const heads = () => p.calls.filter((c) => c.params && c.params.method === 'HEAD').length;
+    assert.equal(p.video.paused, true, 'a video that has never played');
+
+    const ai = p.container.querySelector('#subtitles .subtitle[data-id="tr-pt"]');
+    click(ai);
+    await settle();
+
+    assert.equal(heads(), 1, 'one HEAD, to learn what the source is');
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.equal(heads(), 1, 'and then nothing: nobody is watching a live run');
+    // Asleep, not refused: the run was started and counted, and the chip
+    // carries the count that first answer brought.
+    assert.equal(p.events.filter((e) => e.name === 'subtitle-translate-start').length, 1);
+    assert.equal(ai.querySelector('.tr-progress').hidden, false);
+    assert.equal(ai.querySelector('.tr-progress').textContent, '· 3');
+    assert.deepEqual(p.events.filter((e) => e.name === 'subtitle-translate-error'), [],
+        'sleeping is not a failure');
+
+    p.video.paused = false;
+    p.video.dispatchEvent(new dom.window.Event('play'));
+    await settle();
+    assert.equal(heads(), 2, 'play wakes the same run');
+});
+
+test('a cached batch run on a paused video is not suspended at all', async (t) => {
+    // The negative control for the rule above, and the reason it moved:
+    // the guard used to run before the first HEAD, so it could not know the
+    // source. An OpenSubtitles translation is a cached batch job of
+    // seconds with no transcoder session behind it — and pausing the film
+    // to open the picker is exactly when a viewer starts one. Suspending it
+    // left them looking at `· 0%` and a spinner that never moved until they
+    // pressed play.
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer();
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? progressResponse('12/400')
+        : { ok: true, status: 200, json: async () => ({}) }));
+    const heads = () => p.calls.filter((c) => c.params && c.params.method === 'HEAD').length;
+    assert.equal(p.video.paused, true, 'a video that has never played');
+
+    const ai = p.container.querySelector('#subtitles .subtitle[data-id="tr-pt"]');
+    click(ai);
+    await settle();
+    assert.equal(ai.querySelector('.tr-progress').textContent, '· 3%');
+
+    // No X-Subtitle-Live in the answer, so the run carries on without a
+    // press of play.
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.ok(heads() > 1, `a batch run keeps polling while paused, got ${heads()} HEADs`);
+});
+
+test('a live run started in a hidden tab sleeps after its first answer', async (t) => {
+    t.after(() => { destroyPlayer(); delete document.hidden; });
+    const p = await mountPlayer();
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? liveProgressResponse('3/3')
+        : { ok: true, status: 200, json: async () => ({}) }));
+    const heads = () => p.calls.filter((c) => c.params && c.params.method === 'HEAD').length;
+
+    // Hidden before the run starts — a background tab fires no
+    // visibilitychange of its own, so again only the initial read can see
+    // it. The video is playing, to isolate this from the paused case.
+    p.video.paused = false;
+    setHidden(true);
+    click(p.container.querySelector('#subtitles .subtitle[data-id="tr-pt"]'));
+    await settle();
+    assert.equal(heads(), 1, 'one HEAD, to learn what the source is');
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.equal(heads(), 1, 'a background tab pays for nothing after that');
+
+    setHidden(false);
+    await settle();
+    assert.equal(heads(), 2, 'and it wakes when the tab comes forward');
+});
+
+// ---- one error per run ------------------------------------------------
+
+test('an HTTP error and a late <track> error are one run, and one event', async (t) => {
+    // fail() clears the refs and reports, but it used not to invalidate the
+    // run. A <track> whose src this run set keeps loading after the poll
+    // has already failed, and when it errors a moment later onTrackError's
+    // identity check still passed — so code:'track' landed as a second
+    // subtitle-translate-error for the same translation.
+    // trackErrorReported only guards repeats of the track error itself.
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer();
+    let headCount = 0;
+    p.setResponse((url, params) => {
+        if (params && params.method === 'HEAD') {
+            headCount++;
+            // The first answer is real, so the run reloads the <track> and
+            // wires its error handler; the next one fails the run.
+            return headCount === 1 ? progressResponse('12/400') : { ok: false, status: 500, headers: { get: () => null } };
+        }
+        return { ok: true, status: 200, json: async () => ({}) };
+    });
+
+    p.video.paused = false;
+    click(p.container.querySelector('#subtitles .subtitle[data-id="tr-pt"]'));
+    await settle();
+    const track = p.video.querySelector('track#tr-pt');
+    assert.ok(track, 'the run must have a <track> to fail');
+    assert.match(track.getAttribute('src'), /rev=12/, 'and it must have been pointed at a revision');
+
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    const errors = () => p.events.filter((e) => e.name === 'subtitle-translate-error');
+    assert.deepEqual(errors().map((e) => e.data.code), [500], 'the HTTP error is reported once');
+
+    // The revision the dead run asked for now fails to load. It belongs to
+    // nobody.
+    track.dispatchEvent(new dom.window.Event('error'));
+    await settle();
+    assert.deepEqual(errors().map((e) => e.data.code), [500],
+        'a late track error of a finished run must not be counted again');
+});
+
+// ---- the subtitle invariant -------------------------------------------
+//
+// Two renderers can draw subtitles on the same element: hls.js, from the
+// transcoder's manifest, and the element's own <track>s. The picker is the
+// one thing that says which — and hls.js does not know that. It re-scans
+// the element's TextTracks on every `change` event and adopts a track of
+// its own whenever it finds one that is not 'disabled', which is how a
+// stage viewer ended up with an embedded Russian track drawn over the AI
+// Catalan one they had chosen. These four tests are the invariant:
+// side-loaded means hls.js is off and every track of its is disabled, and
+// it is re-asserted after each transition of hls.js rather than written
+// once.
+
+test('choosing a side-loaded track disables hls.js’s own tracks — it never hides them', async () => {
+    const p = mount({ hlsTracks: [['Full (rus)', 'showing'], ['Full (eng)', 'hidden']] });
+    const hls = p.installHls({ subtitleTrack: 0, subtitleDisplay: true });
+    p.wire();
+
+    click(p.chip('os-os-ru'));
+    await flush();
+
+    assert.equal(hls.subtitleTrack, -1, 'hls.js is off the manifest track');
+    assert.equal(hls.subtitleDisplay, false);
+    assert.equal(p.mode('os-os-ru'), 'showing');
+    assert.deepEqual(p.hlsModes(), ['disabled', 'disabled']);
+    // The specific mode is the whole point: 'hidden' is what
+    // onTextTracksChanged remembers and hands back to setSubtitleTrack, so
+    // "off" written as 'hidden' is an instruction to turn it on again.
+    assert.equal(p.hlsModes().includes('hidden'), false);
+});
+
+test('a translation saved in an earlier session survives hls.js arriving after it', async (t) => {
+    // The measured race: activateSubtitle runs inside the mount, before
+    // useHls has created the instance, so the hls.js half of the selection
+    // cannot be written there — window.hlsPlayer is still null. It used to
+    // be skipped entirely, leaving subtitleDisplay at hls.js's own default
+    // of true (measured on the page: hlsDisp true, hlsSub -1, nine seconds
+    // in) with nothing but a mode write needed to make it draw something.
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer((it) => {
+        it.setResponse((url, params) => (params && params.method === 'HEAD'
+            ? progressResponse('400/400')
+            : { ok: true, status: 200, json: async () => ({}) }));
+        const ai = it.chip('tr-pt');
+        ai.setAttribute('data-saved', 'true');
+        ai.setAttribute('data-default', 'true');
+        ai.removeAttribute('data-offered');
+        it.chip('none').removeAttribute('data-default');
+        it.modal.setAttribute('data-subtitles-off', 'false');
+    }, { hlsTracks: [['Full (rus)', 'showing']] });
+
+    assert.equal(window.hlsPlayer, null, 'the restore ran with no HLS instance to write to');
+    assert.equal(p.mode('tr-pt'), 'showing', 'the element half landed anyway');
+
+    // canplay, and with it the instance.
+    const hls = makeHls({ video: p.video, subtitleTrack: -1, subtitleDisplay: true });
+    initDefaultTracks(hls, p.video);
+
+    assert.equal(hls.subtitleDisplay, false, 'hls.js is told the viewer is not watching its tracks');
+    assert.equal(hls.subtitleTrack, -1);
+    assert.deepEqual(p.hlsModes(), ['disabled']);
+    assert.equal(p.mode('tr-pt'), 'showing');
+});
+
+test('an hls.js track that latches on mid-playback is put back', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer((it) => {
+        it.setResponse((url, params) => (params && params.method === 'HEAD'
+            ? progressResponse('400/400')
+            : { ok: true, status: 200, json: async () => ({}) }));
+        it.installHls({ subtitleTrack: -1, subtitleDisplay: true });
+    }, { hlsTracks: [['Full (rus)', 'hidden']] });
+    const hls = window.hlsPlayer;
+
+    click(p.container.querySelector('#subtitles .subtitle[data-id="tr-pt"]'));
+    await settle();
+    assert.equal(p.mode('tr-pt'), 'showing');
+    assert.deepEqual(p.hlsModes(), ['disabled']);
+
+    // Bounded, and this is the assertion that catches the recursion. The
+    // write of -1 disables the very track the same apply is about to show
+    // and fires SUBTITLE_TRACK_SWITCH from inside itself, so the listener
+    // runs nested at the one moment the selection cannot hold. Without the
+    // re-entrancy guard in applySubtitleSelection this is hundreds of
+    // writes and a blown stack; with it, one per apply.
+    const trackWrites = () => hls.writes.filter(([k]) => k === 'subtitleTrack').length;
+    assert.ok(trackWrites() <= 2, `one selection must not storm hls.js: ${trackWrites()} writes`);
+
+    // Now hls.js does what it does: something wakes onTextTracksChanged, it
+    // adopts a manifest track and starts drawing it. This is the state that
+    // was measured on stage, reproduced by hand — the fake does not
+    // implement hls.js's own reactions.
+    p.hlsTrack(0).mode = 'showing';
+    hls.emit(Hls.Events.SUBTITLE_TRACK_SWITCH, { id: 0 });
+    await flush();
+
+    assert.deepEqual(p.hlsModes(), ['disabled'], 'the manifest track is taken off screen again');
+    assert.equal(hls.subtitleTrack, -1);
+    assert.equal(hls.subtitleDisplay, false);
+    assert.equal(p.mode('tr-pt'), 'showing', 'and the chosen one is still the one playing');
+
+    // Terminating, not looping: the re-assertion's own writes come back as
+    // more hls.js events, and a second pass over a state that already
+    // agrees must write nothing.
+    const writes = hls.writes.length;
+    hls.emit(Hls.Events.SUBTITLE_TRACK_SWITCH, { id: -1 });
+    hls.emit(Hls.Events.SUBTITLE_TRACKS_UPDATED, {});
+    await flush();
+    assert.equal(hls.writes.length, writes);
+});
+
+test('the re-assertion comes off with the player', async () => {
+    const p = await mountPlayer((it) => it.installHls({ subtitleTrack: -1 }));
+    const hls = window.hlsPlayer;
+    assert.equal(hls.listenerCount(Hls.Events.SUBTITLE_TRACK_SWITCH), 1);
+    destroyPlayer();
+    assert.equal(hls.listenerCount(Hls.Events.SUBTITLE_TRACK_SWITCH), 0);
+    assert.equal(hls.listenerCount(Hls.Events.SUBTITLE_TRACKS_UPDATED), 0);
+});
+
+// ---- the session seek --------------------------------------------------
+
+test('a seek re-applies the picker’s current answer, not the one it started with', async (t) => {
+    // The subtitles dialog stays open and clickable while a seek is in
+    // flight (the POST, the manifest reload and the buffering after it are
+    // seconds), so the selection that was playing when the seek began is
+    // not necessarily the one to come back to. It used to be restored from
+    // a snapshot taken at seek start — which, after a switch to a
+    // side-loaded track, put hls.js back on the embedded track and left
+    // both on screen.
+    //
+    // Through a real mount, because the seeker is not the only listener on
+    // SUBTITLE_TRACKS_UPDATED: the player's re-assertion is registered
+    // first and runs first, so this is also the path where the seeker
+    // re-enters applySubtitleSelection through somebody else's listener.
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer((it) => {
+        it.installHls({ subtitleTrack: 0, subtitleDisplay: true });
+        // Playing at seek time: the embedded Russian track.
+        it.chip('none').removeAttribute('data-default');
+        it.chip('mp-0').setAttribute('data-default', 'true');
+        it.modal.setAttribute('data-subtitles-off', 'false');
+    }, { hlsTracks: [['Full (rus)', 'showing']] });
+    const hls = window.hlsPlayer;
+
+    const seeker = createSessionSeeker({
+        hls,
+        videoEl: p.video,
+        sessionSeekUrl: '/session/seek',
+        sourceUrl: 'https://x.test/index.m3u8',
+        trackContainer: p.container,
+    });
+    const seeking = seeker.seek(120);
+    await flush();
+
+    // Mid-seek, the viewer switches to a side-loaded track.
+    click(p.chip('os-os-ru'));
+    await flush();
+
+    // loadSource: hls.js reprocesses the element, dropping its selection
+    // and disabling the element-backed tracks, then announces the new
+    // track list.
+    p.video.textTracks.find((t) => t.id === 'os-os-ru').mode = 'disabled';
+    hls.emit(Hls.Events.SUBTITLE_TRACKS_UPDATED, {});
+
+    assert.equal(hls.subtitleTrack, -1, 'the snapshot’s embedded track is not restored');
+    assert.equal(hls.subtitleDisplay, false);
+    assert.equal(p.mode('os-os-ru'), 'showing');
+    assert.deepEqual(p.hlsModes(), ['disabled']);
+
+    // And the cue/mode snapshot restored on `playing` does not undo it
+    // either: it is the cues that have to survive a seek, not the modes.
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await seeking;
+    assert.equal(p.mode('os-os-ru'), 'showing');
+    assert.deepEqual(p.hlsModes(), ['disabled']);
+    assert.equal(hls.subtitleTrack, -1);
+    assert.ok(hls.writes.filter(([k]) => k === 'subtitleTrack').length <= 4,
+        'two applies (the player\u2019s and the seeker\u2019s) write once each, not once per nested callback');
+});
+
+// ---- a track a seek emptied comes back when it is picked -----------------
+//
+// Bug (2026-09-17, reproduced on stage): hls.js clears the cues of every text
+// track on loadSource, the seek snapshot only holds the track that was on,
+// and the browser never refetches a src it has loaded. An OpenSubtitles
+// track picked after a seek sat at readyState 2, showing, with 0 cues.
+test('a side-loaded track picked after a seek is fetched again; one left off is not', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer((it) => {
+        it.installHls({ subtitleTrack: 0, subtitleDisplay: true });
+        it.chip('none').removeAttribute('data-default');
+        it.chip('mp-0').setAttribute('data-default', 'true');
+        it.modal.setAttribute('data-subtitles-off', 'false');
+    }, { tracks: [['os-os-ru', false], ['os-os-en', false]], hlsTracks: [['Full (rus)', 'showing']] });
+    const hls = window.hlsPlayer;
+    const ru = p.video.querySelector('track#os-os-ru');
+    const en = p.video.querySelector('track#os-os-en');
+    // Both were loaded before the seek, as the browser does with <track>s.
+    for (const el of [ru, en]) Object.defineProperty(el, 'readyState', { configurable: true, value: 2 });
+
+    const seeker = createSessionSeeker({
+        hls,
+        videoEl: p.video,
+        sessionSeekUrl: '/session/seek',
+        sourceUrl: 'https://x.test/index.m3u8',
+        trackContainer: p.container,
+    });
+    const seeking = seeker.seek(120);
+    await flush();
+    hls.emit(Hls.Events.SUBTITLE_TRACKS_UPDATED, {});
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await seeking;
+
+    click(p.chip('os-os-ru'));
+    await flush();
+
+    assert.equal(p.mode('os-os-ru'), 'showing');
+    assert.match(ru.getAttribute('src'), /wt-rf=\d+$/, 'the emptied track the viewer picked is fetched again');
+    assert.equal(en.getAttribute('src'), 'https://x.test/os-os-en.vtt', 'a track nobody picked costs no request');
+});
+
+test('a <track> added while the seek POST is in flight is refetched when picked', async (t) => {
+    // Found in review: the elements to mark were collected before the POST,
+    // so a track that loaded during it was wiped by loadSource and marked by
+    // nobody.
+    t.after(() => destroyPlayer());
+    let releasePost;
+    const p = await mountPlayer((it) => {
+        it.installHls({ subtitleTrack: 0, subtitleDisplay: true });
+        it.chip('none').removeAttribute('data-default');
+        it.chip('mp-0').setAttribute('data-default', 'true');
+        it.modal.setAttribute('data-subtitles-off', 'false');
+    }, { hlsTracks: [['Full (rus)', 'showing']] });
+    p.setResponse((url, params) => (params && params.method === 'POST' && String(url).includes('/session/seek')
+        ? new Promise((resolve) => { releasePost = () => resolve({ ok: true, status: 200, json: async () => ({}) }); })
+        : { ok: true, status: 200, json: async () => ({}) }));
+    const hls = window.hlsPlayer;
+    const seeker = createSessionSeeker({
+        hls, videoEl: p.video, sessionSeekUrl: '/session/seek', sourceUrl: 'https://x.test/index.m3u8', trackContainer: p.container,
+    });
+    const seeking = seeker.seek(120);
+    await flush();
+    const el = document.createElement('track');
+    el.id = 'os-os-en';
+    el.setAttribute('src', 'https://x.test/os-os-en.vtt');
+    Object.defineProperty(el, 'readyState', { configurable: true, value: 2 });
+    p.video.appendChild(el);
+    releasePost();
+    await flush();
+    hls.emit(Hls.Events.SUBTITLE_TRACKS_UPDATED, {});
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await seeking;
+
+    click(p.chip('os-os-en'));
+    await flush();
+    assert.match(p.video.querySelector('track#os-os-en').getAttribute('src'), /wt-rf=\d+$/);
+});
+
+test('a seek whose play() is refused settles instead of latching', async (t) => {
+    // Found in review (2026-09-18): the seek pauses the old run itself and
+    // is unlocked only by `playing`. A rejected play() was swallowed, so
+    // `playing` never came: isSeeking stayed true and every later seek
+    // returned at once, for the rest of the session.
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer((it) => { it.installHls({}); });
+    p.video.paused = false;
+    let plays = 0;
+    p.video.pause = () => { p.video.paused = true; };
+    p.video.play = () => { plays++; return Promise.reject(new dom.window.DOMException('nope', 'NotAllowedError')); };
+    const changes = [];
+    const seeker = createSessionSeeker({
+        hls: window.hlsPlayer, videoEl: p.video, sessionSeekUrl: '/session/seek',
+        sourceUrl: 'https://x.test/index.m3u8', trackContainer: p.container,
+        onSeekingChange: (v) => changes.push(v),
+    });
+    const seeking = seeker.seek(120);
+    await flush();
+    assert.equal(plays, 1);
+    assert.equal(seeker.isSeeking(), true, 'one refusal is not the end: the reload may have aborted it');
+
+    p.video.dispatchEvent(new dom.window.Event('canplay'));
+    await flush();
+    await seeking;
+    assert.equal(plays, 2, 'tried once more when the new source can play');
+    assert.equal(seeker.isSeeking(), false, 'refused twice: settled paused, seeking unlocked');
+    assert.deepEqual(changes, [true, false]);
+});
+
+// ---- a seek kicks the translation poll ---------------------------------
+//
+// Bug (2026-09-16): with a live AI translation running, a seek jumps the
+// video ahead of what the poll knows about, so the first cues for the new
+// position waited out whatever was left of the 3 s poll interval and then
+// TRACK_RELOAD_INTERVAL_MS (15 s) on top of that \u2014 on top of the service's
+// own lag (fixed separately, server side). The fix is `handleSeek`'s
+// `onSeekOffsetChange` calling `pollStopRef.current.kick()`: an immediate
+// HEAD (subtitle-progress.js's kick()) and a mark on the change it finds
+// that lets `reload()` bypass its own throttle once.
+//
+// Through `initPlayer` and a real keydown, not `createSessionSeeker`
+// directly (see the seek test above): `kick()` lives inside the
+// `onSeekOffsetChange` closure `handleSeek` builds, so only the mounted
+// component's own seek path exercises it.
+test('a session seek kicks the translation poll and unthrottles the next reload', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = mount({ tracks: [['tr-pt', false]] });
+    p.video.dataset.sessionId = 's1';
+    p.video.dataset.sessionSeekUrl = '/session/seek';
+    p.video.setAttribute('data-duration', '3600');
+    let done = 5;
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? liveProgressResponse(`${done}/${done}`)
+        : { ok: true, status: 200, json: async () => ({}) }));
+    await initPlayer(p.container);
+    await settle();
+
+    const heads = () => p.calls.filter((c) => c.params && c.params.method === 'HEAD').length;
+    const ai = p.container.querySelector('#subtitles .subtitle[data-id="tr-pt"]');
+    const track = () => p.video.querySelector('#tr-pt');
+
+    p.video.paused = false;
+    click(ai);
+    await settle();
+    assert.equal(heads(), 1, 'the run polls on start');
+    assert.ok(track().getAttribute('src').includes('rev=5'), 'the cold-start reload is unthrottled on its own');
+
+    // The service has more cues ready by the time the seek lands (its own
+    // fix \u2014 translating the current run first \u2014 is separate from this
+    // one).
+    done = 9;
+
+    // ArrowRight reaches the same handleSeek a drag on the timeline does,
+    // well inside both the 3 s poll interval and the 15 s reload throttle
+    // the first reload just started.
+    document.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    await settle();
+
+    assert.ok(heads() >= 2, `the seek must kick a HEAD at once, not wait for the next 3 s tick \u2014 got ${heads()} HEADs`);
+    assert.ok(track().getAttribute('src').includes('rev=9'),
+        'the reload for the new count must not wait out the 15 s throttle either');
+});
+
+// The element carries its movie-time offset (data-run-offset) for code
+// outside the player -- the transfer status's grace window
+// (lib/playerActivity.js inGrace) reads it on the restarting source's own
+// events. Written when the seek's answer arrives, before the source is
+// reloaded, not on the next render: the restart's emptied/loadstart/waiting
+// otherwise read the new element clock (0) against the old offset.
+test('a session seek puts its offset on the element before the source restarts', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = mount();
+    p.video.dataset.sessionId = 's1';
+    p.video.dataset.sessionSeekUrl = '/session/seek';
+    p.video.setAttribute('data-duration', '3600');
+    p.setResponse((url, params) => ({
+        ok: true, status: 200,
+        // The seek's POST answers where the new run starts; the mount's
+        // GET, that the first run starts at 0.
+        json: async () => ({ offset: params && params.method === 'POST' ? 1470 : 0 }),
+    }));
+    await initPlayer(p.container);
+    await settle();
+    assert.equal(p.video.dataset.runOffset, '0');
+    let atRestart = null;
+    p.video.load = function load() { atRestart = this.dataset.runOffset; };
+    if (window.hlsPlayer) {
+        const orig = window.hlsPlayer.loadSource;
+        window.hlsPlayer.loadSource = (...a) => { atRestart = p.video.dataset.runOffset; return orig && orig.apply(window.hlsPlayer, a); };
+    }
+    document.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    await settle();
+    assert.equal(atRestart, '1470', 'the offset on the element when the source restarts');
+    assert.equal(p.video.dataset.runOffset, '1470');
+});
+
+// The grace popup goes up as the film leaves the free window, and the
+// element says so (data-grace-cta-shown): until it does, the transfer status
+// counts the popup as on its way (lib/playerActivity.js graceOfferDue) and
+// keeps its own plan box down -- the popup comes from a render effect, a
+// frame or more after the element's clock crosses.
+test('the grace popup, once up, is marked on the element', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer((page) => {
+        page.video.dataset.graceDurationSec = '30';
+        const cta = document.createElement('div');
+        cta.id = 'grace-cta';
+        cta.className = 'hidden';
+        cta.setAttribute('data-upsell-surface', 'grace');
+        page.container.appendChild(cta);
+    });
+    await playPast(p, 29);
+    assert.ok(document.getElementById('grace-cta').classList.contains('hidden'), 'inside the window: no popup');
+    assert.equal('graceCtaShown' in p.video.dataset, false);
+    await playPast(p, 31);
+    assert.equal(document.getElementById('grace-cta').classList.contains('hidden'), false, 'past it: the popup');
+    assert.equal('graceCtaShown' in p.video.dataset, true, 'and the element says it is up');
+});
+
+// The viewer's answer to the popup -- "continue at N Mbps" or its close --
+// goes on the element too (data-grace-cta-answered): they have just been told
+// of the cap, and the transfer status sells the way out again only at the
+// player's first real stall (lib/playerActivity.js offerAnswered), not the
+// moment the popup closes. The trial link is no answer: it opens a new tab
+// and the popup stays.
+for (const [button, answer] of [['.grace-cta-continue', 'continue'], ['.grace-cta-close', 'dismiss']]) {
+    test(`the grace popup answered "${answer}" is marked on the element`, async (t) => {
+        t.after(() => destroyPlayer());
+        const p = await mountPlayer((page) => {
+            page.video.dataset.graceDurationSec = '30';
+            const cta = document.createElement('div');
+            cta.id = 'grace-cta';
+            cta.className = 'hidden';
+            cta.setAttribute('data-upsell-surface', 'grace');
+            cta.innerHTML = '<button type="button" class="grace-cta-close"></button>'
+                + '<a class="btn" href="/trial?from=grace" target="_blank">trial</a>'
+                + '<button type="button" class="grace-cta-continue"></button>';
+            page.container.appendChild(cta);
+        });
+        await playPast(p, 31);
+        const cta = document.getElementById('grace-cta');
+        assert.equal(cta.classList.contains('hidden'), false, 'the popup is up');
+        assert.equal('graceCtaAnswered' in p.video.dataset, false, 'shown is not answered');
+        cta.querySelector('a').addEventListener('click', (e) => e.preventDefault());
+        cta.querySelector('a').click();
+        assert.equal('graceCtaAnswered' in p.video.dataset, false, 'the trial link is not an answer');
+        assert.equal(cta.classList.contains('hidden'), false);
+        cta.querySelector(button).click();
+        assert.equal(cta.classList.contains('hidden'), true, 'closed');
+        assert.equal(p.video.dataset.graceCtaAnswered, answer);
+        assert.ok(p.events.some((e) => e.name === 'grace-soft-cta-click' && e.data.action === answer), 'Umami as before');
+    });
+}
+
+// ---- the grace popup holds the film (grace-hold.js) ---------------------
+//
+// Owner, 2026-09-26: the film stops when the popup comes up, and goes on with
+// the answer -- only if the popup stopped it. hls.js keeps filling the buffer
+// meanwhile, and the transfer status keeps reading the player as playing
+// (lib/playerActivity.js: the page's pause, data-grace-cta-hold, not the
+// viewer's).
+
+// gracePopup puts the popup on the page as stream_video.html renders it: the
+// close, the trial link (a new tab), "continue at N Mbps".
+function gracePopup(page, sec = 30) {
+    page.video.dataset.graceDurationSec = String(sec);
+    const cta = document.createElement('div');
+    cta.id = 'grace-cta';
+    cta.className = 'hidden';
+    cta.setAttribute('data-upsell-surface', 'grace');
+    cta.innerHTML = '<button type="button" class="grace-cta-close"></button>'
+        + '<a class="btn" href="/trial?from=grace" target="_blank">trial</a>'
+        + '<button type="button" class="grace-cta-continue"></button>';
+    page.container.appendChild(cta);
+}
+const graceCta = () => document.getElementById('grace-cta');
+const popupUp = () => !graceCta().classList.contains('hidden');
+const graceClick = (p) => p.events.find((e) => e.name === 'grace-soft-cta-click');
+const keydown = (key) => document.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key, bubbles: true }));
+
+for (const [button, answer] of [['.grace-cta-continue', 'continue'], ['.grace-cta-close', 'dismiss']]) {
+    test(`the grace popup stops the film, and "${answer}" plays it again`, async (t) => {
+        t.after(() => destroyPlayer());
+        const p = await mountPlayer((page) => gracePopup(page));
+        const log = playback(p.video);
+        const activity = createPlayerActivity(document);
+        t.after(() => activity.stop());
+        await playPast(p, 31);
+        assert.ok(popupUp(), 'the popup is up');
+        assert.equal(p.video.paused, true, 'and the film stopped with it');
+        assert.equal(log.pause, 1);
+        assert.ok('graceCtaHold' in p.video.dataset, 'the page’s pause, on the element');
+        assert.equal(activity.streaming(), true, 'the status keeps the viewer on the chain: not their pause');
+        assert.equal(activity.state(), 'playing');
+        assert.deepEqual(p.events.find((e) => e.name === 'grace-soft-cta-shown').data, { paused: true });
+        await settle();
+        assert.equal(p.video.paused, true, 'it stays stopped');
+
+        graceCta().querySelector(button).click();
+        await settle();
+        assert.equal(popupUp(), false);
+        assert.equal(p.video.dataset.graceCtaAnswered, answer);
+        assert.equal(log.play, 1, 'the answer starts it');
+        assert.equal(p.video.paused, false, 'and nothing pauses it again');
+        assert.equal('graceCtaHold' in p.video.dataset, false);
+        assert.deepEqual(graceClick(p).data, { action: answer, via: 'button', paused: true });
+    });
+}
+
+// The popup comes up a frame after the clock crosses (a render effect): a
+// viewer who paused in between paused it themselves, and the answer leaves
+// their pause alone.
+test('a film the viewer had paused stays paused after the answer', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer((page) => gracePopup(page));
+    const log = playback(p.video);
+    p.video.paused = false;
+    p.video.currentTime = 31;
+    // After the player's clock has read 0:31 in this frame, before the
+    // effect that puts the popup up runs in the next one.
+    await new Promise((resolve) => requestAnimationFrame(() => { p.video.pause(); resolve(); }));
+    await settle();
+    assert.ok(popupUp(), 'fixture: the popup came up over a film the viewer paused');
+    assert.equal(log.pause, 1, 'their pause, and no other');
+    assert.equal('graceCtaHold' in p.video.dataset, false, 'not the page’s pause');
+    assert.deepEqual(p.events.find((e) => e.name === 'grace-soft-cta-shown').data, { paused: false });
+
+    graceCta().querySelector('.grace-cta-continue').click();
+    await settle();
+    assert.equal(popupUp(), false);
+    assert.equal(p.video.dataset.graceCtaAnswered, 'continue');
+    assert.equal(log.play, 0, 'nothing starts it');
+    assert.equal(p.video.paused, true);
+    assert.equal(graceClick(p).data.paused, false);
+});
+
+// The trial link opens a new tab and the popup stays: no answer, and the
+// film does not start behind it.
+test('the trial link starts nothing behind the popup', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer((page) => gracePopup(page));
+    const log = playback(p.video);
+    await playPast(p, 31);
+    const a = graceCta().querySelector('a');
+    a.addEventListener('click', (e) => e.preventDefault());
+    a.click();
+    await settle();
+    assert.ok(popupUp());
+    assert.equal(p.video.paused, true);
+    assert.equal(log.play, 0);
+    assert.ok('graceCtaHold' in p.video.dataset);
+    assert.equal('graceCtaAnswered' in p.video.dataset, false);
+    assert.equal(graceClick(p), undefined);
+});
+
+// Play while the popup is up (space here; the big button, a click on the
+// picture and the headset go through the same toggle) is the answer
+// "continue": it says what the button says, and a Play that did nothing
+// would read as a broken player. It plays, whoever paused the film.
+test('Play while the popup is up is the answer "continue"', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer((page) => gracePopup(page));
+    const log = playback(p.video);
+    await playPast(p, 31);
+    assert.equal(p.video.paused, true, 'fixture: held');
+    keydown(' ');
+    await settle();
+    assert.equal(popupUp(), false, 'answered');
+    assert.equal(p.video.dataset.graceCtaAnswered, 'continue');
+    assert.equal(log.play, 1);
+    assert.equal(p.video.paused, false);
+    assert.deepEqual(graceClick(p).data, { action: 'continue', via: 'play', paused: true });
+    keydown(' ');
+    await settle();
+    assert.equal(p.video.paused, true, 'from here on space is play/pause as ever');
+    assert.equal(p.events.filter((e) => e.name === 'grace-soft-cta-click').length, 1, 'one answer');
+});
+
+// P6: a file's Download opens a dialog of the page over the playing film
+// (partials/file.html). A key on its buttons is the button's, not Play's.
+test('a key in a dialog of the page is that dialog\'s: the film plays on, where it was', async (t) => {
+    const p = await mountPlayer();
+    const dlg = document.createElement('dialog');
+    dlg.id = 'download-modal-x';
+    dlg.open = true;
+    dlg.innerHTML = '<form method="dialog"><button>x</button></form><a class="closeable-close" href="/dl">start download</a>';
+    document.body.appendChild(dlg);
+    t.after(() => { dlg.remove(); destroyPlayer(); });
+    const log = playback(p.video);
+    await playPast(p, 31);
+    const at = p.video.currentTime;
+    const pauses = log.pause;
+    const space = new dom.window.KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true });
+    dlg.querySelector('button').dispatchEvent(space);
+    dlg.querySelector('a').dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true }));
+    await settle();
+    assert.equal(space.defaultPrevented, false, 'the button gets its press');
+    assert.equal(log.pause, pauses);
+    assert.equal(p.video.paused, false);
+    assert.equal(p.video.currentTime, at, 'no seek under it');
+    keydown(' ');
+    await settle();
+    assert.equal(p.video.paused, true, 'outside it, space is play/pause as ever');
+});
+
+// The popup is modal: the player's own keys stop at it -- the arrows moved
+// the film under it, back into the window too, with the popup still up --
+// but for Play (the answer "continue", above) and Next (the hold dropped,
+// docs/grace_token.md). A key on one of the popup's own buttons is that
+// button's: space on the close is the close, not "continue".
+test('the popup up: the player\'s keys stop at it, and a key on its own button is the button\'s', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer((page) => gracePopup(page));
+    await playPast(p, 31);
+    assert.ok(popupUp(), 'fixture: up');
+    const at = p.video.currentTime;
+    keydown('ArrowRight');
+    keydown('ArrowLeft');
+    await settle();
+    assert.equal(p.video.currentTime, at, 'no seek under it');
+    assert.ok(popupUp(), 'still up');
+    const close = graceCta().querySelector('.grace-cta-close');
+    close.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true }));
+    await settle();
+    assert.equal(graceClick(p), undefined, 'not "continue" by Play');
+    assert.ok(popupUp(), 'the button\'s own press is left to the browser');
+});
+
+// Whatever else starts the film while the popup is up -- the embed's
+// player_play here; the subtitle catch-up letting go is another -- is put
+// back on its `play` event, and counted as playback the answer resumes.
+test('whatever else starts the film behind the popup is put back until the answer', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer((page) => gracePopup(page));
+    const log = playback(p.video);
+    await playPast(p, 31);
+    window.dispatchEvent(new dom.window.CustomEvent('player_play'));
+    await settle();
+    assert.equal(log.play, 1, 'fixture: something played it');
+    assert.equal(p.video.paused, true, 'put back');
+    graceCta().querySelector('.grace-cta-close').click();
+    await settle();
+    assert.equal(p.video.paused, false, 'the answer starts it');
+});
+
+test('in fullscreen the popup leaves it, and the film stops', async (t) => {
+    let exited = 0;
+    Object.defineProperty(document, 'fullscreenElement', { configurable: true, get: () => document.body });
+    document.exitFullscreen = () => { exited++; return Promise.resolve(); };
+    t.after(() => {
+        destroyPlayer();
+        delete document.fullscreenElement;
+        delete document.exitFullscreen;
+    });
+    const p = await mountPlayer((page) => gracePopup(page));
+    playback(p.video);
+    await playPast(p, 31);
+    assert.equal(exited, 1, 'out of fullscreen: the popup lives outside it');
+    assert.ok(popupUp());
+    assert.equal(p.video.paused, true);
+});
+
+// A session seek past the window: the timeline shows the target at once, so
+// the popup comes up as the seek starts, and the seek's play() -- when the
+// transcoder's new run is ready -- would start the film behind it. The seek
+// asks the hold first (session-seek.js holdPlayback), loads the new run
+// without playing it, and lets go when it can play; the answer starts it.
+test('a session seek past the window: the new run waits for the answer', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = mount();
+    gracePopup(p, 10);
+    p.video.dataset.sessionId = 's1';
+    p.video.dataset.sessionSeekUrl = '/session/seek';
+    p.video.setAttribute('data-duration', '3600');
+    let releasePost = null;
+    p.setResponse((url, params) => {
+        if (params && params.method === 'POST' && String(url).startsWith('/session/seek')) {
+            return new Promise((resolve) => {
+                releasePost = () => resolve({ ok: true, status: 200, json: async () => ({ offset: 15 }) });
+            });
+        }
+        return { ok: true, status: 200, headers: new dom.window.Headers(), json: async () => ({ offset: 0 }) };
+    });
+    await initPlayer(p.container);
+    await settle();
+    const log = playback(p.video);
+    p.video.load = () => {};
+    const posts = () => p.calls.filter((c) => c.params && c.params.method === 'POST' && String(c.url).startsWith('/session/seek')).length;
+    p.video.paused = false;
+    keydown('ArrowRight'); // 0:00 -> 0:15, past the 10 s window
+    await settle();
+    assert.ok(popupUp(), 'the popup came up with the seek');
+    assert.equal(p.video.paused, true, 'the film stopped');
+    // The transcoder answers: the new run is loaded -- and not played.
+    releasePost();
+    await settle();
+    assert.equal(log.play, 0, 'the seek did not start the film behind the popup');
+    assert.equal(p.video.paused, true);
+    assert.ok('graceCtaHold' in p.video.dataset);
+    keydown('ArrowRight');
+    await settle();
+    assert.equal(posts(), 1, 'still seeking: nothing else is sought yet');
+    // The new run can play: the seek lets go, paused under the popup.
+    p.video.dispatchEvent(new dom.window.Event('canplay'));
+    await settle();
+    assert.equal(log.play, 0, 'still not played');
+    // ...and the element's `autoplay`, which the reload re-arms, starts it by
+    // itself (Chrome, live, 2026-09-26): put back.
+    p.video.play();
+    await settle();
+    assert.equal(p.video.paused, true, 'autoplay put back');
+    graceCta().querySelector('.grace-cta-continue').click();
+    await settle();
+    assert.equal(log.play, 2, 'the answer starts it');
+    assert.equal(p.video.paused, false);
+    assert.equal(graceClick(p).data.paused, true);
+    keydown('ArrowRight');
+    await settle();
+    assert.equal(posts(), 2, 'the held seek had let go: seeking works again');
+});
+
+// The same through hls.js (the seeker pauses the old run itself there, and
+// starts the new one only if the film was playing): a seek that lands paused
+// never asks the hold, and the answer leaves the film paused.
+test('a held seek through hls.js settles paused on canplay; one that lands paused stays paused', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer((it) => { it.installHls({}); });
+    const log = playback(p.video);
+    const hold = createGraceHold(p.video);
+    const seeker = createSessionSeeker({
+        hls: window.hlsPlayer, videoEl: p.video, sessionSeekUrl: '/session/seek',
+        sourceUrl: 'https://x.test/index.m3u8', trackContainer: p.container,
+        holdPlayback: () => hold.holds(),
+    });
+    p.video.paused = false;
+    const seeking = seeker.seek(120);
+    hold.start(); // the popup, up as the seek starts
+    await flush();
+    await flush();
+    assert.equal(log.play, 0, 'loaded, not played');
+    assert.equal(seeker.isSeeking(), true);
+    p.video.dispatchEvent(new dom.window.Event('canplay'));
+    await flush();
+    assert.equal(seeker.isSeeking(), false, 'settled when it could play');
+    await seeking;
+    assert.equal(p.video.paused, true);
+    assert.equal(hold.release(), true);
+    assert.equal(p.video.paused, false, 'the answer starts it');
+    await settle();
+
+    p.video.pause();
+    const again = createGraceHold(p.video);
+    again.start();
+    seeker.seek(600);
+    await flush();
+    await flush();
+    assert.equal(again.held(), false, 'a seek that lands paused does not ask');
+    assert.equal(again.release(), false);
+    assert.equal(p.video.paused, true, 'and stays paused');
+});
+
+// The popup comes up after the seek's play() went out (the hold's pause
+// aborts it, and the seek retries at canplay): the retry asks the hold, and
+// the seek settles paused instead of playing behind it.
+test('a seek whose play() the popup aborted settles paused at canplay', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer((it) => { it.installHls({}); });
+    let plays = 0;
+    p.video.pause = () => { p.video.paused = true; };
+    p.video.play = () => { plays++; return Promise.reject(new dom.window.DOMException('interrupted by a call to pause()', 'AbortError')); };
+    const hold = createGraceHold(p.video);
+    const seeker = createSessionSeeker({
+        hls: window.hlsPlayer, videoEl: p.video, sessionSeekUrl: '/session/seek',
+        sourceUrl: 'https://x.test/index.m3u8', trackContainer: p.container,
+        holdPlayback: () => hold.holds(),
+    });
+    p.video.paused = false;
+    const seeking = seeker.seek(120);
+    await flush();
+    await flush();
+    assert.equal(plays, 1, 'fixture: the new run was started before the popup');
+    hold.start();
+    p.video.dispatchEvent(new dom.window.Event('canplay'));
+    await flush();
+    assert.equal(plays, 1, 'the retry asked the hold and did not play');
+    assert.equal(seeker.isSeeking(), false, 'settled');
+    await seeking;
+    assert.equal(hold.held(), true, 'the answer will start it');
+});
+
+// A refused seek restarts the old run it paused -- not behind the popup.
+test('a refused seek does not restart the film behind the popup', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer((it) => { it.installHls({}); });
+    const log = playback(p.video);
+    let refuse = null;
+    p.setResponse(() => new Promise((resolve) => { refuse = () => resolve({ ok: false, status: 503 }); }));
+    const hold = createGraceHold(p.video);
+    const seeker = createSessionSeeker({
+        hls: window.hlsPlayer, videoEl: p.video, sessionSeekUrl: '/session/seek',
+        sourceUrl: 'https://x.test/index.m3u8', trackContainer: p.container,
+        holdPlayback: () => hold.holds(),
+    });
+    p.video.paused = false;
+    const seeking = seeker.seek(120); // pauses the playing film for the POST
+    hold.start(); // the popup, up while the POST is out
+    await flush();
+    refuse();
+    await seeking;
+    assert.equal(seeker.isSeeking(), false);
+    assert.equal(log.play, 0, 'not restarted behind the popup');
+    assert.equal(p.video.paused, true);
+    assert.equal(hold.held(), true, 'the answer restarts it');
+});
+
+// The player goes while the popup holds the film (a teardown; "Next" below):
+// the answer given after that starts nothing, and the next player is free.
+test('the player goes while the popup holds: nothing resumes, the next one starts free', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer((page) => gracePopup(page));
+    const log = playback(p.video);
+    await playPast(p, 31);
+    assert.equal(p.video.paused, true, 'fixture: held');
+    const old = p.video;
+    destroyPlayer();
+    assert.equal('graceCtaHold' in old.dataset, false);
+    graceCta().querySelector('.grace-cta-continue').click();
+    await settle();
+    assert.equal(log.play, 0, 'the film that went does not start');
+
+    const q = await mountPlayer((page) => gracePopup(page));
+    const qlog = playback(q.video);
+    await playPast(q, 10);
+    q.video.pause();
+    q.video.play();
+    await settle();
+    assert.equal(qlog.pause, 1);
+    assert.equal(q.video.paused, false, 'nothing holds the new film inside its window');
+});
+
+test('Next while the popup holds: the answer does not start the film being left', async (t) => {
+    t.after(() => { destroyPlayer(); window.sessionStorage.clear(); });
+    const p = await mountPlayer((page) => {
+        gracePopup(page);
+        Object.assign(page.video.dataset, { nextItemId: 'i2', nextPath: 'S01/e02.mkv', nextKind: 'episode', nextLabel: 'E02' });
+        // What canMoveOn looks for: the start form and #content.
+        const form = document.createElement('form');
+        form.setAttribute('action', 'https://webtor.io/stream-video');
+        form.innerHTML = '<input type="hidden" name="resource-id" value="res"><input type="hidden" name="item-id" value="i1">';
+        page.container.appendChild(form);
+        const content = document.createElement('div');
+        content.id = 'content';
+        page.container.appendChild(content);
+    });
+    const log = playback(p.video);
+    await playPast(p, 31);
+    assert.equal(p.video.paused, true, 'fixture: held');
+    keydown('n');
+    await settle();
+    graceCta().querySelector('.grace-cta-continue').click();
+    await settle();
+    assert.equal(log.play, 0, 'the viewer said next');
+    assert.equal(p.video.paused, true);
+});
+
+test('kick() is a no-op with no translation running \u2014 a seek with nothing playing does not throw', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = mount();
+    p.video.dataset.sessionId = 's1';
+    p.video.dataset.sessionSeekUrl = '/session/seek';
+    p.video.setAttribute('data-duration', '3600');
+    p.setResponse(() => ({ ok: true, status: 200, json: async () => ({}) }));
+    await initPlayer(p.container);
+    await settle();
+
+    document.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    await settle();
+    // Nothing to assert beyond "it didn't throw" \u2014 pollStopRef.current is
+    // null, and kickTranslationPoll's own guard is the whole of the fix
+    // for that case.
+});
+
+// ---- the catching-up banner -------------------------------------------
+//
+// A live (embedded-track) translation runs alongside the transcode and can
+// fall behind the playhead: the film plays on and the cues for what is on
+// screen have not been written yet. The service says where its frontier is
+// (X-Subtitle-Pending-From, movie time), the player compares it with the
+// playhead, and the banner offers to wait.
+//
+// The i18n bundle is empty under `node --test` (see jsx-hooks.mjs), so t()
+// answers with the key — which is exactly what makes "which of the two
+// sentences is showing" assertable.
+
+// catchUpResponse is a live answer that also carries the frontier.
+// `pendingFrom` null is an older service, or a run with nothing pending
+// ahead — the two cases that must produce no banner at all.
+const catchUpResponse = (header, pendingFrom) => ({
+    ok: true,
+    status: 200,
+    headers: {
+        get: (n) => {
+            if (n === 'X-Subtitle-Progress') return header;
+            if (n === 'X-Subtitle-Live') return '1';
+            if (n === 'X-Subtitle-Pending-From') return pendingFrom;
+            return null;
+        },
+    },
+    json: async () => ({}),
+});
+
+// jsdom implements neither play() nor pause() (they are the "not
+// implemented" stubs, and pause() fires no event). These are what a
+// browser does as far as this feature can tell: the flag flips at once
+// and the event is *queued* — HTML queues a media element task for
+// `pause` and `play` rather than dispatching inside the call.
+//
+// The asynchrony is not decoration. handleWait pauses and then resumes
+// the poll, so a synchronously dispatched `pause` would land before the
+// resume and be undone by it — which hides the one thing the
+// waitingRef guard in sleep() is there for: in a browser the event
+// arrives after the resume, and without the guard it would put the run
+// to sleep for good, leaving the viewer paused on a translation nobody
+// is asking about any more.
+function playback(video) {
+    const log = { play: 0, pause: 0 };
+    const queue = (name) => setTimeout(() => video.dispatchEvent(new dom.window.Event(name)), 0);
+    video.play = () => {
+        log.play++;
+        video.paused = false;
+        queue('play');
+        return Promise.resolve();
+    };
+    video.pause = () => {
+        log.pause++;
+        video.paused = true;
+        queue('pause');
+    };
+    return log;
+}
+
+const catchUpBanner = (p) => p.container.querySelector('.wt-catchup');
+// The pill that says "behind" -- as opposed to the few seconds of "caught up"
+// that follow it since 2026-09-18 (doneBanner). "Nothing says behind" is what
+// the assertions below mean by null.
+const behindBanner = (p) => p.container.querySelector('.wt-catchup:not(.wt-catchup--done)');
+const doneBanner = (p) => p.container.querySelector('.wt-catchup--done');
+
+// pickPausedThenPlay starts the run the way a viewer does who chooses the
+// track before pressing play. Since 2026-09-18 a run started over a PLAYING
+// film opens the hold window (see "starting a translation over a playing
+// film" below); the tests about the passive banner, the manual Wait and the
+// run mismatch are about a run that is simply behind, so they start here.
+async function pickPausedThenPlay(p, at) {
+    click(p.container.querySelector('#subtitles .subtitle[data-id="tr-pt"]'));
+    await settle();
+    p.video.paused = false;
+    p.video.currentTime = at;
+    p.video.dispatchEvent(new dom.window.Event('play'));
+    await settle();
+}
+const catchUpText = (p) => catchUpBanner(p).querySelector('.wt-catchup-text').textContent;
+
+test('a translation at the playhead holds the film; one that gets ahead lets it go', async (t) => {
+    // Owner, 2026-09-18: the pill used to OFFER to wait here. The player now
+    // holds the film by itself whenever the translation is behind.
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer();
+    const log = playback(p.video);
+    // The frontier — where the untranslated part starts — is right where
+    // the viewer is, so the next thing they hear has no subtitle yet.
+    let pending = '100';
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? catchUpResponse('12/400', pending)
+        : { ok: true, status: 200, json: async () => ({}) }));
+
+    await pickPausedThenPlay(p, 100);
+
+    assert.ok(catchUpBanner(p), 'the run is at the playhead, so it is behind it');
+    assert.equal(catchUpText(p), 'player.subtitleCatchUpWaitingShort');
+    assert.equal(p.video.paused, true, 'and the film is held for it');
+    assert.equal(p.events.filter((e) => e.name === 'subtitle-translate-wait').at(-1).data.auto, true);
+    // No number, on any source (2026-09-18): on a live one `total - done` is
+    // everything the transcoder has emitted minutes ahead of the viewer --
+    // 388 here, ~300 on the owner's screen -- and reads as "never".
+    assert.equal(catchUpBanner(p).dataset.remaining, undefined, 'no cue count on the pill');
+    assert.equal(catchUpBanner(p).querySelector('.wt-catchup-text-short'), null, 'one copy, not a long and a short one');
+    assert.ok(catchUpBanner(p).querySelector('.wt-catchup-btn'), 'with Keep watching on it');
+
+    // The service gets comfortably ahead (past the 5 s clear margin).
+    pending = '400';
+    const playsBefore = log.play;
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.equal(behindBanner(p), null, 'nothing to catch up to, nothing to say');
+    assert.ok(log.play > playsBefore, 'and the film goes on by itself');
+});
+
+test('a service that sends no frontier shows no banner at all', async (t) => {
+    // The compatibility case, and the one the client cannot get wrong:
+    // every deployment before the header shipped, every batch source, and
+    // every live run with nothing pending ahead. Absence is "no banner",
+    // never "behind".
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer();
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? liveProgressResponse('12/400')
+        : { ok: true, status: 200, json: async () => ({}) }));
+
+    p.video.paused = false;
+    p.video.currentTime = 100;
+    click(p.container.querySelector('#subtitles .subtitle[data-id="tr-pt"]'));
+    await settle();
+
+    assert.equal(behindBanner(p), null);
+    assert.equal(p.container.querySelector('.tr-progress').hidden, false, 'the chip still reports the run');
+});
+
+test('Wait pauses the film, keeps the poll awake, and plays again once the run is ahead', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer();
+    // Eight seconds behind the playhead.
+    let pending = '92';
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? catchUpResponse('12/400', pending)
+        : { ok: true, status: 200, json: async () => ({}) }));
+    const heads = () => p.calls.filter((c) => c.params && c.params.method === 'HEAD').length;
+    const log = playback(p.video);
+
+    await pickPausedThenPlay(p, 100);
+    assert.ok(catchUpBanner(p));
+    // The Wait button is what the pill offers a viewer who overruled the
+    // automatic hold: Keep watching first.
+    click(catchUpBanner(p).querySelector('.wt-catchup-btn'));
+    await settle();
+    assert.equal(p.video.paused, false, 'fixture: Keep watching plays the film');
+    assert.equal(catchUpText(p), 'player.subtitleCatchUpShort', 'fixture: and the pill goes back to offering');
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.equal(p.video.paused, false, 'an overruled hold does not come back on the next tick');
+    const pausesBefore = log.pause;
+
+    click(catchUpBanner(p).querySelector('.wt-catchup-btn'));
+    await settle();
+
+    assert.equal(log.pause, pausesBefore + 1, 'Wait pauses the film');
+    assert.equal(p.video.paused, true);
+    assert.equal(catchUpText(p), 'player.subtitleCatchUpWaitingShort', 'and the banner says why it is paused');
+    const waits = p.events.filter((e) => e.name === 'subtitle-translate-wait');
+    assert.equal(waits.length, 2, 'the automatic hold, then one event for one press');
+    assert.equal(waits[1].data.auto, false);
+    assert.equal(waits[1].data.lang, 'pt');
+    assert.equal(waits[1].data.behind, 8, 'how far behind the run was when they pressed it');
+
+    // The whole of the feature: a pause normally suspends the poll, and
+    // this one must not — the HEAD every 3 s is what the viewer is waiting
+    // on, and for a live source it is what keeps the transcoder session
+    // (and the translation reading it) alive.
+    const atPause = heads();
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.ok(heads() > atPause, `the poll must stay awake while waiting: ${heads()} HEADs vs ${atPause} at the pause`);
+    assert.ok(catchUpBanner(p), 'and the banner stands until the run catches up');
+
+    // Comfortably ahead: the film goes back on by itself.
+    pending = '400';
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.ok(log.play >= 1, 'playback resumes on its own');
+    assert.equal(behindBanner(p), null);
+    const dones = p.events.filter((e) => e.name === 'subtitle-translate-wait-done');
+    assert.equal(dones.length, 1, 'one event for one wait');
+    assert.equal(dones[0].data.lang, 'pt');
+    assert.ok(typeof dones[0].data.seconds === 'number' && dones[0].data.seconds >= 0,
+        `the wait is measured: ${JSON.stringify(dones[0].data)}`);
+    // 8 s of film went by without subtitles: back to that line plus the
+    // lead-in (8 + 2), inside the playlist that is playing.
+    assert.equal(dones[0].data.rewind, 10);
+    assert.equal(p.video.currentTime, 90, 'the film is put back to the line the viewer missed');
+});
+
+test('× takes the banner away and the next trailing tick does not bring it back', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer();
+    let pending = '100';
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? catchUpResponse('12/400', pending)
+        : { ok: true, status: 200, json: async () => ({}) }));
+
+    p.video.paused = false;
+    p.video.currentTime = 100;
+    click(p.container.querySelector('#subtitles .subtitle[data-id="tr-pt"]'));
+    await settle();
+    assert.ok(catchUpBanner(p));
+
+    click(catchUpBanner(p).querySelector('.wt-catchup-close'));
+    await settle();
+    assert.equal(behindBanner(p), null, '× hides it');
+
+    // Still behind, still dismissed: a banner that came back three
+    // seconds later would make the × read as broken.
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.equal(behindBanner(p), null, 'and it stays hidden while the run is still behind');
+
+    // The dismissal was about a stretch of film the run was behind on.
+    // Once it is no longer behind, that stretch is over...
+    pending = '400';
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.equal(behindBanner(p), null, 'caught up: nothing to show either way');
+
+    // ...and the next time it falls behind, it may say so again.
+    pending = '100';
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.ok(catchUpBanner(p), 'a fresh stretch of film gets a fresh offer');
+});
+
+// ---- a seek waits for its subtitles -------------------------------------
+//
+// After a seek into film the live translation has not reached, the first
+// lines play with no subtitles. The seek already costs the viewer a pause
+// (the transcoder restarts), so the wait for those lines is folded into it:
+// the same wait as the Wait button, started by the seek, and bounded — one
+// slow batch must not turn a seek into a hang.
+
+// mountSessionRun mounts a transcoder-session player with a live AI run on
+// the Portuguese track, playing, and returns what the tests drive.
+async function mountSessionRun(t, respond, { sessionOffset = 0, startPaused = false } = {}) {
+    t.after(() => destroyPlayer());
+    const p = mount({ tracks: [['tr-pt', false]] });
+    p.video.dataset.sessionId = 's1';
+    p.video.dataset.sessionSeekUrl = '/session/seek';
+    p.video.setAttribute('data-duration', '3600');
+    // The GET of the seek URL at mount is how the player learns the offset
+    // of the session it joined (a resume lands mid-film); the seek POST
+    // answers ok without an offset, like a transcoder from before it said
+    // (the fallback quantization is what these tests pin).
+    p.setResponse((url, params) => {
+        if (params && params.method === 'HEAD') return respond();
+        if (params && params.method === 'POST') return { ok: true, status: 200, json: async () => ({ ok: true }) };
+        return { ok: true, status: 200, json: async () => ({ offset: sessionOffset }) };
+    });
+    await initPlayer(p.container);
+    await settle();
+    const log = playback(p.video);
+    if (startPaused) {
+        await pickPausedThenPlay(p, 1);
+    } else {
+        p.video.paused = false;
+        p.video.currentTime = 1;
+        click(p.container.querySelector('#subtitles .subtitle[data-id="tr-pt"]'));
+        await settle();
+    }
+    // ArrowRight is the same handleSeek a drag on the timeline reaches.
+    const seek = async () => {
+        document.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+        await settle();
+        // The new run is playing: what a browser reports once the seek lands.
+        p.video.currentTime = 1;
+        p.video.dispatchEvent(new dom.window.Event('playing'));
+        await settle();
+    };
+    const events = (name) => p.events.filter((e) => e.name === name);
+    return { p, log, seek, events };
+}
+
+test('a seek into untranslated film holds playback until the translation is ahead, then plays', async (t) => {
+    let pending = '400';
+    const { p, log, seek, events } = await mountSessionRun(t, () => catchUpResponse('12/400', pending));
+    assert.equal(behindBanner(p), null, 'ahead before the seek: nothing to say');
+
+    // The seek lands on film the run has not translated.
+    pending = '0';
+    const pausesBefore = log.pause;
+    await seek();
+
+    assert.ok(log.pause > pausesBefore, 'the seek holds playback for its subtitles');
+    assert.equal(catchUpText(p), 'player.subtitleCatchUpWaitingShort', 'and says why');
+    const waits = events('subtitle-translate-wait');
+    assert.equal(waits.length, 1);
+    assert.equal(waits[0].data.auto, true, 'told apart from a press of Wait');
+
+    pending = '400';
+    const playsBefore = log.play;
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.ok(log.play > playsBefore, 'playback resumes once the run is ahead');
+    assert.equal(behindBanner(p), null);
+    const dones = events('subtitle-translate-wait-done');
+    assert.equal(dones.length, 1);
+    assert.equal(dones[0].data.auto, true);
+});
+
+test('the hold after a seek has no cap: it lasts until the run is ahead or the viewer says so', async (t) => {
+    // Owner, 2026-09-18: the hold gave up after 20 s and played the film
+    // without subtitles. Nothing on a timer ends it any more.
+    let pending = '400';
+    const { p, log, seek, events } = await mountSessionRun(t, () => catchUpResponse('12/400', pending));
+
+    pending = '0';
+    await seek();
+    assert.equal(catchUpText(p), 'player.subtitleCatchUpWaitingShort');
+
+    // Two poll windows of a run that stays behind: still held.
+    const playsBefore = log.play;
+    await wait(2 * POLL_INTERVAL_WINDOW_MS);
+    assert.equal(log.play, playsBefore, 'nothing plays the film under a run that is still behind');
+    assert.equal(catchUpText(p), 'player.subtitleCatchUpWaitingShort');
+    assert.equal(events('subtitle-translate-wait-done').length, 0);
+
+    // The viewer's way out is on the pill.
+    click(catchUpBanner(p).querySelector('.wt-catchup-btn'));
+    await settle();
+    assert.ok(log.play > playsBefore, 'Keep watching plays it');
+});
+
+test('no hold when the seek happened on a paused film, or the service does not say where it is', async (t) => {
+    await t.test('paused at the seek', async (tt) => {
+        let pending = '400';
+        const { p, log, seek, events } = await mountSessionRun(tt, () => catchUpResponse('12/400', pending));
+        p.video.paused = true;
+        pending = '0';
+        const pausesBefore = log.pause;
+        await seek();
+        await wait(POLL_INTERVAL_WINDOW_MS);
+        // The seek decides nothing for a film that was paused -- but the
+        // seeker's native path plays the new run, and a film playing over
+        // untranslated lines is held like any other (2026-09-18).
+        assert.ok(log.pause > pausesBefore);
+        assert.equal(events('subtitle-translate-wait').length, 1, 'by the ordinary rule, once');
+    });
+    await t.test('paused after the seek landed, before the answer came back', async (tt) => {
+        let pending = '400';
+        const { p, log, events } = await mountSessionRun(tt, () => catchUpResponse('12/400', pending));
+        pending = '0';
+        document.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+        await settle();
+        p.video.currentTime = 1;
+        p.video.dispatchEvent(new dom.window.Event('playing'));
+        // The viewer pauses in the same moment: the settle's request is
+        // still in flight. Since 2026-09-18 the element is already paused
+        // by then (the silent hold), so their pause arrives as a toggle --
+        // which must mean "pause", not "play".
+        click(p.video);
+        await settle();
+        assert.equal(p.video.paused, true, 'the toggle during the silent hold pauses');
+        const pausesAfterViewer = log.pause;
+        const playsAfterViewer = log.play;
+        await wait(POLL_INTERVAL_WINDOW_MS);
+        assert.equal(events('subtitle-translate-wait').length, 0, 'no hold for a film the viewer paused');
+        assert.equal(log.pause, pausesAfterViewer);
+        assert.equal(log.play, playsAfterViewer, 'and nothing plays it back on under them');
+    });
+    await t.test('older service without the frontier header', async (tt) => {
+        const { p, log, seek, events } = await mountSessionRun(tt, () => liveProgressResponse('12/400'));
+        const playsBefore = log.play;
+        await seek();
+        await settle();
+        // The silent hold pauses for one answer and lets go on it: no wait,
+        // no banner, and the film is playing again.
+        assert.equal(events('subtitle-translate-wait').length, 0);
+        assert.equal(behindBanner(p), null);
+        assert.equal(p.video.paused, false, 'the first answer releases the film');
+        assert.ok(log.play > playsBefore);
+    });
+});
+
+// ---- the seek hold, after review ---------------------------------------
+
+// A live answer that also says which run it describes.
+const runResponse = (header, pendingFrom, sessionOffset) => ({
+    ok: true,
+    status: 200,
+    headers: {
+        get: (n) => {
+            if (n === 'X-Subtitle-Progress') return header;
+            if (n === 'X-Subtitle-Live') return '1';
+            if (n === 'X-Subtitle-Pending-From') return pendingFrom;
+            if (n === 'X-Subtitle-Session-Offset') return sessionOffset;
+            return null;
+        },
+    },
+    json: async () => ({}),
+});
+
+test('a pause while the answer after a seek is in flight cancels the seek\u2019s hold; a later play answers to the ordinary rule', async (t) => {
+    // Found in review: the "hold after this seek" flag was only cleared by a
+    // poll answer, a pause dropped that answer, and the next play — seconds
+    // or minutes later — paused the film again.
+    let pending = '400';
+    const delayed = () => new Promise((resolve) => setTimeout(() => resolve(catchUpResponse('12/400', pending)), 200));
+    const { p, log, events } = await mountSessionRun(t, delayed);
+    await wait(300);
+    pending = '0';
+    document.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    await settle();
+    p.video.currentTime = 1;
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await wait(20);
+    // Through the UI, as a viewer does: the element is already paused by the
+    // silent hold, and the toggle is what reads that as "pause".
+    click(p.video);
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.equal(p.video.paused, true, 'nothing played it back on under them');
+    assert.equal(events('subtitle-translate-wait').length, 0, 'the seek\u2019s own hold is gone');
+    p.video.play();
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    // Since 2026-09-18 a film playing over untranslated lines is held
+    // whatever brought it there; what must not happen is a hold the viewer
+    // cannot get out of.
+    assert.equal(events('subtitle-translate-wait').length, 1, 'held by the ordinary rule');
+    click(catchUpBanner(p).querySelector('.wt-catchup-btn'));
+    await settle();
+    const pauses = log.pause;
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.equal(log.pause, pauses, 'Keep watching is the end of it');
+    assert.equal(events('subtitle-translate-wait').length, 1);
+});
+
+test('a run that dies during a seek\u2019s hold plays the film it paused', async (t) => {
+    // The Wait button leaves the film paused when its run dies — the viewer
+    // paused on purpose. A hold is a pause the viewer never asked for.
+    let status = 200;
+    let pending = '400';
+    const { p, log, seek } = await mountSessionRun(t, () => (status === 200
+        ? catchUpResponse('12/400', pending)
+        : { ok: false, status, headers: { get: () => null } }));
+    pending = '0';
+    await seek();
+    assert.equal(catchUpText(p), 'player.subtitleCatchUpWaitingShort');
+    const plays = log.play;
+    status = 500;
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.ok(log.play > plays, 'the film plays again');
+    assert.equal(behindBanner(p), null);
+});
+
+test('an answer about the run before the seek does not decide the hold; the one about the new run does', async (t) => {
+    // Found in review, then measured on a real session: the transcoder lists
+    // the new run ~200 ms after the seek POST, so the first answers after a
+    // seek can describe the old run — with nothing pending, which read as
+    // "caught up" and spent the decision.
+    // Joined mid-film: the session's run starts at 300 s. ArrowLeft from
+    // ~5:01 lands on the run starting at 270 s.
+    let answer = () => runResponse('12/400', '800', '300.000');
+    const { p, log, events } = await mountSessionRun(t, () => answer(), { sessionOffset: 300 });
+
+    // The old run's answer, still: nothing pending, offset 300.
+    answer = () => runResponse('12/400', null, '300.000');
+    document.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true }));
+    await settle();
+    p.video.currentTime = 1;
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await settle();
+    assert.equal(events('subtitle-translate-wait').length, 0, 'not decided on the old run');
+    const heads = p.calls.filter((c) => c.params && c.params.method === 'HEAD').map((c) => String(c.url));
+    assert.ok(heads.at(-1).includes('sof=270'), `the polls name the run the player watches: ${heads.at(-1)}`);
+
+    // The service reads the new run; the watch asks again within a second.
+    answer = () => runResponse('12/400', '270.000', '270.000');
+    await wait(1500);
+    assert.equal(events('subtitle-translate-wait').length, 1, 'decided on the answer about the new run');
+    assert.equal(events('subtitle-translate-wait')[0].data.auto, true);
+    assert.ok(log.pause >= 1);
+});
+
+test('during a seek\u2019s hold: another seek plays the film and decides again; \u00d7 plays it too', async (t) => {
+    let pending = '400';
+    const { p, log, seek, events } = await mountSessionRun(t, () => catchUpResponse('12/400', pending));
+    pending = '0';
+    await seek();
+    assert.equal(events('subtitle-translate-wait').length, 1);
+
+    const plays = log.play;
+    await seek();
+    assert.ok(log.play > plays, 'a seek during a hold is not left paused behind it');
+    assert.equal(events('subtitle-translate-wait').length, 2, 'and the new position gets its own hold');
+
+    const beforeX = log.play;
+    click(catchUpBanner(p).querySelector('.wt-catchup-close'));
+    await settle();
+    assert.ok(log.play > beforeX, '\u00d7 on a hold plays the film: the viewer never paused it');
+    assert.equal(behindBanner(p), null);
+});
+
+test('a hold that ends while the tab is hidden does not start playback in the background', async (t) => {
+    t.after(() => { delete document.hidden; });
+    let pending = '400';
+    const { p, log, seek, events } = await mountSessionRun(t, () => catchUpResponse('12/400', pending));
+    pending = '0';
+    await seek();
+    assert.equal(events('subtitle-translate-wait').length, 1);
+    setHidden(true);
+    const plays = log.play;
+    // The run gets ahead behind the viewer's back.
+    pending = '400';
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.equal(events('subtitle-translate-wait-done').length, 1, 'the wait is over');
+    assert.equal(log.play, plays, 'no playback in a hidden tab');
+
+    // Found in re-review: the poll stayed awake behind the paused film, and
+    // for a live source that keeps the transcode running for nobody.
+    const heads = () => p.calls.filter((c) => c.params && c.params.method === 'HEAD').length;
+    const atEnd = heads();
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.equal(heads(), atEnd, 'the poll sleeps while the tab is hidden');
+
+    setHidden(false);
+    await settle();
+    assert.ok(log.play > plays, 'the film plays when the viewer is back');
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.ok(heads() > atEnd, 'and the poll with it');
+});
+
+test('answers that show nothing pending yet do not spend the hold; the first one that does starts it', async (t) => {
+    // Found in re-review: the first answers after a seek can predate the new
+    // run's cues (the transcoder closes a subtitle segment only on the next
+    // cue). One-shot, "nothing pending" read as caught up and the lines that
+    // followed played bare. A silent stretch never shows anything pending.
+    let pending = null;
+    const { p, log, seek, events } = await mountSessionRun(t, () => catchUpResponse('12/400', pending));
+    await seek();
+    await wait(1200);
+    assert.equal(events('subtitle-translate-wait').length, 0, 'nothing pending: no hold, but still watching');
+    const heads = p.calls.filter((c) => c.params && c.params.method === 'HEAD').length;
+    assert.ok(heads >= 3, `the window asks about every second, not every 3 s: ${heads} HEADs`);
+
+    pending = '0';
+    await wait(1500);
+    assert.equal(events('subtitle-translate-wait').length, 1, 'the cue that turned up starts the hold');
+    assert.ok(log.pause >= 1);
+});
+
+test('past the watch window the seek decides nothing, and the ordinary rule takes over', async (t) => {
+    const watch = catchUpTiming.seekWatchMs;
+    catchUpTiming.seekWatchMs = 300;
+    t.after(() => { catchUpTiming.seekWatchMs = watch; });
+    let pending = null;
+    const { p, seek, events } = await mountSessionRun(t, () => catchUpResponse('12/400', pending));
+    await seek();
+    await wait(1300);
+    pending = '0';
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.equal(events('subtitle-translate-wait').length, 1, 'held once, by the rule every playing film answers to');
+    assert.equal(catchUpText(p), 'player.subtitleCatchUpWaitingShort');
+});
+
+test('a tab hidden during the seek gets no hold while nobody is looking', async (t) => {
+    t.after(() => { delete document.hidden; });
+    let pending = '400';
+    const { p, log, events } = await mountSessionRun(t, () => catchUpResponse('12/400', pending));
+    pending = '0';
+    document.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    await settle();
+    setHidden(true);
+    p.video.currentTime = 1;
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await wait(1500);
+    assert.equal(events('subtitle-translate-wait').length, 0);
+    assert.equal(log.pause, 0, 'nothing is decided in the background');
+    // Back, and the film is playing over untranslated lines: the ordinary
+    // rule (2026-09-18), not the seek, is what holds it now.
+    setHidden(false);
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.equal(events('subtitle-translate-wait').length, 1);
+});
+
+test('a run mismatch that does not go away stops silencing the banner', async (t) => {
+    // Found in re-review: two sessions on one key, or a failed offset read
+    // at mount, made every answer "about another run" for good: no banner,
+    // a pressed Wait that never ends.
+    const limit = catchUpTiming.runMismatchLimit;
+    catchUpTiming.runMismatchLimit = 1;
+    t.after(() => { catchUpTiming.runMismatchLimit = limit; });
+    const { p } = await mountSessionRun(t, () => runResponse('12/400', '100.000', '900.000'), { sessionOffset: 90, startPaused: true });
+    p.video.currentTime = 10;
+    await wait(POLL_INTERVAL_WINDOW_MS * 2);
+    assert.ok(catchUpBanner(p), 'the banner is back');
+    // The player keeps naming its run (2026-09-19): dropping `sof` took the
+    // re-read hint away from the service and made it file the viewer's
+    // position under the run it was still on.
+    const last = p.calls.filter((c) => c.params && c.params.method === 'HEAD').map((c) => String(c.url)).at(-1);
+    assert.ok(last.includes('sof=90'), `still named: ${last}`);
+});
+
+test('a service that stays on another run: the film waits, and never hears "caught up"', async (t) => {
+    // Owner, 2026-09-19: seek to 44:27, the service kept answering about the
+    // run before the seek. Its document had no cue past 38:16, so "nothing
+    // pending" came back, the hold ended and the pill flashed "caught up"
+    // over a film with no subtitles. What the viewer has is what decides:
+    // past every loaded cue there is nothing to show, so the film is held.
+    const limit = catchUpTiming.runMismatchLimit;
+    catchUpTiming.runMismatchLimit = 2;
+    t.after(() => { catchUpTiming.runMismatchLimit = limit; });
+    // The answer is always about the run at 0 s, with nothing pending.
+    const { p, log, events } = await mountSessionRun(t, () => runResponse('375/420', null, '0.000'), { sessionOffset: 2667, startPaused: true });
+    const el = p.video.querySelector('track#tr-pt');
+    el.track.cues.length = 0;
+    el.track.addCue({ startTime: -1, endTime: -1, __absStart: 2290, __absEnd: 2296 }); // 38:16, the old run's last line
+    p.video.currentTime = 5; // 44:32 of the film
+    await wait(POLL_INTERVAL_WINDOW_MS * 3);
+
+    assert.equal(doneBanner(p), null, 'never "caught up"');
+    assert.equal(p.video.paused, true, 'no subtitles where the viewer is: the film waits');
+    assert.equal(catchUpText(p), 'player.subtitleCatchUpWaitingShort');
+    const waits = events('subtitle-translate-wait');
+    assert.equal(waits.length, 1, 'one hold, not one per tick');
+    assert.equal(waits[0].data.auto, true);
+    const last = p.calls.filter((c) => c.params && c.params.method === 'HEAD').map((c) => String(c.url)).at(-1);
+    assert.ok(last.includes('sof=2667'), `and the run is still named, so the service can come round: ${last}`);
+
+    // The way out is the viewer's, and it holds: no second pause.
+    click(catchUpBanner(p).querySelector('.wt-catchup-btn'));
+    await settle();
+    const pauses = log.pause;
+    await wait(POLL_INTERVAL_WINDOW_MS * 2);
+    assert.equal(p.video.paused, false, 'Keep watching plays the film');
+    assert.equal(log.pause, pauses, 'and it is not held again');
+    assert.equal(catchUpText(p), 'player.subtitleCatchUpShort', 'the pill goes on offering');
+    assert.equal(doneBanner(p), null);
+});
+
+test('a service that comes round ends that wait the ordinary way', async (t) => {
+    const limit = catchUpTiming.runMismatchLimit;
+    catchUpTiming.runMismatchLimit = 2;
+    t.after(() => { catchUpTiming.runMismatchLimit = limit; });
+    let answer = () => runResponse('375/420', null, '0.000');
+    const { p, log, events } = await mountSessionRun(t, () => answer(), { sessionOffset: 2667, startPaused: true });
+    p.video.currentTime = 5;
+    await wait(POLL_INTERVAL_WINDOW_MS * 3);
+    assert.equal(p.video.paused, true, 'fixture: held');
+
+    // The service reads the new run and is well ahead of the viewer.
+    answer = () => runResponse('40/80', '2900.000', '2667.000');
+    const plays = log.play;
+    await wait(POLL_INTERVAL_WINDOW_MS * 2);
+    assert.ok(log.play > plays, 'the film goes on');
+    assert.equal(behindBanner(p), null);
+    assert.equal(events('subtitle-translate-wait-done').length, 1);
+});
+
+test('with cues still ahead, a permanent run mismatch is taken at its word as before', async (t) => {
+    const limit = catchUpTiming.runMismatchLimit;
+    catchUpTiming.runMismatchLimit = 2;
+    t.after(() => { catchUpTiming.runMismatchLimit = limit; });
+    const { p } = await mountSessionRun(t, () => runResponse('375/420', null, '0.000'), { sessionOffset: 600, startPaused: true });
+    const el = p.video.querySelector('track#tr-pt');
+    el.track.cues.length = 0;
+    el.track.addCue({ startTime: 100, endTime: 103, __absStart: 700, __absEnd: 703 });
+    p.video.currentTime = 5; // 10:05, a minute and a half short of the loaded edge
+    await wait(POLL_INTERVAL_WINDOW_MS * 3);
+    assert.equal(catchUpBanner(p), null, 'nothing pending, cues ahead: nothing to say');
+});
+
+// A timeout of its own: without the fix the seek waits for a `playing` that
+// never comes, and the suite would hang instead of failing.
+test('a refused seek POST moves nothing: no offset change, no reload, no frozen frame', { timeout: 5000 }, async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer((it) => { it.installHls({ subtitleTrack: -1, subtitleDisplay: false }); });
+    p.setResponse((url, params) => (params && params.method === 'POST'
+        ? { ok: false, status: 503, json: async () => ({}) }
+        : { ok: true, status: 200, json: async () => ({}) }));
+    const hls = window.hlsPlayer;
+    let loads = 0;
+    const origLoad = hls.loadSource;
+    hls.loadSource = (...a) => { loads++; return origLoad ? origLoad.apply(hls, a) : undefined; };
+    const offsets = [];
+    const seeking = [];
+    const seeker = createSessionSeeker({
+        hls, videoEl: p.video, sessionSeekUrl: '/session/seek', sourceUrl: 'https://x.test/index.m3u8',
+        trackContainer: p.container, onSeekOffsetChange: (o) => offsets.push(o), onSeekingChange: (v) => seeking.push(v),
+    });
+    const orig = console.error;
+    console.error = () => {};
+    t.after(() => { console.error = orig; });
+    await seeker.seek(120);
+    assert.deepEqual(offsets, [], 'the offset stays with the run the transcoder is still on');
+    assert.equal(loads, 0, 'no reload');
+    assert.deepEqual(seeking, [true, false], 'and the seek is over');
+});
+
+// ---- the same logic for a file-source translation -----------------------
+//
+// A translation of a file source (an OpenSubtitles track) now answers the
+// same frontier header, computed against the playhead the poll itself
+// carries — so the banner, Wait and the seek hold work identically, gated
+// on the header's presence rather than on X-Subtitle-Live.
+
+const fileResponse = (header, pendingFrom) => ({
+    ok: true,
+    status: 200,
+    headers: {
+        get: (n) => {
+            if (n === 'X-Subtitle-Progress') return header;
+            if (n === 'X-Subtitle-Pending-From') return pendingFrom;
+            return null;
+        },
+    },
+    json: async () => ({}),
+});
+
+test('a file translation that is behind the playhead offers to wait too', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer();
+    let pending = '100';
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? fileResponse('12/400', pending)
+        : { ok: true, status: 200, json: async () => ({}) }));
+    p.video.paused = false;
+    p.video.currentTime = 100;
+    click(p.container.querySelector('#subtitles .subtitle[data-id="tr-pt"]'));
+    await settle();
+    assert.ok(catchUpBanner(p), 'the banner needs only the frontier, not a live source');
+    pending = '400';
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.equal(behindBanner(p), null);
+    const heads = p.calls.filter((c) => c.params && c.params.method === 'HEAD').map((c) => String(c.url));
+    assert.ok(heads.every((u) => u.includes('pos=')), `every poll says where the viewer is: ${heads[0]}`);
+    assert.ok(!heads.at(-1).includes('sof='), 'and a file source never names a run');
+});
+
+test('a direct seek (no transcoder session) opens the hold window like a session seek', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer();
+    p.video.setAttribute('data-duration', '3600');
+    const log = playback(p.video);
+    let pending = '3600';
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? fileResponse('12/400', pending)
+        : { ok: true, status: 200, json: async () => ({}) }));
+    p.video.paused = false;
+    p.video.currentTime = 100;
+    click(p.container.querySelector('#subtitles .subtitle[data-id="tr-pt"]'));
+    await settle();
+    assert.equal(behindBanner(p), null, 'far ahead: nothing to say');
+
+    // The viewer seeks 15 s forward into film the job has not reached.
+    pending = '0';
+    document.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    await wait(1200);
+    const waits = p.events.filter((e) => e.name === 'subtitle-translate-wait');
+    assert.equal(waits.length, 1, 'the hold starts without any session settle');
+    assert.equal(waits[0].data.auto, true);
+    assert.ok(log.pause >= 1);
+
+    pending = '3600';
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.ok(log.play >= 1, 'and ends when the job is ahead again');
+    assert.equal(behindBanner(p), null);
+});
+
+test('holding an arrow key rations the direct-seek kicks', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer();
+    p.video.setAttribute('data-duration', '3600');
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? fileResponse('12/400', '3600')
+        : { ok: true, status: 200, json: async () => ({}) }));
+    p.video.paused = false;
+    p.video.currentTime = 100;
+    click(p.container.querySelector('#subtitles .subtitle[data-id="tr-pt"]'));
+    await settle();
+    const heads = () => p.calls.filter((c) => c.params && c.params.method === 'HEAD').length;
+    const before = heads();
+    // Spaced like a real key repeat: each kick's immediate tick has time to
+    // fire before the next keydown, so an unrationed kick is one HEAD per
+    // repeat rather than thirty collapsed timers.
+    for (let i = 0; i < 20; i++) {
+        document.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+        await wait(15);
+    }
+    await settle();
+    assert.ok(heads() - before <= 3, `20 spaced repeats must not be 20 HEADs: ${heads() - before}`);
+});
+
+test('the banner on a file source claims no cue count — the whole-film remainder would be a lie', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer();
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? fileResponse('60/1200', '100')
+        : { ok: true, status: 200, json: async () => ({}) }));
+    await pickPausedThenPlay(p, 100);
+    // A file run does not sleep with the film, so pressing play wakes
+    // nothing: the banner is decided by the next ordinary tick.
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.equal(catchUpText(p), 'player.subtitleCatchUpWaitingShort', 'the copy without the count');
+});
+
+test('a session seek in flight sends no position: the halves disagree mid-seek', async (t) => {
+    let pending = '4000';
+    const { p, seek } = await mountSessionRun(t, () => catchUpResponse('12/400', pending), { sessionOffset: 1500 });
+    // Playing 300 s into a run that starts at 1500 s; the poll says 1800.
+    p.video.currentTime = 300;
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    const urls = () => p.calls.filter((c) => c.params && c.params.method === 'HEAD').map((c) => String(c.url));
+    assert.ok(urls().at(-1).includes('pos=1800'), `before the seek: ${urls().at(-1)}`);
+    // The seek to ~5:15 kicks a poll while currentTime still belongs to the
+    // old run: that poll must carry no pos at all rather than 300+315.
+    document.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    await settle();
+    const during = urls().at(-1);
+    assert.ok(!during.includes('pos='), `mid-seek, no position: ${during}`);
+    p.video.currentTime = 1;
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await settle();
+    assert.ok(urls().at(-1).includes('pos='), `settled: the position is back: ${urls().at(-1)}`);
+});
+
+test('the seek uses the offset the transcoder answers, not its own quantized guess', async (t) => {
+    // A copy-mode run starts at the keyframe before the quantized point;
+    // the POST now says where. Cues shifted by the local floor(t/30)*30 ran
+    // ahead of the sound by the difference (the "small desync after a seek"
+    // report, 2026-09-17).
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer((it) => { it.installHls({ subtitleTrack: -1, subtitleDisplay: false }); });
+    p.setResponse((url, params) => (params && params.method === 'POST'
+        ? { ok: true, status: 200, json: async () => ({ ok: true, offset: 115.633 }) }
+        : { ok: true, status: 200, json: async () => ({}) }));
+    const offsets = [];
+    const seeker = createSessionSeeker({
+        hls: window.hlsPlayer, videoEl: p.video, sessionSeekUrl: '/session/seek',
+        sourceUrl: 'https://x.test/index.m3u8', trackContainer: p.container,
+        onSeekOffsetChange: (o) => offsets.push(o),
+    });
+    const seeking = seeker.seek(120);
+    await flush();
+    window.hlsPlayer.emit(Hls.Events.SUBTITLE_TRACKS_UPDATED, {});
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await seeking;
+    assert.deepEqual(offsets, [115.633], 'the answered real start, not 120 quantized to 120');
+});
+
+test('a transcoder that does not answer an offset leaves the quantized guess in place', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer((it) => { it.installHls({ subtitleTrack: -1, subtitleDisplay: false }); });
+    p.setResponse((url, params) => (params && params.method === 'POST'
+        ? { ok: true, status: 200, json: async () => ({ ok: true }) }
+        : { ok: true, status: 200, json: async () => ({}) }));
+    const offsets = [];
+    const seeker = createSessionSeeker({
+        hls: window.hlsPlayer, videoEl: p.video, sessionSeekUrl: '/session/seek',
+        sourceUrl: 'https://x.test/index.m3u8', trackContainer: p.container,
+        onSeekOffsetChange: (o) => offsets.push(o),
+    });
+    const seeking = seeker.seek(125);
+    await flush();
+    window.hlsPlayer.emit(Hls.Events.SUBTITLE_TRACKS_UPDATED, {});
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await seeking;
+    assert.deepEqual(offsets, [120], 'floor(125/30)*30, as before the transcoder said');
+});
+
+// ---- a saved track survives the initial loadSource ----------------------
+//
+// A saved side-loaded selection is restored before the HLS instance exists,
+// so the initial loadSource wipes its parsed cues exactly as a seek's does —
+// loaded, showing, and empty for the whole session (reproduced on stage
+// 2026-09-17, no seek anywhere). createHls marks the tracks before its
+// loadSource; this test pins the half that follows: initDefaultTracks'
+// apply refetches the marked, wiped track.
+test('the restored default track wiped by the initial loadSource is fetched again', async (t) => {
+    const { markUnsnapshottedTracksStale } = await import('./subtitle-track-reload.js');
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer((it) => {
+        it.chip('none').removeAttribute('data-default');
+        it.chip('os-os-ru').setAttribute('data-default', 'true');
+    }, { tracks: [['os-os-ru', true]] });
+    const el = p.video.querySelector('track#os-os-ru');
+    Object.defineProperty(el, 'readyState', { configurable: true, value: 2 });
+
+    // What createHls does around its loadSource: mark, wipe.
+    markUnsnapshottedTracksStale(Array.from(p.video.querySelectorAll('track')), []);
+    // (the track list is already empty under jsdom, which is the wiped state)
+
+    // MANIFEST_PARSED → initDefaultTracks applies the saved selection.
+    initDefaultTracks(window.hlsPlayer || makeHls({ video: p.video }), p.video);
+    assert.match(el.getAttribute('src'), /wt-rf=\d+$/, 'the wiped restored track is fetched again');
+    assert.equal(p.mode('os-os-ru'), 'showing');
+});
+
+test('a seek answer whose body never completes does not lock seeking', { timeout: 8000 }, async (t) => {
+    // Found in review: isSeeking is cleared only in catch or on `playing`,
+    // and an unbounded res.json() sat before both — one stalled body and
+    // every later seek returned immediately for the rest of the session.
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer((it) => { it.installHls({ subtitleTrack: -1, subtitleDisplay: false }); });
+    p.setResponse((url, params) => (params && params.method === 'POST'
+        ? { ok: true, status: 200, json: () => new Promise(() => {}) }
+        : { ok: true, status: 200, json: async () => ({}) }));
+    const offsets = [];
+    const seeker = createSessionSeeker({
+        hls: window.hlsPlayer, videoEl: p.video, sessionSeekUrl: '/session/seek',
+        sourceUrl: 'https://x.test/index.m3u8', trackContainer: p.container,
+        onSeekOffsetChange: (o) => offsets.push(o),
+    });
+    const seeking = seeker.seek(125);
+    await wait(3500);
+    window.hlsPlayer.emit(Hls.Events.SUBTITLE_TRACKS_UPDATED, {});
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await seeking;
+    assert.deepEqual(offsets, [120], 'the stalled body is abandoned and the quantized fallback applies');
+    assert.equal(seeker.isSeeking(), false, 'and the seek completes');
+});
+
+// ---- the on-screen translation offer -----------------------------------
+//
+// The pill is the picker's offer brought to the picture (subtitle-offer.js).
+// These mount the real component: what is under test is the chain from
+// "playback started" to a pill, and from a click on it to the same run a
+// click on the chip starts.
+
+const offerPill = (p) => p.container.querySelector('.wt-offer');
+const offerCard = (p) => p.container.querySelector('.wt-offer-card');
+const startPlayback = async (p) => {
+    p.video.paused = false;
+    p.video.dispatchEvent(new dom.window.Event('play'));
+    await settle();
+};
+// The free-viewer render of the AI chip, as helper.go marks it.
+const lockChip = (p, { upsell = true } = {}) => {
+    const ai = p.chip('tr-pt');
+    ai.setAttribute('data-locked', 'true');
+    ai.removeAttribute('data-src');
+    ai.removeAttribute('data-offered');
+    if (upsell) ai.setAttribute('data-upsell', 'true');
+};
+const clearOfferMemory = () => { try { window.localStorage.clear(); } catch (e) { /* none */ } };
+
+test('the offer appears when playback starts, and taking it is pressing the chip', async (t) => {
+    t.after(() => destroyPlayer());
+    clearOfferMemory();
+    const p = await mountPlayer();
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? progressResponse('0/0')
+        : { ok: true, status: 200, json: async () => ({}) }));
+    assert.equal(offerPill(p), null, 'nothing is offered on a page that has not played');
+
+    await startPlayback(p);
+    const pill = offerPill(p);
+    assert.ok(pill, 'the fixture offers a translation, so the pill is up');
+    assert.equal(pill.dataset.kind, 'start');
+    assert.ok(p.events.some((e) => e.name === 'subtitle-offer-shown' && e.data.kind === 'start'));
+
+    click(pill.querySelector('.wt-offer-main'));
+    await settle();
+
+    const ai = p.container.querySelector('#subtitles .subtitle[data-id="tr-pt"]');
+    assert.ok(active(ai), 'the chip took the mark');
+    assert.equal(p.puts().length, 1, 'and the choice was saved, as a chip click saves it');
+    assert.equal(p.events.filter((e) => e.name === 'subtitle-translate-start').length, 1, 'one run started');
+    assert.equal(offerPill(p), null, 'an offer taken is an offer spent');
+});
+
+test('picking a track in the picker withdraws the offer', async (t) => {
+    t.after(() => destroyPlayer());
+    clearOfferMemory();
+    const p = await mountPlayer();
+    await startPlayback(p);
+    assert.ok(offerPill(p));
+    const other = Array.from(p.container.querySelectorAll('#subtitle-tracks .subtitle[data-id]'))
+        .find((el) => el.getAttribute('data-id') !== 'none' && el.getAttribute('data-provider') !== 'Translated');
+    assert.ok(other, 'the fixture must carry a human track');
+    click(other);
+    await settle();
+    assert.equal(offerPill(p), null);
+});
+
+test('the × on a start offer is for this page only', async (t) => {
+    t.after(() => destroyPlayer());
+    clearOfferMemory();
+    const p = await mountPlayer();
+    await startPlayback(p);
+    click(offerPill(p).querySelector('.wt-catchup-close'));
+    await settle();
+    assert.equal(offerPill(p), null);
+    assert.equal(window.localStorage.getItem('wt-subtitle-offer'), null, 'nothing is remembered about an action the viewer can take');
+});
+
+test('a free viewer gets the upsell: a card, a CTA, and a way to never see it again', async (t) => {
+    t.after(() => destroyPlayer());
+    clearOfferMemory();
+    const p = await mountPlayer((page) => lockChip(page));
+    await startPlayback(p);
+    const pill = offerPill(p);
+    assert.ok(pill);
+    assert.equal(pill.dataset.kind, 'upsell');
+    assert.equal(offerCard(p), null, 'the card waits for a click');
+
+    click(pill.querySelector('.wt-offer-main'));
+    await settle();
+    const card = offerCard(p);
+    assert.ok(card);
+    const cta = card.querySelector('a.wt-offer-card-cta');
+    assert.ok(cta.getAttribute('href').endsWith('/donate'), 'the picker’s own link');
+    assert.equal(cta.getAttribute('target'), '_blank', 'paying must not cost the viewer the film');
+    assert.equal(p.puts().length, 0, 'nothing was selected');
+    assert.equal(p.events.filter((e) => e.name === 'subtitle-translate-start').length, 0, 'and no run starts');
+
+    const never = Array.from(card.querySelectorAll('.wt-offer-card-link')).find((b) => b.textContent === 'player.subtitleOfferNever');
+    click(never);
+    await settle();
+    assert.equal(offerPill(p), null);
+    assert.equal(offerCard(p), null);
+    assert.deepEqual(JSON.parse(window.localStorage.getItem('wt-subtitle-offer')), { never: true });
+
+    // The next film: same viewer, same state of the list.
+    destroyPlayer();
+    const again = await mountPlayer((page) => lockChip(page));
+    await startPlayback(again);
+    assert.equal(offerPill(again), null, 'asked not to be offered, not offered');
+});
+
+test('the × on the upsell is thirty days, not forever', async (t) => {
+    t.after(() => destroyPlayer());
+    clearOfferMemory();
+    const p = await mountPlayer((page) => lockChip(page));
+    await startPlayback(p);
+    const before = Date.now();
+    click(offerPill(p).querySelector('.wt-catchup-close'));
+    await settle();
+    const saved = JSON.parse(window.localStorage.getItem('wt-subtitle-offer'));
+    assert.equal(saved.never, undefined);
+    const days = (saved.until - before) / 86400000;
+    assert.ok(days > 29.9 && days < 30.1, `until is ${days} days out`);
+});
+
+test('a locked translation the ladder did not want is not pitched on screen', async (t) => {
+    t.after(() => destroyPlayer());
+    clearOfferMemory();
+    const p = await mountPlayer((page) => lockChip(page, { upsell: false }));
+    await startPlayback(p);
+    assert.equal(offerPill(p), null);
+});
+
+// ---- the resume prompt holds the film ----------------------------------
+
+const savedPosition = (p) => p.setResponse((url) => (String(url).startsWith('/watch/position')
+    ? { ok: true, status: 200, headers: new dom.window.Headers(), json: async () => ({ position: 600, duration: 3000 }) }
+    : { ok: true, status: 200, headers: new dom.window.Headers(), json: async () => ({}) }));
+const resumePrompt = (p) => p.container.querySelector('.wt-resume-prompt');
+
+test('a film with a saved position does not start by itself, and is not pitched under the prompt', async (t) => {
+    t.after(() => destroyPlayer());
+    clearOfferMemory();
+    const p = await mountPlayer((page) => savedPosition(page));
+    const log = playback(p.video);
+    assert.ok(resumePrompt(p), 'the fixture must put the prompt up');
+
+    // <video autoplay> firing after the prompt is already up.
+    p.video.play();
+    await settle();
+    assert.equal(p.video.paused, true, 'autoplay is put back to sleep');
+    assert.ok(log.pause >= 1);
+    assert.equal(offerPill(p), null, 'no offer behind the overlay');
+
+    // Start over: the answer is what starts the film, and the offer follows.
+    const playsBefore = log.play;
+    click(resumePrompt(p).querySelector('.wt-resume-btn--ghost'));
+    await settle();
+    assert.equal(resumePrompt(p), null);
+    assert.ok(log.play > playsBefore, 'the answer starts playback');
+    assert.equal(p.video.paused, false, 'and nothing pauses it again');
+    assert.ok(offerPill(p), 'now the offer is decided');
+});
+
+// ---- the dialog is re-rendered, the player is not -------------------------
+//
+// Owner, 2026-09-19: changing the preferred language re-rendered the whole
+// player, and a second of nothing is long in the middle of a film. The new
+// dialog is rendered off the page (background-render.js) and put in place of
+// the old one; these pin what "in place" has to mean.
+
+// freshDialog is the dialog a render for another language would bring: the
+// fixture again, with the language changed and the AI chip renamed.
+function freshDialog(lang) {
+    const doc = new dom.window.DOMParser().parseFromString(DIALOG, 'text/html');
+    const dialog = doc.querySelector('#subtitles');
+    dialog.setAttribute('data-preferred-lang', lang);
+    const ai = dialog.querySelector('.subtitle[data-provider="Translated"]');
+    ai.setAttribute('data-id', `tr-${lang}`);
+    ai.setAttribute('data-srclang', lang);
+    ai.setAttribute('data-src', (ai.getAttribute('data-src') || '').replace(/~tr:[a-z]+/, `~tr:${lang}`));
+    const select = dialog.querySelector('#preferred-lang');
+    if (select) select.setAttribute('data-current', lang);
+    return dialog;
+}
+
+test('a dialog swap leaves the player alone and the new dialog works', async (t) => {
+    t.after(() => destroyPlayer());
+    clearOfferMemory();
+    const p = await mountPlayer();
+    const video = p.video;
+    const liveDialog = p.modal;
+    const oldBox = liveDialog.querySelector('.modal-box');
+    p.video.paused = false;
+
+    assert.equal(swapSubtitlesDialog(p.container, freshDialog('kk'), {}), true);
+
+    assert.equal(p.container.querySelector('video.player'), video, 'the same <video>');
+    assert.equal(p.container.querySelector('#subtitles'), liveDialog, 'the same dialog element: it is open, and the listeners hang on it');
+    assert.notEqual(liveDialog.querySelector('.modal-box'), oldBox, 'with a new box in it');
+    assert.equal(liveDialog.getAttribute('data-preferred-lang'), 'kk');
+    assert.ok(findSubtitleItem(liveDialog, 'tr-kk'), 'the new language\u2019s AI chip');
+    assert.equal(findSubtitleItem(liveDialog, 'tr-pt'), null, 'and not the old one');
+
+    // The chips of the new box answer to the listeners of the old dialog.
+    const chip = Array.from(liveDialog.querySelectorAll('.subtitle'))
+        .find((el) => el.getAttribute('data-provider') === 'OpenSubtitles');
+    click(chip);
+    await settle();
+    assert.equal(chip.getAttribute('data-default'), 'true', 'a chip in the new box can be picked');
+    // ...and so does the switch, which is a new element too.
+    const toggle = liveDialog.querySelector('#subtitles-toggle');
+    toggle.checked = false;
+    toggle.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+    await settle();
+    assert.equal(liveDialog.getAttribute('data-subtitles-off'), 'true', 'the new switch switches');
+});
+
+test('a dialog swap takes the <track> of the language that was left', async (t) => {
+    t.after(() => destroyPlayer());
+    clearOfferMemory();
+    const p = await mountPlayer();
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? progressResponse('12/400')
+        : { ok: true, status: 200, json: async () => ({}) }));
+    p.video.paused = false;
+    click(p.chip('tr-pt'));
+    await settle();
+    const heads = () => p.calls.filter((c) => c.params && c.params.method === 'HEAD').length;
+    assert.ok(heads() >= 1, 'fixture: a Portuguese run is polling');
+    assert.ok(p.video.querySelector('track#tr-pt'), 'fixture: with its <track>');
+
+    assert.equal(swapSubtitlesDialog(p.container, freshDialog('kk'), {}), true);
+    await settle();
+    assert.equal(p.video.querySelector('track#tr-pt'), null, 'the old language\u2019s <track> goes with its chip');
+});
+
+test('a player that comes back from a settings change continues without asking', async (t) => {
+    // The preferred-language select re-renders the player (preferred-lang.js):
+    // the viewer changed a setting, they did not leave, so the "continue
+    // from" prompt is answered for them. Once, for this file, for a minute.
+    t.after(() => { destroyPlayer(); window.sessionStorage.clear(); });
+    clearOfferMemory();
+    window.sessionStorage.setItem('wt-auto-resume', JSON.stringify({ resourceID: 'res', path: 'movie.mkv', until: Date.now() + 60000 }));
+    const p = mount();
+    savedPosition(p);
+    const log = playback(p.video);
+    await initPlayer(p.container);
+    await settle();
+    await settle();
+    assert.equal(resumePrompt(p), null, 'nothing to answer');
+    assert.equal(p.video.currentTime, 600, 'at the saved position');
+    assert.ok(log.play >= 1 && !p.video.paused, 'and playing');
+    assert.equal(window.sessionStorage.getItem('wt-auto-resume'), null, 'the note is spent');
+});
+
+test('without that note the prompt is asked as before', async (t) => {
+    t.after(() => { destroyPlayer(); window.sessionStorage.clear(); });
+    clearOfferMemory();
+    window.sessionStorage.setItem('wt-auto-resume', JSON.stringify({ resourceID: 'another', path: 'movie.mkv', until: Date.now() + 60000 }));
+    const p = await mountPlayer((page) => savedPosition(page));
+    assert.ok(resumePrompt(p), 'a note for another file answers nothing here');
+});
+
+test('an audio file with a saved position is not held: it has no prompt to answer', async (t) => {
+    // Found in review (2026-09-18): the hold had no isVideo guard while the
+    // prompt renders for video only, so the track was re-paused on every
+    // play with nothing on screen that could end it.
+    t.after(() => destroyPlayer());
+    clearOfferMemory();
+    const p = await mountPlayer((page) => savedPosition(page), { tag: 'audio' });
+    const log = playback(p.video);
+    assert.equal(resumePrompt(p), null);
+    p.video.play();
+    await settle();
+    assert.equal(log.pause, 0, 'nobody pauses it');
+    assert.equal(p.video.paused, false);
+});
+
+test('a resume answered while a seek is in flight is carried out when that seek lets go', async (t) => {
+    // Found in review (2026-09-18): handleSeek returns at once during a
+    // session seek, and handleResume had already closed the prompt -- the
+    // film stayed paused at the old position with nothing left to press.
+    t.after(() => destroyPlayer());
+    clearOfferMemory();
+    const p = mount();
+    p.video.dataset.sessionId = 's1';
+    p.video.dataset.sessionSeekUrl = '/session/seek';
+    p.video.setAttribute('data-duration', '3000');
+    let releasePosition;
+    p.setResponse((url, params) => {
+        if (String(url).startsWith('/watch/position') && !(params && params.method === 'POST')) {
+            return new Promise((resolve) => {
+                releasePosition = () => resolve({ ok: true, status: 200, headers: new dom.window.Headers(), json: async () => ({ position: 600, duration: 3000 }) });
+            });
+        }
+        if (params && params.method === 'POST') return { ok: true, status: 200, headers: new dom.window.Headers(), json: async () => ({ ok: true }) };
+        return { ok: true, status: 200, headers: new dom.window.Headers(), json: async () => ({ offset: 0 }) };
+    });
+    await initPlayer(p.container);
+    await settle();
+    const log = playback(p.video);
+    const seekPosts = () => p.calls.filter((c) => c.params && c.params.method === 'POST' && String(c.url).startsWith('/session/seek')).map((c) => String(c.url));
+
+    // An arrow key just before the saved position arrives.
+    p.video.paused = false;
+    document.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    await settle();
+    assert.equal(seekPosts().length, 1, 'fixture: a seek is in flight');
+    releasePosition();
+    await settle();
+    assert.ok(resumePrompt(p), 'fixture: the prompt came up over it');
+
+    click(resumePrompt(p).querySelector('.wt-resume-btn:not(.wt-resume-btn--ghost)'));
+    await settle();
+    assert.equal(resumePrompt(p), null);
+    assert.equal(seekPosts().length, 1, 'nothing can be sought yet');
+
+    // The first seek lands; the answer is carried out.
+    const playsBefore = log.play;
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await settle();
+    assert.equal(seekPosts().length, 2, 'the resume seek follows');
+    assert.ok(/[?&]t=600\b/.test(seekPosts()[1]), seekPosts()[1]);
+    assert.ok(log.play > playsBefore, 'which starts the new run itself');
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await settle();
+    assert.equal(p.video.paused, false, 'and the film is playing');
+});
+
+// A saved live translation, restored at mount behind the resume prompt:
+// asleep until the viewer answers (nobody is watching), and awake after.
+// Owner, 2026-09-18: "Kazakh is selected, no subtitles, until I press the
+// chip again" -- the restored run had 7 cues and never asked for more.
+async function mountSavedLiveRun(t, { session }) {
+    t.after(() => destroyPlayer());
+    clearOfferMemory();
+    const p = mount({ tracks: [['tr-pt', false]] });
+    if (session) {
+        p.video.dataset.sessionId = 's1';
+        p.video.dataset.sessionSeekUrl = '/session/seek';
+    }
+    p.video.setAttribute('data-duration', '3000');
+    const ai = p.chip('tr-pt');
+    ai.setAttribute('data-saved', 'true');
+    ai.setAttribute('data-default', 'true');
+    ai.removeAttribute('data-offered');
+    p.chip('none').removeAttribute('data-default');
+    p.modal.setAttribute('data-subtitles-off', 'false');
+    let done = 7;
+    p.setResponse((url, params) => {
+        if (params && params.method === 'HEAD') return catchUpResponse(`${done}/${done}`, null);
+        if (String(url).startsWith('/watch/position') && !(params && params.method === 'POST')) {
+            return { ok: true, status: 200, headers: new dom.window.Headers(), json: async () => ({ position: 600, duration: 3000 }) };
+        }
+        if (params && params.method === 'POST') return { ok: true, status: 200, headers: new dom.window.Headers(), json: async () => ({ ok: true }) };
+        return { ok: true, status: 200, headers: new dom.window.Headers(), json: async () => ({ offset: 0 }) };
+    });
+    const log = playback(p.video);
+    await initPlayer(p.container);
+    await settle();
+    // <video autoplay>, which the prompt's hold puts back to sleep.
+    p.video.play();
+    await settle();
+    const heads = () => p.calls.filter((c) => c.params && c.params.method === 'HEAD').length;
+    return { p, log, heads, more: (n) => { done = n; } };
+}
+
+for (const session of [false, true]) {
+    for (const answer of ['resume', 'start over']) {
+        test(`a saved live translation wakes when the prompt is answered (${answer}, ${session ? 'session' : 'direct'})`, async (t) => {
+            const { p, heads, more } = await mountSavedLiveRun(t, { session });
+            assert.ok(resumePrompt(p), 'fixture: the prompt is up');
+            assert.equal(p.video.paused, true, 'fixture: and the film is held');
+            await wait(POLL_INTERVAL_WINDOW_MS);
+            const asleep = heads();
+            assert.ok(asleep >= 1, 'fixture: the restored run asked at least once');
+            await wait(POLL_INTERVAL_WINDOW_MS);
+            assert.equal(heads(), asleep, 'fixture: asleep while nobody watches');
+
+            more(40);
+            click(resumePrompt(p).querySelector(answer === 'resume' ? '.wt-resume-btn--primary' : '.wt-resume-btn--ghost'));
+            await settle();
+            if (session && answer === 'resume') {
+                p.video.currentTime = 1;
+                p.video.dispatchEvent(new dom.window.Event('playing'));
+                await settle();
+            }
+            await wait(POLL_INTERVAL_WINDOW_MS);
+            // The HEADs are the claim. The swap to the new revision is the
+            // reload throttle's and needsReload's business (tested above).
+            assert.ok(heads() > asleep, `the run asks again once the film plays: ${heads()} vs ${asleep}`);
+            assert.deepEqual(p.events.filter((e) => e.name === 'subtitle-translate-error'), []);
+        });
+    }
+}
+
+test('a film with no saved position still starts by itself', async (t) => {
+    t.after(() => destroyPlayer());
+    clearOfferMemory();
+    const p = await mountPlayer();
+    const log = playback(p.video);
+    p.video.play();
+    await settle();
+    assert.equal(resumePrompt(p), null);
+    assert.equal(log.pause, 0, 'nobody holds a film that has nothing to resume');
+    assert.equal(p.video.paused, false);
+});
+
+// ---- starting a translation over a playing film ------------------------
+//
+// Owner, 2026-09-18: pressing "AI translate" did nothing visible -- no
+// banner, no subtitles -- because a run that has counted nothing sends no
+// frontier, and no frontier reads as "not behind". A start is the same
+// event as a seek landing on untranslated film: the same hold, the same cap.
+
+test('starting a translation over a playing film holds it until the run is ahead', async (t) => {
+    t.after(() => destroyPlayer());
+    clearOfferMemory();
+    const p = await mountPlayer();
+    const log = playback(p.video);
+    // Registered nothing yet: `0/0`, no frontier header at all.
+    let answer = () => progressResponse('0/0');
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? answer()
+        : { ok: true, status: 200, json: async () => ({}) }));
+
+    p.video.paused = false;
+    p.video.currentTime = 100;
+    click(p.container.querySelector('#subtitles .subtitle[data-id="tr-pt"]'));
+    await settle();
+
+    assert.ok(log.pause >= 1, 'the film is held');
+    assert.equal(p.video.paused, true);
+    assert.ok(catchUpBanner(p), 'and the banner says why');
+    assert.equal(catchUpText(p), 'player.subtitleCatchUpWaitingShort', 'with no cue count: nothing has been counted');
+    assert.ok(p.events.some((e) => e.name === 'subtitle-translate-wait' && e.data.auto === true));
+
+    // The run counts its cues and is comfortably ahead of the playhead.
+    answer = () => catchUpResponse('40/400', '400');
+    const playsBefore = log.play;
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.ok(log.play > playsBefore, 'the film goes back on by itself');
+    assert.equal(behindBanner(p), null);
+});
+
+test('starting a translation over a paused film holds nothing', async (t) => {
+    t.after(() => destroyPlayer());
+    clearOfferMemory();
+    const p = await mountPlayer();
+    const log = playback(p.video);
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? progressResponse('0/0')
+        : { ok: true, status: 200, json: async () => ({}) }));
+    // jsdom's video starts paused; the viewer picks the track before playing.
+    click(p.container.querySelector('#subtitles .subtitle[data-id="tr-pt"]'));
+    await settle();
+    assert.equal(log.pause, 0);
+    assert.equal(behindBanner(p), null, 'a paused film is not running into anything');
+    assert.equal(p.events.filter((e) => e.name === 'subtitle-translate-wait').length, 0);
+});
+
+test('the film a hold releases has its subtitles: the reload does not wait out the throttle', async (t) => {
+    // Owner, 2026-09-18: after the start hold the film went on with no
+    // subtitles, and they appeared only after pause -> play (which kicks the
+    // poll, and a kick bypasses the throttle). The first counted answer had
+    // spent the 15 s reload window on a near-empty revision.
+    t.after(() => destroyPlayer());
+    clearOfferMemory();
+    const p = await mountPlayer(null, { tracks: [['tr-pt', false]] });
+    const log = playback(p.video);
+    let answer = () => catchUpResponse('0/400', '100');
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? answer()
+        : { ok: true, status: 200, json: async () => ({}) }));
+    const trackSrc = () => p.video.querySelector('track#tr-pt').getAttribute('src') || '';
+
+    p.video.paused = false;
+    p.video.currentTime = 100;
+    click(p.container.querySelector('#subtitles .subtitle[data-id="tr-pt"]'));
+    await settle();
+    assert.equal(p.video.paused, true, 'held: counted, nothing done, frontier at the playhead');
+    assert.ok(!/rev=0\b/.test(trackSrc()), `a revision with nothing translated is not worth a swap: ${trackSrc()}`);
+
+    // A few cues land, still behind: an ordinary reload, which starts the
+    // 15 s throttle window.
+    answer = () => catchUpResponse('5/400', '101');
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.ok(/rev=5\b/.test(trackSrc()), `the first translated cues are loaded: ${trackSrc()}`);
+    assert.equal(p.video.paused, true, 'still held');
+
+    // Comfortably ahead, well inside the throttle window.
+    answer = () => catchUpResponse('40/400', '400');
+    const playsBefore = log.play;
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.ok(log.play > playsBefore, 'the hold lets the film go');
+    assert.ok(/rev=40\b/.test(trackSrc()), `and the track it goes on with is the current one: ${trackSrc()}`);
+});
+
+// ---- the silent hold ----------------------------------------------------
+
+test('a seek onto untranslated film never plays before it is held', async (t) => {
+    // Owner, 2026-09-18: the film started after a seek and was paused a
+    // moment later, once the answer arrived. The pause now comes with the
+    // seek settling; the answer only decides what it turns into.
+    let pending = '400';
+    const delayed = () => new Promise((resolve) => setTimeout(() => resolve(catchUpResponse('12/400', pending)), 200));
+    const { p, log, events } = await mountSessionRun(t, delayed);
+    await wait(300);
+    pending = '0';
+    document.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    await settle();
+    p.video.currentTime = 1;
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await wait(20);
+
+    // The answer is still 180 ms out.
+    assert.equal(p.video.paused, true, 'held the moment the seek settled');
+    assert.equal(behindBanner(p), null, 'with nothing said yet');
+    assert.equal(events('subtitle-translate-wait').length, 0);
+    const playsWhileSilent = log.play;
+
+    await wait(400);
+    assert.equal(events('subtitle-translate-wait').length, 1, 'the answer turns it into the ordinary hold');
+    assert.ok(catchUpBanner(p), 'which has a banner');
+    assert.equal(log.play, playsWhileSilent, 'and the film never played in between');
+    assert.equal(p.video.paused, true);
+});
+
+test('a silent hold nobody answers lets the film go', async (t) => {
+    const cap = catchUpTiming.seekPreHoldMaxMs;
+    catchUpTiming.seekPreHoldMaxMs = 300;
+    t.after(() => { catchUpTiming.seekPreHoldMaxMs = cap; });
+    let hang = false;
+    const { p, log, events } = await mountSessionRun(t, () => (hang
+        ? new Promise(() => {})
+        : catchUpResponse('12/400', '400')));
+    hang = true;
+    const playsBefore = log.play;
+    document.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    await settle();
+    p.video.currentTime = 1;
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await wait(20);
+    assert.equal(p.video.paused, true);
+    await wait(500);
+    assert.equal(p.video.paused, false, 'the cap is what bounds a service that says nothing');
+    assert.ok(log.play > playsBefore);
+    assert.equal(events('subtitle-translate-wait').length, 0);
+});
+
+// ---- a seek silences the run it leaves ---------------------------------
+
+// seekerOn builds a seeker over the hls.js fake, with a POST that takes
+// `postMs` and answers `ok`.
+async function seekerOn(t, { postMs = 100, ok = true } = {}) {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer((it) => { it.installHls({ subtitleTrack: -1, subtitleDisplay: false }); });
+    p.setResponse((url, params) => (params && params.method === 'POST'
+        ? new Promise((resolve) => setTimeout(() => resolve({ ok, status: ok ? 200 : 503, json: async () => ({ offset: 118.5 }) }), postMs))
+        : { ok: true, status: 200, json: async () => ({}) }));
+    const log = playback(p.video);
+    const seeker = createSessionSeeker({
+        hls: window.hlsPlayer, videoEl: p.video, sessionSeekUrl: '/session/seek', sourceUrl: 'https://x.test/index.m3u8',
+        trackContainer: p.container, onSeekOffsetChange: () => {}, onSeekingChange: () => {},
+    });
+    return { p, log, seeker };
+}
+
+test('a seek pauses the run it leaves and plays the one it starts', { timeout: 5000 }, async (t) => {
+    // Owner, 2026-09-18: the old position's sound went on under the frozen
+    // frame for as long as the transcoder took to start the new one.
+    const { p, log, seeker } = await seekerOn(t);
+    p.video.paused = false;
+    const done = seeker.seek(120);
+    await wait(20);
+    assert.equal(p.video.paused, true, 'silent while the POST is out');
+    const playsDuringPost = log.play;
+    await wait(150);
+    assert.ok(log.play > playsDuringPost, 'played again once the new source is loading');
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await done;
+    assert.equal(seeker.isSeeking(), false);
+});
+
+test('a seek on a paused film starts nothing, unless the caller says the pause was not the viewer’s', { timeout: 5000 }, async (t) => {
+    const { p, log, seeker } = await seekerOn(t, { postMs: 10 });
+    seeker.seek(120);
+    await wait(60);
+    assert.equal(log.play, 0, 'a viewer who seeks while paused stays paused');
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await settle();
+
+    // The resume prompt's answer: the film is held, and the seek is what
+    // ends the hold.
+    const done = seeker.seek(240, { play: true });
+    await wait(60);
+    assert.ok(log.play >= 1, 'the new run is started');
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await done;
+});
+
+test('a refused seek gives the film back as it was: playing', { timeout: 5000 }, async (t) => {
+    const { p, log, seeker } = await seekerOn(t, { postMs: 10, ok: false });
+    const orig = console.error;
+    console.error = () => {};
+    t.after(() => { console.error = orig; });
+    p.video.paused = false;
+    await seeker.seek(120);
+    assert.ok(log.pause >= 1);
+    assert.equal(p.video.paused, false, 'the pause the seek made is undone with it');
+});
+
+test('pressing play during a wait is pressing Keep watching: the banner says so at once', async (t) => {
+    t.after(() => destroyPlayer());
+    clearOfferMemory();
+    const p = await mountPlayer();
+    playback(p.video);
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? catchUpResponse('12/400', '100')
+        : { ok: true, status: 200, json: async () => ({}) }));
+    p.video.paused = false;
+    p.video.currentTime = 100;
+    click(p.container.querySelector('#subtitles .subtitle[data-id="tr-pt"]'));
+    await settle();
+    assert.equal(catchUpText(p), 'player.subtitleCatchUpWaitingShort', 'held: the start hold');
+
+    p.video.play();
+    await settle();
+    assert.equal(catchUpText(p), 'player.subtitleCatchUpShort', 'no longer "paused until…" over a film that is playing');
+    assert.equal(catchUpBanner(p).querySelector('.wt-catchup-btn').textContent, 'player.subtitleCatchUpWait');
+});
+
+// ---- "caught up" is said, not implied -----------------------------------
+
+test('the film brakes a second before the first untranslated line, and resumes without a rewind', async (t) => {
+    // Owner, 2026-09-18: better to slow down before a line the translation
+    // is not ready for than to rewind after it. The 3 s tick cannot do that
+    // on its own -- the frontier can be 2.5 s ahead on one tick and behind
+    // on the next -- so the brake is decided on timeupdate.
+    t.after(() => destroyPlayer());
+    clearOfferMemory();
+    const p = await mountPlayer();
+    const log = playback(p.video);
+    let pending = '130';
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? catchUpResponse('12/400', pending)
+        : { ok: true, status: 200, json: async () => ({}) }));
+    await pickPausedThenPlay(p, 100);
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.equal(catchUpBanner(p), null, 'fixture: 30 s ahead, nothing to say');
+    const tick = async (at) => {
+        p.video.currentTime = at;
+        p.video.dispatchEvent(new dom.window.Event('timeupdate'));
+        await settle();
+    };
+
+    await tick(128.5);
+    assert.equal(p.video.paused, false, 'a second and a half to go: still playing');
+    const heads = p.calls.filter((c) => c.params && c.params.method === 'HEAD').length;
+    await tick(129.2);
+    assert.equal(p.video.paused, true, 'inside the last second: held before the line');
+    assert.equal(catchUpText(p), 'player.subtitleCatchUpWaitingShort');
+    assert.equal(p.events.filter((e) => e.name === 'subtitle-translate-wait').at(-1).data.auto, true);
+    assert.ok(p.calls.filter((c) => c.params && c.params.method === 'HEAD').length > heads,
+        'and the poll is asked at once: a stale frontier must cost one HEAD, not three seconds');
+
+    pending = '400';
+    const playsBefore = log.play;
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.ok(log.play > playsBefore, 'the run got ahead: the film goes on');
+    const done = p.events.filter((e) => e.name === 'subtitle-translate-wait-done').at(-1);
+    assert.equal(done.data.rewind, 0, 'nothing was missed, so nothing is replayed');
+    assert.equal(p.video.currentTime, 129.2);
+});
+
+test('the brake leaves alone a viewer who said they would rather watch', async (t) => {
+    t.after(() => destroyPlayer());
+    clearOfferMemory();
+    const p = await mountPlayer();
+    const log = playback(p.video);
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? catchUpResponse('12/400', '100')
+        : { ok: true, status: 200, json: async () => ({}) }));
+    await pickPausedThenPlay(p, 100);
+    assert.equal(p.video.paused, true, 'fixture: held');
+    click(catchUpBanner(p).querySelector('.wt-catchup-btn'));
+    await settle();
+    const pauses = log.pause;
+    p.video.currentTime = 101;
+    p.video.dispatchEvent(new dom.window.Event('timeupdate'));
+    await settle();
+    assert.equal(log.pause, pauses, 'Keep watching holds for the rest of this stretch');
+});
+
+test('the pill says "caught up" when the subtitles are back, and then goes', async (t) => {
+    const flash = catchUpTiming.caughtUpFlashMs;
+    catchUpTiming.caughtUpFlashMs = 400;
+    t.after(() => { catchUpTiming.caughtUpFlashMs = flash; destroyPlayer(); });
+    clearOfferMemory();
+    const p = await mountPlayer();
+    let pending = '100';
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? catchUpResponse('12/400', pending)
+        : { ok: true, status: 200, json: async () => ({}) }));
+    await pickPausedThenPlay(p, 100);
+    assert.ok(behindBanner(p), 'behind first');
+
+    pending = '400';
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.equal(behindBanner(p), null);
+    assert.ok(doneBanner(p), 'the pill does not just vanish');
+    assert.equal(doneBanner(p).querySelector('.wt-catchup-text').textContent, 'player.subtitleCaughtUp');
+    assert.equal(doneBanner(p).querySelector('button'), null, 'nothing to press on good news');
+
+    await wait(600);
+    assert.equal(catchUpBanner(p), null, 'and then it goes');
+});
+
+test('"caught up" does not outlive the translation it is about', async (t) => {
+    // Found in review (2026-09-18): the flash ignores a "nothing to show"
+    // so the next tick cannot cut it short -- and ignored the viewer
+    // switching the translation off as well.
+    t.after(() => destroyPlayer());
+    clearOfferMemory();
+    const p = await mountPlayer();
+    let pending = '100';
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? catchUpResponse('12/400', pending)
+        : { ok: true, status: 200, json: async () => ({}) }));
+    await pickPausedThenPlay(p, 100);
+    pending = '400';
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.ok(doneBanner(p), 'the flash is up');
+
+    click(p.chip('none'));
+    await settle();
+    assert.equal(catchUpBanner(p), null, 'no translation, nothing to have caught up');
+});
+
+test('a dismissed banner is not followed by "caught up"', async (t) => {
+    t.after(() => destroyPlayer());
+    clearOfferMemory();
+    const p = await mountPlayer();
+    let pending = '100';
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? catchUpResponse('12/400', pending)
+        : { ok: true, status: 200, json: async () => ({}) }));
+    await pickPausedThenPlay(p, 100);
+    click(behindBanner(p).querySelector('.wt-catchup-close'));
+    await settle();
+    pending = '400';
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.equal(catchUpBanner(p), null, 'the viewer asked not to hear about it');
+});
+
+test('the viewer is behind when the TRACK is, whatever the service says', async (t) => {
+    // Owner, 2026-09-18: "the subtitles do not keep up", with no banner to
+    // say why. The service was ahead; the throttled <track> was not.
+    t.after(() => destroyPlayer());
+    clearOfferMemory();
+    const p = await mountPlayer(null, { tracks: [['tr-pt', false]] });
+    let answer = () => catchUpResponse('5/400', '130');
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? answer()
+        : { ok: true, status: 200, json: async () => ({}) }));
+    const trackSrc = () => p.video.querySelector('track#tr-pt').getAttribute('src') || '';
+    await pickPausedThenPlay(p, 100);
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.ok(/rev=5\b/.test(trackSrc()), `loaded up to 130 s: ${trackSrc()}`);
+
+    // The service races ahead to 400 s; nothing reloads (15 s throttle, and
+    // the viewer is 30 s short of the edge of what they have).
+    answer = () => catchUpResponse('40/400', '400');
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.ok(/rev=5\b/.test(trackSrc()), 'plenty loaded ahead: no swap yet');
+
+    // The viewer reaches the edge of the loaded cues: that is a swap NOW.
+    p.video.currentTime = 127;
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.ok(/rev=40\b/.test(trackSrc()), `the throttle yields to a viewer running out of cues: ${trackSrc()}`);
+});
+
+test('the edge of an unshifted track is read in movie time, not pushed out by the run offset', async (t) => {
+    // Found in review (2026-09-18): coverageEnd added the session offset to
+    // a cue that had not been shifted yet -- one that is in movie time
+    // already. In a run starting at 600 s a track ending at 650 s claimed
+    // 1250 s, so the viewer ran out of cues with no swap and no banner.
+    let answer = () => catchUpResponse('5/400', null);
+    const { p } = await mountSessionRun(t, () => answer(), { sessionOffset: 600, startPaused: true });
+    const el = p.video.querySelector('track#tr-pt');
+    const trackSrc = () => el.getAttribute('src') || '';
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.ok(/rev=5\b/.test(trackSrc()), `fixture: swapped with nothing pending: ${trackSrc()}`);
+
+    // The revision parsed, and the offset pass has not reached it yet.
+    el.track.cues.length = 0;
+    el.track.addCue({ startTime: 640, endTime: 650 });
+    // The service is far ahead; the viewer (600 + 48) is at the track's edge.
+    answer = () => catchUpResponse('40/400', '2000');
+    p.video.currentTime = 48;
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.ok(/rev=40\b/.test(trackSrc()), `the viewer is running out of cues, so the swap is now: ${trackSrc()}`);
+});
+
+test('a seek the service already covers is not held for a track that is merely stale', async (t) => {
+    // Found in review (2026-09-18): the forced swap was skipped while the
+    // silent pre-hold had the film paused, so the stale track edge read as
+    // "behind" -- a visible wait, a banner and a "caught up" flash over cues
+    // the service had all along.
+    let answer = () => catchUpResponse('5/400', '130');
+    const { p, log, seek, events } = await mountSessionRun(t, () => answer(), { startPaused: true });
+    const el = p.video.querySelector('track#tr-pt');
+    const trackSrc = () => el.getAttribute('src') || '';
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.ok(/rev=5\b/.test(trackSrc()), `fixture: loaded up to 130 s: ${trackSrc()}`);
+
+    // The service gets far ahead and the player hears about it before the
+    // seek: the swap is throttled (plenty loaded ahead of 1 s), and the
+    // seek's kick will find no NEW change to force one with.
+    answer = () => catchUpResponse('40/400', '2000');
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.ok(/rev=5\b/.test(trackSrc()), `fixture: throttled, still the old revision: ${trackSrc()}`);
+
+    // The seek lands at 210 s: past the loaded edge, well inside what the
+    // service has translated. (timeupdate: the arrow key seeks from the
+    // player's own clock, which jsdom does not advance.)
+    // The brake is kept out of the jump itself (it skips a hidden tab; no
+    // visibilitychange is sent, so nothing else notices): a film playing at
+    // 200 s over a track that ends at 130 s is exactly what the brake is
+    // for, and this test is about the seek.
+    Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+    p.video.currentTime = 200;
+    p.video.dispatchEvent(new dom.window.Event('timeupdate'));
+    await settle();
+    delete document.hidden;
+    // Answers take 200 ms from here on, so the one that matters lands
+    // while the silent hold has the film paused -- a mid-seek answer,
+    // with the film still running, swaps on its own and hides the bug.
+    const prompt = answer;
+    answer = () => new Promise((resolve) => setTimeout(() => resolve(prompt()), 200));
+    const playsBefore = log.play;
+    await seek();
+    assert.equal(p.video.paused, true, 'fixture: the silent hold is on when the answer arrives');
+    await wait(500);
+
+    assert.ok(/rev=40\b/.test(trackSrc()), `the swap happens under the silent hold: ${trackSrc()}`);
+    assert.equal(events('subtitle-translate-wait').length, 0, 'no wait was ever started');
+    assert.equal(behindBanner(p), null, 'and nothing was said');
+    assert.ok(log.play > playsBefore, 'the silent hold lets the film go');
+    assert.equal(p.video.paused, false);
+});
+
+// ---- a revision's load does not switch the translation off ---------------
+
+test('a track switched off while its revision loads is switched back on when it settles', async (t) => {
+    // The whole chain behind "no subtitles until pause -> play" (owner,
+    // 2026-09-18, on OpenSubtitles and embedded sources alike): something
+    // disables the element-backed track -- a session seek's loadSource does
+    // -- and nothing re-asserts the picker's selection after a <track> load,
+    // because the re-assertion listens to hls.js events only.
+    t.after(() => destroyPlayer());
+    clearOfferMemory();
+    const p = await mountPlayer(null, { tracks: [['tr-pt', false]] });
+    p.setResponse((url, params) => (params && params.method === 'HEAD'
+        ? catchUpResponse('5/400', '400')
+        : { ok: true, status: 200, json: async () => ({}) }));
+    const el = p.video.querySelector('track#tr-pt');
+    await pickPausedThenPlay(p, 100);
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.ok(/rev=5\b/.test(el.getAttribute('src') || ''), 'a revision is loading');
+    assert.equal(p.mode('tr-pt'), 'showing', 'fixture: the picked translation is on');
+
+    // What hls.loadSource() does to every element-backed track.
+    el.track.mode = 'disabled';
+    el.dispatchEvent(new dom.window.Event('load'));
+    await settle();
+    assert.equal(p.mode('tr-pt'), 'showing', 'the settle writes the picker’s answer again');
+});
+
+// ---- restored cues carry the CURRENT run's offset -------------------------
+
+test('cues a reload puts back are shifted by the run that is playing now', async (t) => {
+    // The hole behind "the subtitles do not match the dialogue at all" after
+    // a seek (owner, 2026-09-18): an empty revision makes the reload restore
+    // the cue objects it had snapshotted, and those still carry the shift of
+    // the run they were loaded in. The capture 'load' listener cannot help --
+    // it runs BEFORE the restore, over an empty list.
+    // Nothing translated yet, so nothing is swapped in during the mount:
+    // the snapshot under test has to be taken with the stale cue in it.
+    let progress = '0/400';
+    const { p } = await mountSessionRun(t, () => catchUpResponse(progress, '400'), { sessionOffset: 90, startPaused: true });
+    const el = p.video.querySelector('track#tr-pt');
+    // Loaded while the run started at 0: movie time 100 s sat at 100 s.
+    const stale = { startTime: 100, endTime: 103, __absStart: 100, __absEnd: 103 };
+    el.track.cues.length = 0;
+    el.track.addCue(stale);
+    progress = '5/400';
+    await wait(POLL_INTERVAL_WINDOW_MS);
+    assert.ok(/rev=5\b/.test(el.getAttribute('src') || ''), 'fixture: a revision swap is pending');
+
+    // The browser dropped the list while reparsing, and the revision is empty.
+    el.track.cues.length = 0;
+    el.dispatchEvent(new dom.window.Event('load'));
+    await settle();
+    assert.equal(el.track.cues.length, 1, 'the viewer keeps the line they had');
+    assert.equal(el.track.cues[0].startTime, 10, 'at 100 - 90 s: the run that is playing starts at 90');
+});
+
+// ---- the buffering label (BufferingLabel.jsx, buffering-label.js) ---------
+//
+// Owner, 2026-09-26: the spinner is a pill that says "Buffering". At the
+// plan's cap -- the transfer status's word, published on window by
+// lib/playerLabel.js -- it is the lock, a button with the viewer's cap that
+// opens the status's own stream plan card in a modal dialog. The label here
+// is the one the status builds from the server's own message (the
+// Go-generated fixture the status tests run on), not a hand-written
+// look-alike.
+
+const { publishPlayerLabel } = await import('../playerLabel.js');
+const { playerLabel } = await import('../transferStatus.js');
+const STALL_SUB = 'Без подписки — до 5 Мбит/с, а файлу нужно 8,7 Мбит/с';
+const CAP_LABEL = playerLabel(
+    JSON.parse(readFileSync(path.join(HERE, '../__fixtures__/transfer-status-states.json'), 'utf8'))
+        .find((s) => s.design === 'tier_dl').status.view,
+    { player: 'buffering', stallSub: STALL_SUB },
+);
+
+const bufferingPill = (p) => p.container.querySelector('.wt-buffering-pill');
+const lockButton = (p) => p.container.querySelector('button.wt-buffering-pill--cap');
+// The card is the page's, not the player's (it outlives a move to the next
+// file): looked for in the document.
+const capDialog = () => document.querySelector('dialog.wt-cap-dialog');
+const capCard = () => document.querySelector('.wt-cap-card');
+const lockSeen = (p) => p.events.filter((e) => e.name === 'player-label-lock-shown');
+
+// jsdom has <dialog> but neither showModal() nor close(). stubDialog teaches
+// them to its prototype for one test, as a browser does them: showModal()
+// opens it (the top layer is the browser's), close() closes it and fires
+// `close` a task later. Without the stub the card takes its fallback, the
+// class.
+function stubDialog(t) {
+    const proto = dom.window.HTMLDialogElement.prototype;
+    const calls = [];
+    proto.showModal = function showModal() {
+        calls.push('showModal');
+        this.setAttribute('open', '');
+    };
+    proto.close = function close() {
+        calls.push('close');
+        if (!this.hasAttribute('open')) return;
+        this.removeAttribute('open');
+        setTimeout(() => this.dispatchEvent(new dom.window.Event('close')), 0);
+    };
+    t.after(() => {
+        delete proto.showModal;
+        delete proto.close;
+    });
+    return calls;
+}
+// The film at the cap, stalled, the card opened from its lock.
+async function openCard(p, clock) {
+    publishPlayerLabel(CAP_LABEL);
+    await filmPlays(p, clock);
+    await filmStalls(p, clock);
+    click(lockButton(p));
+    await settle();
+    assert.ok(capCard(p), 'fixture: the card is open');
+}
+
+// filmClock moves the element's clock while the film plays -- what the
+// player's stall watchdog (stall-watch.js) reads as playback -- and stands
+// it still for a stall. jsdom's clock does not move on its own.
+function filmClock(p) {
+    let timer = null;
+    return {
+        run() { if (!timer) timer = setInterval(() => { p.video.currentTime += 0.05; }, 10); },
+        stop() { clearInterval(timer); timer = null; },
+    };
+}
+// The film starts (`play`, the first frame's `playing`) at `at` s.
+async function filmPlays(p, clock, at = 300) {
+    p.video.paused = false;
+    p.video.currentTime = at;
+    clock.run();
+    p.video.dispatchEvent(new dom.window.Event('play'));
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await settle();
+}
+// The data runs out: `waiting`, and the clock stands.
+async function filmStalls(p, clock) {
+    clock.stop();
+    p.video.dispatchEvent(new dom.window.Event('waiting'));
+    await settle();
+}
+// It comes back: `playing`, and the clock runs for longer than the watchdog
+// asks of a recovery (RECOVER_MS).
+async function filmResumes(p, clock) {
+    clock.run();
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await wait(400);
+}
+// The page's player: with controls (the label is part of them), as
+// stream_video.html renders it.
+async function mountLabelled(t, prepare) {
+    const p = await mountPlayer((page) => {
+        page.video.setAttribute('controls', '');
+        if (prepare) prepare(page);
+    });
+    const clock = filmClock(p);
+    t.after(() => {
+        clock.stop();
+        publishPlayerLabel(null);
+        destroyPlayer();
+    });
+    return { p, clock, log: playback(p.video) };
+}
+
+test('the spinner is a pill that says Buffering, with the spinner\'s visibility', async (t) => {
+    assert.ok(CAP_LABEL && CAP_LABEL.cta.url, 'fixture: the status\'s label at a stall at the cap');
+    const { p, clock } = await mountLabelled(t);
+    assert.equal(bufferingPill(p), null, 'paused: nothing');
+    await filmPlays(p, clock);
+    assert.equal(bufferingPill(p), null, 'playing: nothing');
+    await filmStalls(p, clock);
+    const pill = bufferingPill(p);
+    assert.ok(pill, 'a stall: the pill');
+    assert.equal(pill.tagName, 'SPAN', 'no status word on the cap: the plain pill, not a control');
+    assert.equal(pill.textContent, 'player.buffering');
+    assert.ok(pill.querySelector('svg.wt-buffering-spin'), 'its own small spinner');
+    assert.equal(p.container.querySelector('.wt-buffering .animate-spin'), null, 'the big spinner is gone');
+    assert.equal(lockButton(p), null);
+    await filmResumes(p, clock);
+    assert.equal(bufferingPill(p), null, 'playing again: gone');
+});
+
+// A live region created together with its words is not read out by most
+// screen readers: the pill's own role=status came and went with the pill,
+// and the lock (a button) said nothing at all. One region stands in the
+// player from the start, empty while nothing waits: the wait is said, and
+// at the cap the lock's reason.
+test('the buffering label is said: one live region, there before its words', async (t) => {
+    const { p, clock } = await mountLabelled(t);
+    const live = () => p.container.querySelector('[data-buffering-live]');
+    const region = live();
+    assert.ok(region, 'there from the start');
+    assert.equal(region.getAttribute('role'), 'status');
+    assert.equal(region.textContent, '', 'empty while nothing waits');
+    await filmPlays(p, clock);
+    await filmStalls(p, clock);
+    assert.equal(live(), region, 'the same element');
+    assert.equal(region.textContent, 'player.buffering');
+    assert.equal(bufferingPill(p).hasAttribute('role'), false, 'said once: the pill is not a region of its own');
+    publishPlayerLabel(CAP_LABEL);
+    await settle();
+    assert.ok(lockButton(p), 'fixture: the lock');
+    assert.equal(region.textContent, lockButton(p).getAttribute('aria-label'), 'at the cap: the lock\'s reason');
+    await filmResumes(p, clock);
+    assert.equal(live(), region);
+    assert.equal(region.textContent, '', 'playing again: nothing to say');
+});
+
+test('the lock only with the status\'s word on the cap, and only where the pill is', async (t) => {
+    const { p, clock, log } = await mountLabelled(t);
+    await filmPlays(p, clock);
+    publishPlayerLabel(CAP_LABEL);
+    await settle();
+    assert.equal(bufferingPill(p), null, 'the word alone, the film playing: nothing');
+    await filmStalls(p, clock);
+    const lock = lockButton(p);
+    assert.ok(lock, 'a stall at the cap: the lock');
+    assert.equal(lock.querySelector('.wt-buffering-cap').textContent, CAP_LABEL.rate, 'the viewer\'s own cap');
+    assert.equal(lock.textContent.replaceAll(' ', ' '), 'player.buffering5 Мбит/с');
+    assert.equal(lock.getAttribute('aria-expanded'), 'false');
+    assert.ok(lock.querySelector('.wt-buffering-chev'), 'the chevron: there is more');
+    assert.deepEqual(p.events.filter((e) => e.name === 'player-label-lock-shown').map((e) => e.data), [CAP_LABEL.props]);
+    // The word goes (the swarm, not the cap; the cap let go): plain again.
+    publishPlayerLabel(null);
+    await settle();
+    assert.equal(lockButton(p), null);
+    assert.equal(bufferingPill(p).tagName, 'SPAN', 'a swarm or network stall: the plain pill');
+    publishPlayerLabel(CAP_LABEL);
+    await settle();
+    assert.ok(lockButton(p));
+    assert.equal(p.events.filter((e) => e.name === 'player-label-lock-shown').length, 1, 'one lock seen is one lock seen');
+    // A label without the card's data (no link): the plain pill.
+    publishPlayerLabel({ ...CAP_LABEL, cta: { ...CAP_LABEL.cta, url: '' } });
+    await settle();
+    assert.equal(lockButton(p), null, 'no card to open: no lock');
+    assert.equal(bufferingPill(p).tagName, 'SPAN');
+    assert.equal(log.play + log.pause, 0, 'nothing played or paused the film');
+});
+
+test('a player mounted after the status has spoken reads its word', async (t) => {
+    publishPlayerLabel(CAP_LABEL);
+    const { p, clock } = await mountLabelled(t);
+    await filmPlays(p, clock);
+    await filmStalls(p, clock);
+    assert.ok(lockButton(p));
+});
+
+// The status draws every second: a word published between the player's
+// first render and its subscription is read again on subscribing, not lost
+// until the next change.
+test('a word published while the player mounts is not lost', async (t) => {
+    const p = mount();
+    p.video.setAttribute('controls', '');
+    const clock = filmClock(p);
+    t.after(() => {
+        clock.stop();
+        publishPlayerLabel(null);
+        destroyPlayer();
+    });
+    await initPlayer(p.container);
+    publishPlayerLabel(CAP_LABEL);
+    await settle();
+    playback(p.video);
+    await filmPlays(p, clock);
+    await filmStalls(p, clock);
+    assert.ok(lockButton(p));
+});
+
+// A native <dialog class="modal"> opened with showModal(), like the grace
+// popup and #subtitles: the top layer -- nothing in the player clips it, and
+// it shows over a fullscreen player (owner, 2026-09-26: the card inside the
+// player's frame was cut off).
+test('the lock opens the status\'s stream plan card in a modal dialog, with the player\'s own link', async (t) => {
+    const calls = stubDialog(t);
+    const { p, clock, log } = await mountLabelled(t);
+    await openCard(p, clock);
+    const dialog = capDialog(p);
+    assert.ok(dialog, 'a <dialog>');
+    assert.ok(dialog.classList.contains('modal'), 'DaisyUI\'s modal, as the other popups');
+    assert.deepEqual(calls, ['showModal'], 'opened with showModal(): the top layer');
+    assert.equal(dialog.open, true);
+    assert.equal(dialog.classList.contains('modal-open'), false, 'not the fallback');
+    assert.equal(dialog.getAttribute('aria-label'), CAP_LABEL.title);
+    const card = capCard(p);
+    assert.equal(card.parentElement, dialog);
+    assert.ok(card.classList.contains('modal-box') && card.classList.contains('tx-pbox'), 'the status\'s own box, as the modal\'s box');
+    assert.equal(document.activeElement, card, 'focus on the box itself: no ring on a button nobody tabbed to');
+    assert.equal(card.querySelector('.tx-pt').textContent, 'Видео подгружается медленнее, чем играет');
+    assert.equal(card.querySelector('.tx-ps').textContent, STALL_SUB, 'the stream job\'s line');
+    const a = card.querySelector('a.tx-sbtn');
+    assert.equal(a.getAttribute('href'), '/ru/trial?from=player-label', 'the trial through the player\'s own surface');
+    assert.equal(a.getAttribute('target'), '_blank');
+    assert.equal(a.textContent, 'Смотреть без ограничения скорости');
+    assert.equal(card.querySelector('.tx-pn').textContent, CAP_LABEL.cta.note);
+    assert.equal(a.getAttribute('data-umami-event'), 'donate-player-label');
+    assert.equal(a.getAttribute('data-umami-event-location'), 'player');
+    assert.equal(a.getAttribute('data-umami-event-state'), 'stream_stall');
+    assert.equal(a.getAttribute('data-umami-event-target'), 'trial');
+    const backdrop = dialog.querySelector('form[method="dialog"].modal-backdrop button');
+    assert.ok(backdrop, 'the backdrop, as #subtitles has');
+    // A click beside the card, not a stop for Tab or a word for a screen
+    // reader: an invisible screen-sized button saying "close" in English
+    // in every locale (the × and Esc are the keyboard's ways out).
+    assert.equal(backdrop.getAttribute('tabindex'), '-1', 'not in the Tab order');
+    assert.equal(backdrop.getAttribute('aria-hidden'), 'true', 'not read out');
+    assert.equal(lockButton(p).getAttribute('aria-expanded'), 'true');
+    assert.equal(lockButton(p).querySelector('.wt-buffering-chev'), null, 'open: the chevron goes');
+    assert.deepEqual(p.events.filter((e) => e.name === 'donate-player-label-shown').map((e) => e.data), [CAP_LABEL.props]);
+    // The clicks and keys are the card's: the film is neither toggled, nor
+    // sought, nor made fullscreen -- the player's keys are on the document,
+    // where the card's would bubble to.
+    const stage = p.container.querySelector('.wt-player-stage');
+    let fullscreens = 0;
+    stage.requestFullscreen = () => { fullscreens++; return Promise.resolve(); };
+    click(card);
+    click(card.querySelector('.tx-pt'));
+    card.dispatchEvent(new dom.window.MouseEvent('dblclick', { bubbles: true }));
+    card.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: ' ', bubbles: true }));
+    card.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    await settle();
+    assert.equal(log.play + log.pause, 0, 'nothing played or paused the film');
+    assert.equal(fullscreens, 0, 'nor made it fullscreen');
+    assert.ok(capCard(p), 'still open');
+    p.container.querySelector('.wt-player').dispatchEvent(new dom.window.MouseEvent('dblclick', { bubbles: true }));
+    assert.equal(fullscreens, 1, 'fixture: the player\'s own double-click is fullscreen');
+    // Its X closes it; the lock stays while the film stalls.
+    click(card.querySelector('.wt-cap-card-x'));
+    await settle();
+    assert.equal(capDialog(p), null, 'closed');
+    assert.deepEqual(calls, ['showModal', 'close'], 'closed as a dialog: out of the top layer');
+    assert.ok(lockButton(p), 'the lock stays while the film stalls');
+    assert.equal(lockButton(p).getAttribute('aria-expanded'), 'false');
+    assert.equal(log.play + log.pause, 0);
+});
+
+for (const [how, act] of [
+    ['Esc', (dialog) => dialog.dispatchEvent(new dom.window.Event('cancel', { cancelable: true }))],
+    ['a click beside it', (dialog) => click(dialog.querySelector('.modal-backdrop button'))],
+    ['its button', (dialog) => {
+        const a = dialog.querySelector('a.tx-sbtn');
+        a.addEventListener('click', (e) => e.preventDefault()); // jsdom does not open tabs
+        click(a);
+    }],
+]) {
+    test(`the card closes on ${how}`, async (t) => {
+        const calls = stubDialog(t);
+        const { p, clock, log } = await mountLabelled(t);
+        await openCard(p, clock);
+        act(capDialog(p));
+        await settle();
+        assert.equal(capDialog(p), null, 'closed');
+        assert.deepEqual(calls, ['showModal', 'close']);
+        assert.ok(lockButton(p), 'the lock stays');
+        assert.equal(log.play + log.pause, 0, 'the film untouched');
+    });
+}
+
+// The browser closes a modal dialog itself as well: Chrome's close watcher
+// does not let every Esc be cancelled, and closes it then without asking.
+// The player follows -- the lock says closed, and one press opens it again.
+test('a card the browser closed itself is closed for the player too', async (t) => {
+    stubDialog(t);
+    const { p, clock } = await mountLabelled(t);
+    await openCard(p, clock);
+    capDialog(p).close();
+    await settle();
+    assert.equal(capDialog(p), null, 'gone');
+    assert.equal(lockButton(p).getAttribute('aria-expanded'), 'false');
+    click(lockButton(p));
+    await settle();
+    assert.ok(capCard(p), 'one press opens it again');
+});
+
+// A browser without showModal (and jsdom): DaisyUI's .modal-open shows it,
+// and the lock -- not made inert by a modal -- closes it as it opened it.
+test('without showModal the card is shown by its class, and closes the same ways', async (t) => {
+    assert.equal(typeof dom.window.HTMLDialogElement.prototype.showModal, 'undefined', 'fixture: jsdom has none');
+    const { p, clock, log } = await mountLabelled(t);
+    await openCard(p, clock);
+    const dialog = capDialog(p);
+    assert.ok(dialog.classList.contains('modal-open'), 'shown by its class');
+    assert.equal(document.activeElement, capCard(p), 'focus on the box');
+    click(lockButton(p));
+    await settle();
+    assert.equal(capDialog(p), null, 'the lock closes it');
+    click(lockButton(p));
+    await settle();
+    capDialog(p).dispatchEvent(new dom.window.Event('cancel', { cancelable: true }));
+    await settle();
+    assert.equal(capDialog(p), null, 'Esc');
+    click(lockButton(p));
+    await settle();
+    click(capDialog(p).querySelector('.modal-backdrop button'));
+    await settle();
+    assert.equal(capDialog(p), null, 'the backdrop');
+    click(lockButton(p));
+    await settle();
+    click(capDialog(p).querySelector('.wt-cap-card-x'));
+    await settle();
+    assert.equal(capDialog(p), null, 'the X');
+    assert.equal(log.play + log.pause, 0);
+});
+
+// Owner, 2026-09-26: only the viewer closes the card -- not the film playing
+// again, not the status taking its word back.
+test('the card stays open when the film plays again', async (t) => {
+    const calls = stubDialog(t);
+    const { p, clock } = await mountLabelled(t);
+    await openCard(p, clock);
+    await filmResumes(p, clock);
+    assert.equal(bufferingPill(p), null, 'playing: the pill goes');
+    assert.ok(capCard(p), 'the card stays');
+    assert.equal(capDialog(p).open, true);
+    assert.deepEqual(calls, ['showModal'], 'nobody closed it');
+    await filmStalls(p, clock);
+    assert.ok(lockButton(p), 'the next stall: the lock');
+    assert.equal(document.querySelectorAll('.wt-cap-card').length, 1, 'and the one card');
+    assert.equal(lockButton(p).getAttribute('aria-expanded'), 'true');
+});
+
+test('the card stays open, saying what it said, when the status takes its word back', async (t) => {
+    const calls = stubDialog(t);
+    const { p, clock } = await mountLabelled(t);
+    await openCard(p, clock);
+    const before = capCard(p).innerHTML;
+    publishPlayerLabel(null);
+    await settle();
+    assert.ok(capCard(p), 'the card stays');
+    assert.equal(capCard(p).innerHTML, before, 'with its words and its link');
+    assert.equal(bufferingPill(p).tagName, 'SPAN', 'the pill: plain');
+    publishPlayerLabel({ ...CAP_LABEL, sub: 'другая строка' });
+    await settle();
+    assert.equal(capCard(p).innerHTML, before, 'another word meanwhile: the card as it was opened');
+    assert.deepEqual(calls, ['showModal']);
+    click(capCard(p).querySelector('.wt-cap-card-x'));
+    await settle();
+    assert.equal(capDialog(p), null, 'the viewer closes it');
+});
+
+// Nor the move to the next file (next-item-go.js): the player the card was
+// opened from is destroyed (destroyPlayer({ keepStage: true })) and another
+// mounted on the same stage, and the lock is drawn while the next file
+// loads -- a card opened there, or at a stall near the end before autoplay
+// moves on, is the viewer's to close. The card is the page's, not the
+// player's.
+// `prepare`: more for the first player's page (a grace popup, the stream
+// job's card); deliver(attrs): more attributes on the next file's <video>.
+async function mountWithNext(t, prepare) {
+    const saved = { DOMParser: globalThis.DOMParser, FormData: globalThis.FormData };
+    globalThis.DOMParser = dom.window.DOMParser;
+    globalThis.FormData = dom.window.FormData;
+    window._userId = 'u1'; // signed in: no Turnstile token to get
+    const streams = [];
+    window.EventSource = class { constructor(url) { this.url = url; streams.push(this); } close() {} };
+    t.after(() => {
+        globalThis.DOMParser = saved.DOMParser;
+        globalThis.FormData = saved.FormData;
+        delete window._userId;
+        delete window.EventSource;
+        window.sessionStorage.clear();
+    });
+    const { p, clock } = await mountLabelled(t, (page) => {
+        Object.assign(page.video.dataset, { nextItemId: 'i2', nextPath: 'ep2.mkv', nextKind: 'episode' });
+        // What canMoveOn looks for: the start form and #content.
+        const form = document.createElement('form');
+        form.setAttribute('action', '/stream-video');
+        form.setAttribute('data-async-target', '#content');
+        form.innerHTML = '<input name="item-id" value="i1">';
+        document.body.appendChild(form);
+        const content = document.createElement('div');
+        content.id = 'content';
+        document.body.appendChild(content);
+        if (prepare) prepare(page);
+    });
+    // The start's POST answers with its job log. Its body is FormData, which
+    // the harness's fetch (it records JSON bodies) cannot read: answered
+    // before it.
+    const harnessFetch = globalThis.fetch;
+    globalThis.fetch = (url, params) => {
+        if (params && params.method === 'POST' && String(url).endsWith('/stream-video')) {
+            return Promise.resolve({ ok: true, status: 200, text: async () => '<div data-async-progress-log="/log/1"></div>' });
+        }
+        return harnessFetch(url, params);
+    };
+    window.fetch = globalThis.fetch;
+    // The job's last message: the next file's player.
+    const deliver = async (attrs = '') => {
+        streams[streams.length - 1].onmessage({ data: JSON.stringify({
+            level: 'rendertemplate',
+            body: `<div class="relative"><video class="player" data-resource-id="res" data-path="ep2.mkv" controls${attrs}></video>${DIALOG}</div>`,
+        }) });
+        await settle();
+        await settle();
+    };
+    return { p, clock, streams, deliver };
+}
+
+test('the card outlives the move to the next file: only the viewer closes it', async (t) => {
+    const calls = stubDialog(t);
+    const { p, clock, streams, deliver } = await mountWithNext(t);
+    publishPlayerLabel(CAP_LABEL);
+    await filmPlays(p, clock, 1200);
+    keydown('n');
+    await settle();
+    assert.equal(streams.length, 1, 'fixture: the next file\'s start is under way');
+    assert.ok(lockButton(p), 'the next file loads at the cap: the lock');
+    click(lockButton(p));
+    await settle();
+    assert.ok(capCard(p), 'fixture: the card is open');
+    const before = capCard(p).innerHTML;
+    await deliver();
+    assert.equal(document.querySelector('video.player').getAttribute('data-path'), 'ep2.mkv', 'fixture: the next file\'s player is up');
+    assert.ok(capDialog(p), 'the card is still there');
+    assert.equal(capDialog(p).open, true, 'and open');
+    assert.deepEqual(calls, ['showModal'], 'nobody closed it');
+    assert.equal(capCard(p).innerHTML, before, 'saying what it said');
+    assert.equal(document.querySelectorAll('.wt-cap-card').length, 1, 'the one card');
+    // The new player's lock (its start waits at the cap) knows the card is open.
+    assert.equal(lockButton(p).getAttribute('aria-expanded'), 'true', 'the new player\'s lock: open');
+    click(capCard(p).querySelector('.wt-cap-card-x'));
+    await settle();
+    assert.equal(capDialog(p), null, 'the viewer closes it');
+    assert.deepEqual(calls, ['showModal', 'close']);
+    assert.equal(lockButton(p).getAttribute('aria-expanded'), 'false', 'and the new player\'s lock says so');
+});
+
+// The fallback (no showModal) the same way: the class, across the move.
+test('without showModal the card outlives the move to the next file too', async (t) => {
+    const { p, clock, deliver } = await mountWithNext(t);
+    publishPlayerLabel(CAP_LABEL);
+    await filmPlays(p, clock, 1200);
+    keydown('n');
+    await settle();
+    click(lockButton(p));
+    await settle();
+    await deliver();
+    assert.equal(document.querySelector('video.player').getAttribute('data-path'), 'ep2.mkv', 'fixture: the next file\'s player is up');
+    assert.ok(capDialog(p) && capDialog(p).classList.contains('modal-open'), 'still shown');
+    click(lockButton(p));
+    await settle();
+    assert.equal(capDialog(p), null, 'the new player\'s lock closes it, as the old one would have');
+});
+
+// In fullscreen: the modal card is over the fullscreen stage (the top
+// layer), and the viewer stays there; the fallback, a plain element on the
+// page outside the stage, would be hidden by it -- so it leaves fullscreen
+// first, as the grace popup's fallback does.
+for (const [how, modal, exits] of [['a modal card keeps', true, 0], ['the fallback leaves', false, 1]]) {
+    test(`in fullscreen ${how} it`, async (t) => {
+        if (modal) stubDialog(t);
+        let exited = 0;
+        Object.defineProperty(document, 'fullscreenElement', { configurable: true, get: () => document.body });
+        document.exitFullscreen = () => { exited++; return Promise.resolve(); };
+        t.after(() => {
+            delete document.fullscreenElement;
+            delete document.exitFullscreen;
+        });
+        const { p, clock } = await mountLabelled(t);
+        await openCard(p, clock);
+        assert.equal(exited, exits);
+        assert.equal(modal ? capDialog(p).open : capDialog(p).classList.contains('modal-open'), true, 'shown');
+    });
+}
+
+// The player the next file brings up mounts under the open card, and its
+// lock says open from its first frame -- and when the card opened between
+// that frame and its subscription (the status draws every second), on
+// subscribing.
+const { openCapCard, closeCapCard } = await import('./BufferingLabel.jsx');
+for (const [when, before] of [['on its first frame', true], ['on subscribing', false]]) {
+    test(`a player mounted under an open card reads it ${when}`, async (t) => {
+        const p = mount();
+        p.video.setAttribute('controls', '');
+        t.after(() => {
+            publishPlayerLabel(null);
+            destroyPlayer();
+        });
+        publishPlayerLabel(CAP_LABEL);
+        if (before) openCapCard(CAP_LABEL);
+        await initPlayer(p.container, { awaitStart: true });
+        // Rendered; its effects (the subscription) wait for the next frame.
+        assert.ok(lockButton(p), 'fixture: the start waits under the lock');
+        if (before) {
+            assert.equal(lockButton(p).getAttribute('aria-expanded'), 'true', 'the first frame: open');
+        } else {
+            openCapCard(CAP_LABEL);
+        }
+        await settle();
+        assert.equal(lockButton(p).getAttribute('aria-expanded'), 'true', 'open');
+        closeCapCard();
+        await settle();
+        assert.equal(lockButton(p).getAttribute('aria-expanded'), 'false', 'and closed when it closes');
+    });
+}
+
+// Leaving the page (the view's destroy: destroyPlayer() without keepStage)
+// takes the card with it -- as a dialog, out of the top layer.
+test('leaving the page takes the card with it', async (t) => {
+    const calls = stubDialog(t);
+    const { p, clock } = await mountLabelled(t);
+    await openCard(p, clock);
+    destroyPlayer();
+    await settle();
+    assert.equal(capDialog(p), null, 'gone');
+    assert.deepEqual(calls, ['showModal', 'close'], 'closed as a dialog');
+    assert.equal(document.querySelector('.wt-cap-card-host'), null, 'nothing left on the page');
+});
+
+// The status takes its word back inside the grace window; a word a second
+// old (a session seek back into the window) is the player's to refuse.
+test('inside the free grace window by movie time: the plain pill, whatever the word', async (t) => {
+    const { p, clock } = await mountLabelled(t, (page) => { page.video.dataset.graceDurationSec = '600'; });
+    publishPlayerLabel(CAP_LABEL);
+    await filmPlays(p, clock, 30);
+    await filmStalls(p, clock);
+    assert.ok(bufferingPill(p), 'a stall');
+    assert.equal(lockButton(p), null, 'inside the window: no lock');
+    await filmResumes(p, clock);
+    // Past the window (no popup on this page to put up).
+    p.video.currentTime = 700;
+    await settle();
+    await filmStalls(p, clock);
+    assert.ok(lockButton(p), 'past it: the lock');
+});
+
+test('no lock while the grace popup holds the film; a stall at the cap after the answer is the lock', async (t) => {
+    const { p, clock } = await mountLabelled(t, (page) => gracePopup(page, 30));
+    publishPlayerLabel(CAP_LABEL); // a word the status has not taken back yet
+    await filmPlays(p, clock, 31);
+    assert.ok(popupUp(), 'fixture: the popup is up');
+    assert.equal(p.video.paused, true, 'fixture: and holds the film');
+    await filmStalls(p, clock);
+    assert.equal(lockButton(p), null, 'no lock behind the popup');
+    assert.equal(capCard(p), null);
+    graceCta().querySelector('.grace-cta-continue').click();
+    await settle();
+    assert.equal(p.video.paused, false, 'fixture: the answer plays it');
+    await filmStalls(p, clock);
+    assert.ok(lockButton(p), 'past the window, the popup answered: the lock');
+});
+
+// Owner, 2026-09-26: "after a seek at the cap the pill says just Buffering,
+// but the seek wait is limited by the plan too" -- the lock wherever the pill
+// is shown.
+test('a session seek at the cap waits under the lock', async (t) => {
+    const { p, clock } = await mountLabelled(t, (page) => {
+        page.video.dataset.sessionId = 's1';
+        page.video.dataset.sessionSeekUrl = '/session/seek';
+        page.video.setAttribute('data-duration', '3600');
+    });
+    let releasePost = null;
+    p.setResponse((url, params) => {
+        if (params && params.method === 'POST' && String(url).startsWith('/session/seek')) {
+            return new Promise((resolve) => {
+                releasePost = () => resolve({ ok: true, status: 200, json: async () => ({ offset: 900 }) });
+            });
+        }
+        return { ok: true, status: 200, headers: new dom.window.Headers(), json: async () => ({ offset: 0 }) };
+    });
+    p.video.load = () => {};
+    publishPlayerLabel(CAP_LABEL);
+    await filmPlays(p, clock);
+    assert.equal(bufferingPill(p), null, 'fixture: playing, no pill');
+    keydown('ArrowRight');
+    await settle();
+    assert.ok(releasePost, 'fixture: the seek is under way');
+    assert.ok(lockButton(p), 'the seek waits under the lock');
+    assert.equal(lockSeen(p).length, 1);
+    releasePost();
+    await settle();
+});
+
+// A player moved to by "next" (next-item-go.js), before its first frame.
+test('the next file\'s start at the cap waits under the lock', async (t) => {
+    const p = mount();
+    p.video.setAttribute('controls', '');
+    t.after(() => {
+        publishPlayerLabel(null);
+        destroyPlayer();
+    });
+    publishPlayerLabel(CAP_LABEL);
+    await initPlayer(p.container, { awaitStart: true });
+    await settle();
+    assert.equal(p.video.paused, true, 'fixture: not playing yet');
+    assert.ok(lockButton(p), 'the start waits under the lock');
+});
+
+// A session seek past the window puts the popup up as the seek starts, and
+// the seek's wait is on screen behind it: no lock while the popup is up --
+// not even for the frame before its effect puts it up -- and the lock once
+// the viewer has answered it.
+test('no lock behind the grace popup a session seek brings up; the lock after the answer', async (t) => {
+    const { p, clock } = await mountLabelled(t, (page) => {
+        gracePopup(page, 10);
+        page.video.dataset.sessionId = 's1';
+        page.video.dataset.sessionSeekUrl = '/session/seek';
+        page.video.setAttribute('data-duration', '3600');
+    });
+    let releasePost = null;
+    p.setResponse((url, params) => {
+        if (params && params.method === 'POST' && String(url).startsWith('/session/seek')) {
+            return new Promise((resolve) => {
+                releasePost = () => resolve({ ok: true, status: 200, json: async () => ({ offset: 15 }) });
+            });
+        }
+        return { ok: true, status: 200, headers: new dom.window.Headers(), json: async () => ({ offset: 0 }) };
+    });
+    p.video.load = () => {};
+    publishPlayerLabel(CAP_LABEL); // a word the status has not taken back yet
+    await filmPlays(p, clock, 0);
+    keydown('ArrowRight'); // 0:00 -> 0:15, past the 10 s window
+    await settle();
+    assert.ok(popupUp(), 'fixture: the popup came up with the seek');
+    assert.ok(releasePost, 'fixture: the seek is under way');
+    assert.ok(bufferingPill(p), 'the seek waits');
+    assert.equal(lockButton(p), null, 'behind the popup: the plain pill');
+    assert.equal(lockSeen(p).length, 0, 'not even for a frame');
+    graceCta().querySelector('.grace-cta-continue').click();
+    await settle();
+    assert.equal(popupUp(), false, 'fixture: answered');
+    assert.ok(lockButton(p), 'the seek still waits, past the window, the popup answered: the lock');
+    releasePost();
+    await settle();
+});
+
+// ---- the lock by the viewer's answer to the grace popup -------------------
+//
+// Owner, 2026-09-27: "after a seek the 20-minute popup appeared; after I
+// answered that I want slow, a plain Buffering hung with no lock." The answer
+// says the rest of the film is at the cap; the status's word on it comes 8-15 s
+// later (thp's verdict, then the box). From the answer on every wait is the
+// lock at once, with the card the stream job rendered on the element -- the
+// <video> as stream_video.html renders it (the Go-generated fixture,
+// services/template/cap_card_render_test.go), not a look-alike -- and the
+// status's label takes over the moment it is there.
+
+const CARD_VIDEO = readFileSync(path.join(HERE, '__fixtures__/cap-card-video.html'), 'utf8');
+// The card's attributes and the file's line (data-status-stall-sub), as the
+// element's dataset has them.
+const JOB_CARD = (() => {
+    const holder = document.createElement('div');
+    holder.innerHTML = `${CARD_VIDEO}</video>`;
+    const { dataset } = holder.querySelector('video');
+    return Object.fromEntries(Object.entries(dataset).filter(([k]) => k.startsWith('capCard') || k === 'statusStallSub'));
+})();
+// The same as markup, for a <video> the next file's job renders.
+const JOB_CARD_ATTRS = Object.entries(JOB_CARD)
+    .map(([k, v]) => ` data-${k.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}="${v.replaceAll('&', '&amp;').replaceAll('"', '&quot;')}"`)
+    .join('');
+const jobCard = (page) => Object.assign(page.video.dataset, JOB_CARD);
+const ANSWER_PROPS = { ctx: 'stream', location: 'player', auth: 'anon', state: 'stream_stall', tier: 'free', target: 'trial', source: 'grace-answer' };
+const shownCards = (p) => p.events.filter((e) => e.name === 'donate-player-label-shown').map((e) => e.data);
+
+// The film past a 30 s window, the popup up and holding it, a stall behind it.
+async function popupAt31(p, clock) {
+    await filmPlays(p, clock, 31);
+    assert.ok(popupUp(), 'fixture: the popup is up');
+    await filmStalls(p, clock);
+    assert.equal(lockButton(p), null, 'not before the answer');
+}
+
+test('fixture: the stream job\'s card says what the status\'s label says', () => {
+    assert.ok(JOB_CARD.capCardUrl && JOB_CARD.statusStallSub, 'the card and the file\'s line on the element');
+    const job = { rate: JOB_CARD.capCardRate, title: JOB_CARD.capCardTitle, cta: JOB_CARD.capCardCta, note: JOB_CARD.capCardNote, url: JOB_CARD.capCardUrl, sub: JOB_CARD.statusStallSub };
+    const status = { rate: CAP_LABEL.rate, title: CAP_LABEL.title, cta: CAP_LABEL.cta.label, note: CAP_LABEL.cta.note, url: CAP_LABEL.cta.url, sub: STALL_SUB };
+    // The status's line here is the harness's STALL_SUB (the stream job's
+    // line is on the element either way): compared by its words.
+    const words = (o) => ({ ...o, sub: o.sub.replaceAll(' ', ' ') });
+    assert.deepEqual(words(job), words(status), 'two Go renders, one set of words');
+});
+
+for (const [how, answer, act] of [
+    ['"continue at 5 Mbps"', 'continue', () => graceCta().querySelector('.grace-cta-continue').click()],
+    ['its close', 'dismiss', () => graceCta().querySelector('.grace-cta-close').click()],
+    ['Play', 'continue', () => keydown(' ')],
+]) {
+    test(`answered by ${how}: the next wait is the lock at once, with the stream job's card`, async (t) => {
+        const { p, clock } = await mountLabelled(t, (page) => {
+            gracePopup(page, 30);
+            jobCard(page);
+        });
+        await popupAt31(p, clock);
+        act();
+        await settle();
+        assert.equal(popupUp(), false, 'fixture: answered');
+        assert.equal(p.video.dataset.graceCtaAnswered, answer);
+        await filmStalls(p, clock);
+        const lock = lockButton(p);
+        assert.ok(lock, 'the lock, with no word from the status yet');
+        assert.equal(lock.querySelector('.wt-buffering-cap').textContent, JOB_CARD.capCardRate);
+        assert.deepEqual(lockSeen(p).map((e) => e.data), [ANSWER_PROPS], 'seen, raised by the answer');
+        click(lock);
+        await settle();
+        const card = capCard(p);
+        assert.ok(card, 'the card opens');
+        assert.equal(card.querySelector('.tx-pt').textContent, 'Видео подгружается медленнее, чем играет');
+        assert.equal(card.querySelector('.tx-ps').textContent.replaceAll(' ', ' '), 'Без подписки — до 5 Мбит/с, а файлу нужно 8,7 Мбит/с', 'the stream job\'s line');
+        const a = card.querySelector('a.tx-sbtn');
+        assert.equal(a.getAttribute('href'), '/ru/trial?from=player-label', 'the player\'s own surface');
+        assert.equal(a.textContent, 'Смотреть без ограничения скорости');
+        assert.equal(card.querySelector('.tx-pn').textContent, '7 дней бесплатно · отмена в любой момент');
+        assert.equal(a.getAttribute('data-umami-event'), 'donate-player-label');
+        assert.equal(a.getAttribute('data-umami-event-source'), 'grace-answer');
+        assert.equal(a.getAttribute('data-umami-event-target'), 'trial');
+        assert.equal(a.getAttribute('data-umami-event-state'), 'stream_stall');
+        assert.deepEqual(shownCards(p), [ANSWER_PROPS]);
+    });
+}
+
+// The owner's own case: a session seek past the window puts the popup up as it
+// starts, and after the answer the seek still waits -- under the lock, now.
+test('a session seek past the window, the popup answered "slow": the seek waits under the lock at once', async (t) => {
+    const { p, clock } = await mountLabelled(t, (page) => {
+        gracePopup(page, 10);
+        jobCard(page);
+        page.video.dataset.sessionId = 's1';
+        page.video.dataset.sessionSeekUrl = '/session/seek';
+        page.video.setAttribute('data-duration', '3600');
+    });
+    let releasePost = null;
+    p.setResponse((url, params) => {
+        if (params && params.method === 'POST' && String(url).startsWith('/session/seek')) {
+            return new Promise((resolve) => {
+                releasePost = () => resolve({ ok: true, status: 200, json: async () => ({ offset: 15 }) });
+            });
+        }
+        return { ok: true, status: 200, headers: new dom.window.Headers(), json: async () => ({ offset: 0 }) };
+    });
+    p.video.load = () => {};
+    await filmPlays(p, clock, 0);
+    keydown('ArrowRight'); // 0:00 -> 0:15, past the 10 s window
+    await settle();
+    assert.ok(popupUp(), 'fixture: the popup came up with the seek');
+    assert.ok(releasePost, 'fixture: the seek is under way');
+    assert.equal(lockButton(p), null, 'behind the popup: the plain pill');
+    graceCta().querySelector('.grace-cta-continue').click();
+    await settle();
+    assert.equal(popupUp(), false, 'fixture: answered');
+    assert.ok(lockButton(p), 'the seek still waits: the lock, before the status has a word');
+    assert.deepEqual(lockSeen(p).map((e) => e.data), [ANSWER_PROPS]);
+    releasePost();
+    await settle();
+});
+
+// No answer, no lock of the player's own: a film past its window whose popup
+// never came (none on this page) waits under the plain pill as before.
+test('the stream job\'s card alone, not answered: the plain pill', async (t) => {
+    const { p, clock } = await mountLabelled(t, (page) => {
+        page.video.dataset.graceDurationSec = '30';
+        jobCard(page);
+    });
+    await filmPlays(p, clock, 31);
+    await filmStalls(p, clock);
+    assert.ok(bufferingPill(p), 'fixture: a wait');
+    assert.equal(lockButton(p), null);
+    assert.equal(lockSeen(p).length, 0);
+});
+
+// The stream job says the file fits under the cap with room to spare: a wait
+// there is not the cap's as far as the player knows -- the status's word
+// alone makes it the lock (its own rules for such a file stand).
+test('answered, a file that fits the cap: the plain pill until the status says so', async (t) => {
+    const { p, clock } = await mountLabelled(t, (page) => {
+        gracePopup(page, 30);
+        jobCard(page);
+        page.video.dataset.statusFitsCap = '';
+    });
+    await popupAt31(p, clock);
+    graceCta().querySelector('.grace-cta-continue').click();
+    await settle();
+    await filmStalls(p, clock);
+    assert.ok(bufferingPill(p), 'fixture: a wait');
+    assert.equal(lockButton(p), null, 'fits: no lock of the player\'s own');
+    publishPlayerLabel(CAP_LABEL);
+    await settle();
+    assert.ok(lockButton(p), 'the status\'s word: the lock');
+    assert.equal(lockSeen(p)[0].data.source, 'status');
+});
+
+// Nothing faster on sale (no catalog, a promo plan no faster than the cap):
+// the job renders no card, and there is nothing for the lock to open.
+test('answered, nothing on sale: the plain pill', async (t) => {
+    const { p, clock } = await mountLabelled(t, (page) => gracePopup(page, 30));
+    await popupAt31(p, clock);
+    graceCta().querySelector('.grace-cta-continue').click();
+    await settle();
+    await filmStalls(p, clock);
+    assert.ok(bufferingPill(p), 'fixture: a wait');
+    assert.equal(lockButton(p), null);
+});
+
+// A seek back before the window's end plays at the grace rate again: not the
+// cap, whatever was answered. Past it again: the lock.
+test('answered, back inside the grace window: the plain pill; past it again, the lock', async (t) => {
+    const { p, clock } = await mountLabelled(t, (page) => {
+        gracePopup(page, 30);
+        jobCard(page);
+    });
+    await popupAt31(p, clock);
+    graceCta().querySelector('.grace-cta-continue').click();
+    await settle();
+    await filmPlays(p, clock, 10);
+    await filmStalls(p, clock);
+    assert.ok(bufferingPill(p), 'fixture: a wait at 0:10');
+    assert.equal(lockButton(p), null, 'inside the window');
+    await filmPlays(p, clock, 40);
+    await filmStalls(p, clock);
+    assert.ok(lockButton(p), 'past it: the lock');
+});
+
+// One source of truth: the status's label is the lock whenever it is there
+// -- over the answer's, and in its place once it comes. Taken back, it is
+// the status's word too (its box goes only after 10 s of the viewer under
+// the cap): the plain pill, not the answer's lock again -- until a seek back
+// inside the window starts a new stretch, whose gap before the verdict is
+// the answer's again.
+test('answered: the status\'s label is preferred when it is there', async (t) => {
+    const { p, clock } = await mountLabelled(t, (page) => {
+        gracePopup(page, 30);
+        jobCard(page);
+    });
+    await popupAt31(p, clock);
+    graceCta().querySelector('.grace-cta-continue').click();
+    await settle();
+    await filmStalls(p, clock);
+    assert.ok(lockButton(p), 'fixture: the answer\'s lock');
+    publishPlayerLabel(CAP_LABEL);
+    await settle();
+    assert.ok(lockButton(p), 'the status\'s word: the lock still');
+    assert.equal(lockSeen(p).length, 1, 'one lock seen: the status took over the one the answer raised');
+    click(lockButton(p));
+    await settle();
+    const a = capCard(p).querySelector('a.tx-sbtn');
+    assert.equal(a.getAttribute('data-umami-event-source'), 'status', 'the card is the status\'s');
+    assert.equal(capCard(p).querySelector('.tx-ps').textContent, CAP_LABEL.sub);
+    assert.deepEqual(shownCards(p).map((d) => d.source), ['status']);
+    click(capCard(p).querySelector('.wt-cap-card-x'));
+    await settle();
+    publishPlayerLabel(null);
+    await settle();
+    assert.ok(bufferingPill(p), 'fixture: still a wait');
+    assert.equal(lockButton(p), null, 'the status takes its word back: the plain pill, not the answer\'s lock');
+    await filmResumes(p, clock);
+    await filmStalls(p, clock);
+    assert.equal(lockButton(p), null, 'the next stall on this stretch: the status\'s word alone');
+    publishPlayerLabel(CAP_LABEL);
+    await settle();
+    assert.ok(lockButton(p), 'its word again: the lock');
+    publishPlayerLabel(null);
+    // A seek back inside the window, and past it again: a new stretch.
+    await filmPlays(p, clock, 10);
+    await filmStalls(p, clock);
+    assert.equal(lockButton(p), null, 'fixture: inside the window');
+    await filmPlays(p, clock, 40);
+    await filmStalls(p, clock);
+    assert.ok(lockButton(p), 'past it again, before the status\'s verdict: the answer\'s lock');
+    click(lockButton(p));
+    await settle();
+    assert.equal(capCard(p).querySelector('a.tx-sbtn').getAttribute('data-umami-event-source'), 'grace-answer');
+});
+
+// The answer covers the gap before the status's word, not a word that says
+// no (review of 2026-09-27): a swarm-bound torrent -- a few seeders slower
+// than the cap -- no seeders, pieces nobody has, nothing flowing. The status
+// names the cause (lib/transferStatus.js playerCause), statusview refuses to
+// sell there on purpose, and a trial would not end the wait: the plain pill.
+// Before the status has spoken on this stretch its word follows the view:
+// the cause gone (the bytes flow again, no verdict yet), the answer's lock.
+test('answered, the status names another cause for the wait: the plain pill', async (t) => {
+    const { p, clock } = await mountLabelled(t, (page) => {
+        gracePopup(page, 30);
+        jobCard(page);
+    });
+    await popupAt31(p, clock);
+    graceCta().querySelector('.grace-cta-continue').click();
+    await settle();
+    await filmStalls(p, clock);
+    assert.ok(lockButton(p), 'fixture: the answer\'s lock, no word yet');
+    for (const cause of ['swarm', 'noseed', 'missing', 'stalled']) {
+        publishPlayerLabel(null, window, cause);
+        await settle();
+        assert.ok(bufferingPill(p), `fixture: a wait (${cause})`);
+        assert.equal(lockButton(p), null, `the status says ${cause}: no lock, no trial pitch`);
+    }
+    await filmResumes(p, clock);
+    await filmStalls(p, clock);
+    assert.equal(lockButton(p), null, 'the next stall with the cause still named: plain');
+    publishPlayerLabel(null, window, '');
+    await settle();
+    assert.ok(lockButton(p), 'the cause gone, no verdict yet: the answer\'s lock');
+    assert.equal(lockSeen(p).length, 1, 'one lock seen');
+});
+
+// The next file is a new element, and a new grace window: it starts without
+// the answer -- and so does the wait while it loads, drawn by the player
+// being left. Plain until the status says so.
+test('the next file starts without the answer: plain until the status says so', async (t) => {
+    const { p, clock, deliver } = await mountWithNext(t, (page) => {
+        gracePopup(page, 30);
+        jobCard(page);
+    });
+    await popupAt31(p, clock);
+    graceCta().querySelector('.grace-cta-continue').click();
+    await settle();
+    await filmStalls(p, clock);
+    assert.ok(lockButton(p), 'fixture: answered, the lock');
+    keydown('n');
+    await settle();
+    assert.ok(bufferingPill(p), 'the next file loads');
+    assert.equal(lockButton(p), null, 'its start is not this film\'s cap');
+    await deliver(JOB_CARD_ATTRS);
+    const next = document.querySelector('video.player');
+    assert.equal(next.getAttribute('data-path'), 'ep2.mkv', 'fixture: the next file\'s player is up');
+    assert.ok(next.dataset.capCardUrl, 'fixture: with its own card');
+    assert.equal('graceCtaAnswered' in next.dataset, false, 'and no answer');
+    assert.ok(bufferingPill(p), 'its start waits');
+    assert.equal(lockButton(p), null, 'plain');
+    publishPlayerLabel(CAP_LABEL);
+    await settle();
+    assert.ok(lockButton(p), 'the status says so: the lock');
+});
+
+// ---- HEVC passthrough: the route in stream-start, the fallback, "Compatibility mode"
+
+const { setPendingFallback, pendingFallbackFor, loadMemory: loadDecodeMemory } = await import('./decode-declaration.js');
+
+// The page's start form for the file the harness plays, with its log target
+// (resource page markup: form.stream-video, resource-id, item-id).
+function pageStartForm(page, itemId = 'item1') {
+    const f = document.createElement('form');
+    f.setAttribute('action', '/stream-video');
+    f.setAttribute('method', 'post');
+    f.className = 'stream-video';
+    f.innerHTML = `<input type="hidden" name="resource-id" value="res"><input type="hidden" name="item-id" value="${itemId}">`;
+    page.container.appendChild(f);
+    return f;
+}
+// The submits a form on the page would send, read at submit time (the async
+// submit's FormData), and stopped there: jsdom does not navigate.
+function recordSubmits() {
+    const got = [];
+    const onSubmit = (e) => { e.preventDefault(); got.push(Object.fromEntries(new dom.window.FormData(e.target))); };
+    document.addEventListener('submit', onSubmit);
+    return { got, stop: () => document.removeEventListener('submit', onSubmit) };
+}
+const passthroughPlayer = (page, { itemId = 'item1' } = {}) => {
+    page.video.setAttribute('controls', '');
+    page.video.setAttribute('data-video-route', 'passthrough');
+    page.video.setAttribute('data-route-reason', 'ok');
+    page.video.setAttribute('data-video-class', 'hevc10-2160');
+    page.video.setAttribute('data-item-id', itemId);
+    page.video.setAttribute('data-decode', 'hevc8,hevc10,hevc8-2160,hevc10-2160,hdr-pq');
+    page.video.setAttribute('data-frag-load-ms', '240000');
+};
+const compatItem = (p) => p.container.querySelector('.wt-player-menu-row--compat');
+const freshDecodeMemory = () => {
+    window.localStorage.removeItem('wt-decode-fallback');
+    if (window.__wtDecode) { window.__wtDecode.memory = null; window.__wtDecode.pending = null; }
+};
+
+test('stream-start carries the route, its reason and the declaration', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer((page) => {
+        page.video.setAttribute('data-video-route', 'reencode');
+        page.video.setAttribute('data-route-reason', 'no_declaration');
+    });
+    await playPast(p);
+    const ev = p.events.find((e) => e.name === 'stream-start');
+    assert.ok(ev, 'the engagement gate must emit stream-start');
+    assert.equal(ev.data.route, 'reencode');
+    assert.equal(ev.data.reason, 'no_declaration');
+    assert.equal(ev.data.decl, '', 'no declaration: an empty field, not a missing one');
+    assert.equal(ev.data.audio, 'none');
+});
+
+// The start's audio class: what its declaration made of the audio, as the
+// job read it from the master -- the base audio-fallback and hevc-fallback
+// are counted against, per class.
+for (const [name, decode, audioClass, want] of [
+    ['Dolby declared and made', 'hevc8,hevc10,aac51,ac3,ec3', 'dolby', 'dolby'],
+    ['AAC 5.1 declared and made', 'aac51', 'aac51', 'aac51'],
+    ['audio declared, the stereo of old made', 'hevc8,aac51,ec3', '', 'none'],
+    ['no audio token declared', 'hevc8,hevc10', 'dolby', 'none'],
+]) {
+    test(`stream-start carries the start's audio class: ${name}`, async (t) => {
+        t.after(() => destroyPlayer());
+        const p = await mountPlayer((page) => {
+            page.video.setAttribute('data-video-route', 'reencode');
+            page.video.setAttribute('data-decode', decode);
+            if (audioClass) page.video.setAttribute('data-audio-class', audioClass);
+        });
+        await playPast(p);
+        const ev = p.events.find((e) => e.name === 'stream-start');
+        assert.equal(ev.data.audio, want);
+        assert.equal(ev.data.decl, decode);
+    });
+}
+
+test('stream-start without a transcoder session: empty route fields', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer();
+    await playPast(p);
+    const ev = p.events.find((e) => e.name === 'stream-start');
+    assert.deepEqual([ev.data.route, ev.data.reason, ev.data.decl], ['', '', '']);
+});
+
+test('"Compatibility mode" is there only on a passthrough stream', async (t) => {
+    t.after(() => destroyPlayer());
+    let p = await mountPlayer((page) => {
+        page.video.setAttribute('controls', '');
+        page.video.setAttribute('data-video-route', 'reencode');
+    });
+    assert.equal(compatItem(p), null, 'the old route: no item');
+    assert.equal(p.container.querySelector('.wt-player-btn--more'), null, 'and no menu without a next file');
+    destroyPlayer();
+    p = await mountPlayer(passthroughPlayer);
+    assert.ok(p.container.querySelector('.wt-player-btn--more'), 'the menu, for the item');
+    assert.ok(compatItem(p), 'a passthrough: the item');
+    assert.equal(compatItem(p).textContent.includes('player.compatMode'), true);
+    assert.equal(p.container.querySelector('.wt-player-menu input[role="switch"]'), null, 'no autoplay switch without a next file');
+});
+
+test('"Compatibility mode" restarts this file on the old route, with why, once', async (t) => {
+    freshDecodeMemory();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); freshDecodeMemory(); });
+    const p = await mountPlayer((page) => {
+        passthroughPlayer(page);
+        pageStartForm(page);
+    });
+    compatItem(p).click();
+    await settle();
+    assert.equal(rec.got.length, 1, 'the start form, submitted');
+    assert.equal(rec.got[0]['decode-fallback'], 'user');
+    assert.equal(rec.got[0]['decode-class'], 'hevc10-2160');
+    assert.equal(rec.got[0].decode, undefined, 'no declaration for this file');
+    const ev = p.events.find((e) => e.name === 'hevc-fallback');
+    assert.deepEqual(ev && ev.data, { reason: 'user', cls: 'hevc10-2160', path: 'native', audio: 'none' });
+    const m = loadDecodeMemory(window);
+    assert.ok(m.sources['res/item1'], 'the file is remembered');
+    assert.deepEqual(m.strikes, {}, 'the viewer\'s choice strikes no class');
+    // The element failing afterwards does not restart it again.
+    Object.defineProperty(p.video, 'error', { value: { code: 3 }, configurable: true });
+    p.video.dispatchEvent(new dom.window.Event('error'));
+    await settle();
+    assert.equal(rec.got.length, 1, 'one fallback per player');
+});
+
+test('a passthrough whose decoder fails restarts on the old route and strikes the class', async (t) => {
+    freshDecodeMemory();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); freshDecodeMemory(); });
+    const p = await mountPlayer((page) => {
+        passthroughPlayer(page);
+        pageStartForm(page);
+    });
+    Object.defineProperty(p.video, 'error', { value: { code: 3 }, configurable: true });
+    p.video.dispatchEvent(new dom.window.Event('error'));
+    await settle();
+    assert.equal(rec.got.length, 1);
+    assert.equal(rec.got[0]['decode-fallback'], 'decode_error');
+    assert.deepEqual(loadDecodeMemory(window).strikes['hevc10-2160'].map((s) => s.src), ['res/item1']);
+});
+
+test('an old-route stream has no fallback: an element error restarts nothing', async (t) => {
+    freshDecodeMemory();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); });
+    const p = await mountPlayer((page) => {
+        page.video.setAttribute('data-video-route', 'reencode');
+        pageStartForm(page);
+    });
+    Object.defineProperty(p.video, 'error', { value: { code: 3 }, configurable: true });
+    p.video.dispatchEvent(new dom.window.Event('error'));
+    await settle();
+    assert.equal(rec.got.length, 0);
+    assert.equal(p.events.find((e) => e.name === 'hevc-fallback'), undefined);
+});
+
+test('a player coming up ends a pending restart: its fields ride on no later start', async (t) => {
+    freshDecodeMemory();
+    t.after(() => { destroyPlayer(); freshDecodeMemory(); });
+    setPendingFallback(window, { resourceId: 'res', itemId: 'item1', reason: 'decode_error', cls: 'hevc10' });
+    assert.ok(pendingFallbackFor(window, { resourceId: 'res', itemId: 'item1' }));
+    await mountPlayer();
+    assert.equal(pendingFallbackFor(window, { resourceId: 'res', itemId: 'item1' }), null);
+});
+
+// ---- multichannel audio: the fallback of the audio a declaration made -------
+
+// A declaring browser with its cached answers: every video token and every
+// audio token (decode-declaration.js reads them for the restart's
+// declaration). `audio` is its audio switch: 'on' (?audio=on), 'off'
+// (?audio=off: no audio token), null (never opened: since the audio's stage
+// 5, every audio token -- the same as 'on').
+// Taken out again after each test.
+const DECL_VIDEO = 'hevc8,hevc10,hevc8-2160,hevc10-2160,hdr-pq';
+function declaringBrowser({ audio = 'on' } = {}) {
+    const ua = window.navigator.userAgent;
+    window.localStorage.setItem('wt-passthrough', 'on');
+    if (audio) window.localStorage.setItem('wt-audio', audio);
+    window.localStorage.setItem('wt-decode', JSON.stringify({ ua, tokens: DECL_VIDEO.split(','), at: Date.now() }));
+    window.localStorage.setItem('wt-decode-audio', JSON.stringify({ ua, tokens: ['aac51', 'ac3', 'ec3'], at: Date.now() }));
+    return () => {
+        for (const k of ['wt-passthrough', 'wt-audio', 'wt-decode', 'wt-decode-audio']) window.localStorage.removeItem(k);
+        freshDecodeMemory();
+    };
+}
+const oldRouteAudio = (page, { decode = `${DECL_VIDEO},aac51,ac3,ec3`, audioClass = 'aac51' } = {}) => {
+    page.video.setAttribute('controls', '');
+    page.video.setAttribute('data-video-route', 'reencode');
+    page.video.setAttribute('data-route-reason', 'no_hevc_declared');
+    if (decode) page.video.setAttribute('data-decode', decode);
+    if (audioClass) page.video.setAttribute('data-audio-class', audioClass);
+    page.video.setAttribute('data-item-id', 'item1');
+};
+const failElement = async (p, code, message = '') => {
+    Object.defineProperty(p.video, 'error', { value: { code, message }, configurable: true });
+    p.video.dispatchEvent(new dom.window.Event('error'));
+    await settle();
+};
+
+test('old route, AAC 5.1 declared and made: a failure restarts the file without audio tokens, the video declared as before', async (t) => {
+    const undo = declaringBrowser();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); undo(); });
+    const p = await mountPlayer((page) => {
+        oldRouteAudio(page);
+        pageStartForm(page);
+    });
+    await failElement(p, 3);
+    assert.equal(rec.got.length, 1, 'the start form, submitted');
+    assert.equal(rec.got[0].decode, DECL_VIDEO, 'no audio token; the video tokens stay');
+    assert.equal(rec.got[0]['decode-fallback'], 'decode_error');
+    assert.equal(rec.got[0]['decode-class'], 'aac51');
+    const ev = p.events.find((e) => e.name === 'audio-fallback');
+    assert.deepEqual(ev && ev.data, { reason: 'decode_error', cls: 'aac51', path: 'native', route: 'reencode', audio: 'aac51', by: 'native' });
+    assert.equal(p.events.find((e) => e.name === 'hevc-fallback'), undefined, 'the HEVC fallback count stays the video\'s');
+    assert.deepEqual(loadDecodeMemory(window).strikes.aac51.map((s) => s.src), ['res/item1']);
+    assert.equal(compatItem(p), null, 'no Compatibility mode on the old route');
+});
+
+// The same failure after half a minute of playback: the audio has decoded
+// here, so on native HLS (jsdom has no hls.js) the element's error is the old
+// route's, as on every stream -- no restart from the start (finding 1 of the
+// audio stage 5 review; passthrough.js createAudioGuard, CLEAN_PLAY_S).
+test('old route, AAC 5.1 declared and made: an element error after 30 s of playback restarts nothing', async (t) => {
+    const undo = declaringBrowser();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); undo(); });
+    const p = await mountPlayer((page) => {
+        oldRouteAudio(page);
+        pageStartForm(page);
+    });
+    p.video.dispatchEvent(new dom.window.Event('timeupdate'));
+    await playSeconds(p, 31);
+    await failElement(p, 3);
+    assert.equal(rec.got.length, 0);
+    assert.equal(p.events.find((e) => e.name === 'audio-fallback'), undefined);
+    assert.equal(loadDecodeMemory(window).strikes.aac51, undefined);
+});
+
+// The default since the audio's stage 5: a browser that never opened
+// ?audio= declares every audio token it answers -- Chrome, which answers no
+// Dolby, aac51 alone; its old-route stream gets the guard, and the restart
+// after a failure at the start drops every audio token.
+test('old route, a browser with the audio switch never opened: an AAC 5.1 failure at the start restarts without aac51', async (t) => {
+    const undo = declaringBrowser({ audio: null });
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); undo(); });
+    const p = await mountPlayer((page) => {
+        oldRouteAudio(page, { decode: `${DECL_VIDEO},aac51` });
+        pageStartForm(page);
+    });
+    await failElement(p, 4);
+    assert.equal(rec.got.length, 1);
+    assert.equal(rec.got[0].decode, DECL_VIDEO);
+    assert.equal(rec.got[0]['decode-class'], 'aac51');
+    assert.equal(rec.got[0]['decode-fallback'], 'src_unsupported');
+});
+
+// The invariant: a start that declared no audio token gets no guard --
+// a browser opted out of audio, one that answered none, no declaration.
+for (const [name, decode] of [['no declaration', ''], ['video only', DECL_VIDEO]]) {
+    test(`old route, ${name}: an element error restarts nothing, whatever the tag says of the audio`, async (t) => {
+        const undo = declaringBrowser();
+        const rec = recordSubmits();
+        t.after(() => { rec.stop(); destroyPlayer(); undo(); });
+        const p = await mountPlayer((page) => {
+            oldRouteAudio(page, { decode, audioClass: 'aac51' });
+            pageStartForm(page);
+        });
+        await failElement(p, 3);
+        await failElement(p, 4);
+        assert.equal(rec.got.length, 0);
+        assert.equal(p.events.find((e) => e.name === 'audio-fallback'), undefined);
+    });
+}
+
+test('old route, audio declared but not made (no class): nothing restarts', async (t) => {
+    const undo = declaringBrowser();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); undo(); });
+    const p = await mountPlayer((page) => {
+        oldRouteAudio(page, { audioClass: '' });
+        pageStartForm(page);
+    });
+    await failElement(p, 3);
+    assert.equal(rec.got.length, 0);
+});
+
+// The element names the audio's decoder (Chrome's MediaError message
+// "<PipelineStatus>: <the media log's first error>", DecoderStream's
+// "audio decode error!"): the audio's failure.
+test('a passthrough with Dolby whose audio decoder fails restarts it without Dolby: the video keeps passthrough, the class is not struck', async (t) => {
+    const undo = declaringBrowser();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); undo(); });
+    const p = await mountPlayer((page) => {
+        passthroughPlayer(page);
+        page.video.setAttribute('data-decode', `${DECL_VIDEO},aac51,ac3,ec3`);
+        page.video.setAttribute('data-audio-class', 'dolby');
+        pageStartForm(page);
+    });
+    await failElement(p, 3, 'PIPELINE_ERROR_DECODE: audio decode error!');
+    assert.equal(rec.got.length, 1);
+    assert.equal(rec.got[0].decode, `${DECL_VIDEO},aac51`, 'HEVC declared again: a 4K film plays');
+    assert.equal(rec.got[0]['decode-class'], 'dolby');
+    const m = loadDecodeMemory(window);
+    assert.equal(m.strikes['hevc10-2160'], undefined, 'the video class is not struck');
+    assert.deepEqual(m.strikes.dolby.map((s) => s.src), ['res/item1']);
+    assert.deepEqual(m.sources, {});
+    const ev = p.events.find((e) => e.name === 'audio-fallback');
+    assert.deepEqual(ev && ev.data, { reason: 'decode_error', cls: 'dolby', path: 'native', route: 'passthrough', audio: 'dolby', by: 'message' });
+});
+
+// A failure nobody pins on a side -- iOS and Safari never name one -- in a
+// passthrough whose audio is Dolby: Dolby first. The restart goes without
+// ac3/ec3 and keeps the HEVC route; the strike is Dolby's. Two such files
+// take Dolby out for 7 days (AAC 5.1 instead), never HEVC: a false HEVC
+// strike would cost passthrough and 4K for 7 days. If the video was the one
+// failing, the start without Dolby fails again and the video's rules take it
+// (the AAC 5.1 test below).
+test('a passthrough with Dolby whose decoder fails, nobody blaming a side: Dolby first -- a restart without it, HEVC kept', async (t) => {
+    const undo = declaringBrowser();
+    t.after(() => { destroyPlayer(); undo(); });
+    for (const item of ['item1', 'item2']) {
+        const rec = recordSubmits();
+        const p = await mountPlayer((page) => {
+            passthroughPlayer(page, { itemId: item });
+            page.video.setAttribute('data-decode', `${DECL_VIDEO},aac51,ac3,ec3`);
+            page.video.setAttribute('data-audio-class', 'dolby');
+            pageStartForm(page, item);
+        });
+        await failElement(p, 3);
+        rec.stop();
+        assert.equal(rec.got.length, 1, `${item}: one restart`);
+        assert.equal(rec.got[0].decode, `${DECL_VIDEO},aac51`, `${item}: the video keeps its route, without Dolby`);
+        assert.equal(rec.got[0]['decode-class'], 'dolby');
+        assert.equal(p.events.find((e) => e.name === 'hevc-fallback'), undefined, `${item}: not the video's`);
+        const ev = p.events.find((e) => e.name === 'audio-fallback');
+        assert.equal(ev && ev.data.cls, 'dolby', `${item}: counted as Dolby's`);
+        assert.equal(ev && ev.data.by, 'unpinned', `${item}: and that nothing pinned it`);
+        destroyPlayer();
+    }
+    const m = loadDecodeMemory(window);
+    assert.deepEqual(m.strikes.dolby.map((s) => s.src), ['res/item1', 'res/item2']);
+    assert.equal(m.strikes['hevc10-2160'], undefined, 'no HEVC strike');
+    const { declarationFor } = await import('./decode-declaration.js');
+    assert.equal(declarationFor(window, { resourceId: 'res', itemId: 'item3' }), `${DECL_VIDEO},aac51`, 'another file: HEVC and AAC 5.1 still declared, Dolby out');
+});
+
+test('a passthrough with AAC 5.1 whose decoder fails, nobody blaming the audio: the video\'s fallback, as before', async (t) => {
+    const undo = declaringBrowser();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); undo(); });
+    const p = await mountPlayer((page) => {
+        passthroughPlayer(page);
+        page.video.setAttribute('data-audio-class', 'aac51');
+        pageStartForm(page);
+    });
+    await failElement(p, 3);
+    assert.equal(rec.got[0].decode, undefined);
+    assert.equal(rec.got[0]['decode-class'], 'hevc10-2160');
+    assert.deepEqual(loadDecodeMemory(window).strikes['hevc10-2160'].map((s) => s.src), ['res/item1']);
+});
+
+// A browser that declares its video but opted out of audio (?audio=off):
+// its start carries no audio token, so the server renders a video-only
+// data-decode -- even a tag that named Dolby (it cannot, without an audio
+// token) charges nothing to the audio: the video's fallback, as before
+// multichannel audio. (Its declaration: decode-declaration.test.js.)
+test('a passthrough of a browser opted out of audio: a failure is the video\'s', async (t) => {
+    const undo = declaringBrowser({ audio: 'off' });
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); undo(); });
+    const p = await mountPlayer((page) => {
+        passthroughPlayer(page);
+        page.video.setAttribute('data-audio-class', 'dolby');
+        pageStartForm(page);
+    });
+    await failElement(p, 3);
+    assert.equal(rec.got.length, 1);
+    assert.equal(rec.got[0].decode, undefined, 'the old route for this file');
+    assert.equal(rec.got[0]['decode-class'], 'hevc10-2160');
+    assert.equal(p.events.find((e) => e.name === 'audio-fallback'), undefined);
+    assert.deepEqual(loadDecodeMemory(window).strikes['hevc10-2160'].map((s) => s.src), ['res/item1']);
+});
+
+// The audio guard is made only for a start that declared an audio token:
+// every other stream -- a browser opted out of audio, or no declaration at
+// all -- gets exactly the listeners it always had. Counted on the element's
+// `error` listeners: the guard adds one there (and a `timeupdate` one, the
+// clock of what played).
+test('no audio token declared, no audio guard: the element gets the listeners it always had', async (t) => {
+    const errorListeners = async (prep) => {
+        let n = 0;
+        const p = await mountPlayer((page) => {
+            const add = page.video.addEventListener.bind(page.video);
+            page.video.addEventListener = (type, fn, o) => { if (type === 'error') n++; return add(type, fn, o); };
+            if (prep) prep(page);
+        });
+        destroyPlayer();
+        return n;
+    };
+    t.after(() => destroyPlayer());
+    const plain = await errorListeners(null);
+    assert.equal(await errorListeners((page) => oldRouteAudio(page, { decode: '', audioClass: 'aac51' })), plain, 'no declaration');
+    assert.equal(await errorListeners((page) => oldRouteAudio(page, { decode: DECL_VIDEO, audioClass: 'aac51' })), plain, 'the video only');
+    assert.equal(await errorListeners((page) => oldRouteAudio(page)), plain + 1, 'an audio token: its guard');
+});
+
+// dead-player.js in the player: asked to play, nothing for DEAD_AFTER_MS --
+// one player-dead; a restart the passthrough guard has begun is the guard's.
+// jsdom plays nothing: no hls.js, no source, readyState 0 -- a dead player.
+// The clock goes in the watch's own steps: a mocked tick runs every interval
+// due in it with Date.now() already at its end.
+const tickBy = (t, ms, step = 2000) => { for (let d = 0; d < ms; d += step) t.mock.timers.tick(step); };
+// The mocked clock only around `fn`: the player's teardown (t.after) must
+// clear its intervals with the real clearInterval, or the ones made at mount
+// outlive the test and the process never exits.
+const mockClock = (t, fn) => {
+    t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: 1000000 });
+    try { fn(); } finally { t.mock.timers.reset(); }
+};
+test('a player asked to play that shows nothing sends player-dead, with its route', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer(passthroughPlayer);
+    mockClock(t, () => {
+        p.video.paused = false;
+        p.video.dispatchEvent(new dom.window.Event('play'));
+        tickBy(t, 28000);
+        assert.equal(p.events.find((e) => e.name === 'player-dead'), undefined, 'not before the quiet');
+        tickBy(t, 4000);
+    });
+    const ev = p.events.filter((e) => e.name === 'player-dead');
+    assert.equal(ev.length, 1);
+    assert.equal(ev[0].data.route, 'passthrough');
+    assert.equal(ev[0].data.audio, 'none', 'no audio token declared');
+    assert.equal(ev[0].data.waited_s, 30);
+});
+
+test('player-dead of a passthrough with Dolby carries its audio class', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer((page) => {
+        passthroughPlayer(page);
+        page.video.setAttribute('data-decode', 'hevc8,hevc10,hevc8-2160,hevc10-2160,hdr-pq,aac51,ac3,ec3');
+        page.video.setAttribute('data-audio-class', 'dolby');
+    });
+    mockClock(t, () => {
+        p.video.paused = false;
+        p.video.dispatchEvent(new dom.window.Event('play'));
+        tickBy(t, 32000);
+    });
+    const ev = p.events.filter((e) => e.name === 'player-dead');
+    assert.equal(ev.length, 1);
+    assert.equal(ev[0].data.audio, 'dolby');
+});
+
+test('a passthrough the guard gave up on is not a dead player', async (t) => {
+    freshDecodeMemory();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); freshDecodeMemory(); });
+    const p = await mountPlayer((page) => {
+        passthroughPlayer(page);
+        pageStartForm(page);
+    });
+    p.video.paused = false;
+    Object.defineProperty(p.video, 'error', { value: { code: 3 }, configurable: true });
+    mockClock(t, () => {
+        p.video.dispatchEvent(new dom.window.Event('play'));
+        p.video.dispatchEvent(new dom.window.Event('error'));
+        assert.equal(rec.got.length, 1, 'the restart on the old route');
+        tickBy(t, 60000);
+    });
+    assert.equal(p.events.find((e) => e.name === 'player-dead'), undefined);
+});
+
+// usePlayerState togglePlay: Play before any data calls load() for native
+// HLS, never under hls.js -- load() drops the element's MediaSource (an
+// iPhone on `?mms=on`, or Chrome) and the player is dead.
+test('Play before any data: load() for native HLS, never under hls.js', async (t) => {
+    t.after(() => { window.hlsPlayer = null; destroyPlayer(); });
+    const p = await mountPlayer((page) => page.video.setAttribute('controls', ''));
+    let loads = 0;
+    p.video.load = () => { loads++; };
+    p.video.play = () => Promise.resolve();
+    const play = () => p.container.querySelector('.wt-player-big-play').click();
+    assert.equal(p.video.readyState, 0);
+    play();
+    assert.equal(loads, 1, 'native HLS: loaded first');
+    window.hlsPlayer = { media: p.video, on() {}, off() {}, stopLoad() {}, destroy() {} };
+    play();
+    assert.equal(loads, 1, 'hls.js attached: no load()');
+    window.hlsPlayer = { media: null, on() {}, off() {}, stopLoad() {}, destroy() {} };
+    play();
+    assert.equal(loads, 2, 'an hls.js that let the element go is not attached');
+});
+
+// ---- a stream whose transcoder session is gone -------------------------------
+//
+// network-recovery.js decides what a fatal network error is, stream-restart.js
+// what the page does about it; these are the player's own wiring of the two:
+// hls.js's fatal error and a session seek's POST reach the policy, the restart
+// carries the viewer's place in the film to the next player, the grace popup
+// is answered first, and past the budget the card with one button.
+
+const { NOTE_KEY: RESTART_NOTE_KEY, BUDGET_KEY: RESTART_BUDGET_KEY } = await import('./stream-restart.js');
+
+// A real hls.js instance for the player: jsdom has no MediaSource, so hls.js
+// is told it is supported and its two calls that need one do nothing (as in
+// hooks/useHls.test.js). Everything the player and hls-manager wire is real.
+function withHlsJs(t) {
+    const saved = { isSupported: Hls.isSupported, loadSource: Hls.prototype.loadSource, attachMedia: Hls.prototype.attachMedia };
+    Hls.isSupported = () => true;
+    Hls.prototype.loadSource = function loadSource() {};
+    Hls.prototype.attachMedia = function attachMedia() {};
+    t.after(() => {
+        Hls.isSupported = saved.isSupported;
+        Hls.prototype.loadSource = saved.loadSource;
+        Hls.prototype.attachMedia = saved.attachMedia;
+    });
+}
+
+// sessionPlayer: the element as a transcoder session's render has it.
+function sessionPlayer(page, { seek = () => ({ ok: true, status: 200, json: async () => ({ offset: 1830 }) }) } = {}) {
+    page.video.dataset.sessionId = 'f1097e82';
+    page.video.dataset.sessionSeekUrl = 'https://api.test/x/movie.mkv~hls/session/f1097e82/seek';
+    page.video.setAttribute('data-duration', '3600');
+    page.video.setAttribute('controls', '');
+    const src = document.createElement('source');
+    src.setAttribute('src', 'https://api.test/x/movie.mkv~hls/session/f1097e82/index.m3u8');
+    src.setAttribute('type', 'application/vnd.apple.mpegurl');
+    page.video.appendChild(src);
+    page.setResponse((url, params) => (params && params.method === 'POST'
+        ? seek(url)
+        : { ok: true, status: 200, json: async () => ({ offset: 0 }) }));
+}
+
+// A fatal 404 as hls.js 1.6 hands it for a fragment of a dead session
+// (fragment-loader.ts onError; the body the transcoder sends, in the xhr).
+const deadFragment = (status = 404, body = 'session not found\n') => ({
+    type: Hls.ErrorTypes.NETWORK_ERROR,
+    details: Hls.ErrorDetails.FRAG_LOAD_ERROR,
+    fatal: true,
+    frag: { url: 'https://api.test/x/movie.mkv~hls/session/f1097e82/v0-720-34.ts', type: 'main' },
+    response: { url: 'https://api.test/x/movie.mkv~hls/session/f1097e82/v0-720-34.ts', data: undefined, code: status, text: '' },
+    networkDetails: { status, responseType: 'arraybuffer', response: new TextEncoder().encode(body).buffer, getAllResponseHeaders: () => '' },
+});
+
+const restartNote = () => JSON.parse(window.sessionStorage.getItem(RESTART_NOTE_KEY) || 'null');
+const cleanRestart = () => {
+    window.sessionStorage.removeItem(RESTART_NOTE_KEY);
+    window.sessionStorage.removeItem(RESTART_BUDGET_KEY);
+};
+
+test('a dead session, hls.js path: no startLoad loop -- the page\'s start form again, purged, at the viewer\'s place', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page);
+        pageStartForm(page, 'item');
+    });
+    const hls = window.hlsPlayer;
+    assert.ok(hls instanceof Hls, 'the player runs hls.js');
+    let startLoads = 0;
+    hls.startLoad = () => { startLoads++; };
+    // The film at 20:34 of a run that started at 1200 s (the run's offset).
+    p.video.dataset.runOffset = '1200';
+    await playPast(p, 34);
+    // What the old handler answered at once, again and again.
+    for (let i = 0; i < 50; i++) hls.trigger(Hls.Events.ERROR, deadFragment());
+    await settle();
+    assert.equal(startLoads, 0, 'never a blind startLoad');
+    assert.equal(rec.got.length, 1, 'one restart');
+    assert.equal(rec.got[0]['item-id'], 'item');
+    assert.equal(rec.got[0].purge, 'true');
+    const note = restartNote();
+    assert.equal(note.resourceID, 'res');
+    assert.equal(note.path, 'movie.mkv');
+    assert.equal(note.play, true);
+    assert.deepEqual(p.events.filter((e) => e.name.startsWith('player-recover')), [
+        { name: 'player-recover-restart', data: { reason: '404', status: 404, via: 'load', loader: 'video' } },
+    ]);
+});
+
+// The movie time is the element's clock plus the run's offset: a run that
+// started mid-film (a resume, a seek) is at 0 on the element.
+test('the restart goes to the movie time: the element\'s clock plus the session\'s run offset', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page);
+        pageStartForm(page, 'item');
+        // The run this render started at: GET .../seek answers its offset.
+        page.setResponse((url, params) => (params && params.method === 'POST'
+            ? { ok: true, status: 200, json: async () => ({ offset: 1830 }) }
+            : { ok: true, status: 200, json: async () => ({ offset: 1830 }) }));
+    });
+    await settle();
+    assert.equal(p.video.dataset.runOffset, '1830');
+    p.video.paused = true;
+    p.video.currentTime = 42;
+    window.hlsPlayer.trigger(Hls.Events.ERROR, deadFragment(403, ''));
+    await settle();
+    const note = restartNote();
+    assert.equal(note.at, 1872, '1830 + 42');
+    assert.equal(note.play, false, 'a paused film comes back paused');
+    assert.equal(p.events.find((e) => e.name === 'player-recover-restart').data.reason, '403');
+});
+
+test('the next player takes the note: the session seek to that time, no prompt, no /watch/position', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    t.after(() => { destroyPlayer(); cleanRestart(); });
+    window.sessionStorage.setItem(RESTART_NOTE_KEY, JSON.stringify({
+        resourceID: 'res', path: 'movie.mkv', at: 1872, play: true, until: Date.now() + 60000,
+    }));
+    let purgeLeft = null;
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page);
+        const f = pageStartForm(page, 'item');
+        f.insertAdjacentHTML('beforeend', '<input type="hidden" name="purge" value="true" data-stream-restart>');
+        purgeLeft = () => f.querySelector('input[name="purge"]');
+    });
+    await settle();
+    const posts = p.calls.filter((c) => c.params && c.params.method === 'POST' && String(c.url).includes('/seek'));
+    assert.equal(posts.length, 1);
+    assert.ok(String(posts[0].url).endsWith('t=1872'), posts[0].url);
+    assert.equal(p.calls.filter((c) => String(c.url).startsWith('/watch/position?')).length, 0, 'the note, not the server\'s copy');
+    assert.equal(p.container.querySelector('.wt-resume-prompt'), null, 'no "continue from" question');
+    assert.equal(restartNote(), null, 'taken once');
+    assert.equal(purgeLeft(), null, 'the purge the restart left on the form is gone');
+});
+
+// A seek after a long pause is the other way a dead session shows itself:
+// POST /session/<id>/seek answers 404 too. The film goes to where the viewer
+// asked, not where the dead run stood.
+test('a session seek that finds the session gone restarts at the seek\'s target', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page, { seek: () => ({ ok: false, status: 404, json: async () => null }) });
+        pageStartForm(page, 'item');
+    });
+    await playPast(p, 100);
+    document.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    await settle();
+    assert.equal(rec.got.length, 1);
+    assert.equal(restartNote().at, 115, 'the target: 100 + 15');
+    assert.deepEqual(p.events.find((e) => e.name === 'player-recover-restart').data, { reason: '404', status: 404, via: 'seek' });
+});
+
+test('once per 5 minutes: past it, loading stops and the card shows; its button restarts, playing', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    // This file was restarted a minute ago (the player before this one).
+    window.sessionStorage.setItem(RESTART_BUDGET_KEY, JSON.stringify({ 'res:movie.mkv': Date.now() - 60 * 1000 }));
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page);
+        pageStartForm(page, 'item');
+    });
+    const hls = window.hlsPlayer;
+    let stops = 0;
+    const stop = hls.stopLoad.bind(hls);
+    hls.stopLoad = () => { stops++; return stop(); };
+    await playPast(p, 50);
+    // jsdom's pause() does nothing: the element is paused by hand, as a
+    // browser would.
+    p.video.pause = () => { p.video.paused = true; };
+    hls.trigger(Hls.Events.ERROR, deadFragment());
+    await settle();
+    assert.equal(rec.got.length, 0, 'no second automatic restart');
+    assert.ok(stops >= 1, 'loading stopped');
+    const card = p.container.querySelector('.wt-recover');
+    assert.ok(card, 'the card');
+    assert.equal(card.querySelector('.wt-recover-text').textContent, 'player.streamLost');
+    assert.equal(p.container.querySelector('.wt-player-big-play'), null, 'the card is the one button');
+    assert.equal(p.video.paused, true, 'the dead film is paused under it');
+    assert.deepEqual(p.events.filter((e) => e.name.startsWith('player-recover')), [
+        { name: 'player-recover-card-shown', data: { reason: 'limit', status: 404, cause: '404', via: 'load' } },
+    ]);
+    click(card.querySelector('button'));
+    await settle();
+    assert.equal(rec.got.length, 1, 'the click restarts');
+    assert.equal(rec.got[0].purge, 'true');
+    assert.equal(restartNote().play, true, '"Continue watching" plays');
+    assert.equal(p.events.at(-1).name, 'player-recover-card-click');
+});
+
+test('the grace popup up: no restart until it is answered; then the restart', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page);
+        pageStartForm(page, 'item');
+        page.video.dataset.graceDurationSec = '30';
+        const cta = document.createElement('div');
+        cta.id = 'grace-cta';
+        cta.className = 'hidden';
+        cta.innerHTML = '<button type="button" class="grace-cta-close"></button><button type="button" class="grace-cta-continue"></button>';
+        page.container.appendChild(cta);
+    });
+    await playPast(p, 31);
+    assert.equal(document.getElementById('grace-cta').classList.contains('hidden'), false, 'the popup is up');
+    window.hlsPlayer.trigger(Hls.Events.ERROR, deadFragment());
+    await settle();
+    assert.equal(rec.got.length, 0, 'no restart behind the popup');
+    assert.equal(p.container.querySelector('.wt-recover'), null, 'and no card');
+    click(document.querySelector('.grace-cta-continue'));
+    await settle();
+    assert.equal(rec.got.length, 1, 'its answer, then the restart');
+});
+
+// On its way: the element's clock has crossed the window, the popup comes
+// from a render effect a frame later. The fatal error in between waits too.
+test('the grace popup on its way: the restart waits for it as well', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page);
+        pageStartForm(page, 'item');
+        page.video.dataset.graceDurationSec = '30';
+        const cta = document.createElement('div');
+        cta.id = 'grace-cta';
+        cta.className = 'hidden';
+        cta.innerHTML = '<button type="button" class="grace-cta-close"></button>';
+        page.container.appendChild(cta);
+    });
+    p.video.paused = false;
+    p.video.currentTime = 31;
+    // Before any frame has run the popup's effect.
+    window.hlsPlayer.trigger(Hls.Events.ERROR, deadFragment());
+    assert.equal(rec.got.length, 0);
+    await settle();
+    assert.equal(rec.got.length, 0, 'still waiting, the popup now up');
+    click(document.querySelector('.grace-cta-close'));
+    await settle();
+    assert.equal(rec.got.length, 1);
+});
+
+test('another 4xx: no retry, the card at once (reason network)', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    const p = await mountPlayer((page) => sessionPlayer(page));
+    let startLoads = 0;
+    window.hlsPlayer.startLoad = () => { startLoads++; };
+    window.hlsPlayer.trigger(Hls.Events.ERROR, { ...deadFragment(410, ''), frag: { url: 'https://api.test/x/movie.mp4', type: 'main' }, response: { url: 'https://api.test/x/movie.mp4', code: 410 } });
+    await settle();
+    await new Promise((r) => setTimeout(r, 1200));
+    assert.equal(startLoads, 0);
+    assert.ok(p.container.querySelector('.wt-recover'));
+    assert.deepEqual(p.events.find((e) => e.name === 'player-recover-card-shown').data, { reason: 'network', status: 410 });
+});
+
+test('unmounted with a retry pending: its timer goes with the instance', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    t.after(() => { destroyPlayer(); cleanRestart(); });
+    const p = await mountPlayer((page) => sessionPlayer(page));
+    const hls = window.hlsPlayer;
+    let startLoads = 0;
+    hls.startLoad = () => { startLoads++; };
+    hls.trigger(Hls.Events.ERROR, deadFragment(502, 'bad gateway'));
+    destroyPlayer();
+    await new Promise((r) => setTimeout(r, 1300));
+    assert.equal(startLoads, 0, 'no startLoad on a destroyed instance');
+    assert.equal(p.events.filter((e) => e.name.startsWith('player-recover')).length, 0);
+});
+
+// resumeAt starts a file the viewer had all but finished from the top -- a
+// rule about coming back to a file. A session that died in the credits is
+// not that: the restart goes back to where it stood.
+test('a restart in the last tenth of the film goes back there, not to the start', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    t.after(() => { destroyPlayer(); cleanRestart(); });
+    window.sessionStorage.setItem(RESTART_NOTE_KEY, JSON.stringify({
+        resourceID: 'res', path: 'movie.mkv', at: 3500, play: true, until: Date.now() + 60000,
+    }));
+    const p = await mountPlayer((page) => sessionPlayer(page));
+    await settle();
+    const posts = p.calls.filter((c) => c.params && c.params.method === 'POST' && String(c.url).includes('/seek'));
+    assert.equal(posts.length, 1);
+    assert.ok(String(posts[0].url).endsWith('t=3500'), posts[0].url);
+});
+
+// ---- the note carries a place the viewer is at ---------------------------
+//
+// A page load can replay a job whose session is already gone (the job id
+// stays for 10 min on the site, an hour in the embed; a transcoder rollout
+// in between). The master answers 404 at mounting, before the resume
+// question is answered, before anything played: there is no place to carry.
+// A note there made the next player skip /watch/position, and a signed-in
+// viewer's saved position was never offered -- then overwritten by the
+// restarted player's own saves from 0.
+
+// sessionWithSaved: a session render, with a position saved on the server
+// (600 s of 3000) and the seek POST answered by `seek`. `watch` answers the
+// GET of /watch/position (a pending promise: the fetch still out).
+function sessionWithSaved(page, { seek = () => ({ ok: true, status: 200, json: async () => ({ offset: 0 }) }), watch = null } = {}) {
+    sessionPlayer(page, { seek });
+    page.setResponse((url, params) => {
+        if (params && params.method === 'POST') return seek(url);
+        if (String(url).startsWith('/watch/position?')) {
+            return watch ? watch() : { ok: true, status: 200, headers: new dom.window.Headers(), json: async () => ({ position: 600, duration: 3000 }) };
+        }
+        return { ok: true, status: 200, headers: new dom.window.Headers(), json: async () => ({ offset: 0 }) };
+    });
+}
+
+// The master of a session the transcoder no longer has (playlist-loader.ts
+// handleNetworkError: fatal; the body in the xhr).
+const deadMaster = () => ({
+    type: Hls.ErrorTypes.NETWORK_ERROR, details: Hls.ErrorDetails.MANIFEST_LOAD_ERROR, fatal: true,
+    url: 'https://api.test/x/movie.mkv~hls/session/f1097e82/index.m3u8',
+    response: { url: 'https://api.test/x/movie.mkv~hls/session/f1097e82/index.m3u8', data: undefined, code: 404, text: '' },
+    networkDetails: { status: 404, responseType: 'text', responseText: 'session not found\n', getAllResponseHeaders: () => '' },
+});
+
+const positionGets = (p) => p.calls.filter((c) => String(c.url).startsWith('/watch/position?')).length;
+const positionPuts = (p) => p.calls.filter((c) => String(c.url) === '/watch/position' && c.params && c.params.method === 'PUT');
+
+test('a session found dead at mounting: no note -- the next player still asks /watch/position and offers it', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    const first = await mountPlayer((page) => {
+        sessionWithSaved(page);
+        pageStartForm(page, 'item');
+    });
+    window.hlsPlayer.trigger(Hls.Events.ERROR, deadMaster());
+    await settle();
+    assert.equal(rec.got.length, 1, 'restarted');
+    assert.equal(restartNote(), null, 'nothing to carry');
+    assert.equal(positionPuts(first).length, 0, 'and the saved position is left alone');
+    destroyPlayer();
+    const next = await mountPlayer((page) => sessionWithSaved(page));
+    await settle();
+    assert.equal(positionGets(next), 1, 'the server\'s copy is asked for');
+    assert.ok(resumePrompt(next), '"Continue from 10:00?"');
+});
+
+// The question open: the hold paused autoplay a fraction of a second in.
+// That is not where the viewer is.
+test('the resume question open: autoplay\'s head start is no place -- no note, no PUT', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    const p = await mountPlayer((page) => {
+        sessionWithSaved(page);
+        pageStartForm(page, 'item');
+    });
+    assert.ok(resumePrompt(p), 'the question is open');
+    p.video.paused = true;
+    p.video.currentTime = 0.4;
+    window.hlsPlayer.trigger(Hls.Events.ERROR, deadFragment());
+    await settle();
+    assert.equal(rec.got.length, 1, 'restarted');
+    assert.equal(restartNote(), null);
+    assert.deepEqual(positionPuts(p), [], 'the saved 600 s is not overwritten with 0.4');
+});
+
+// The saved position still being fetched: autoplay is not held yet, the
+// film runs from 0 -- and the prompt may still come up and move it.
+test('the saved position still being fetched: the film\'s first seconds are no place -- no note', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    const p = await mountPlayer((page) => {
+        sessionWithSaved(page, { watch: () => new Promise(() => {}) });
+        pageStartForm(page, 'item');
+    });
+    p.video.paused = false;
+    p.video.currentTime = 3;
+    window.hlsPlayer.trigger(Hls.Events.ERROR, deadFragment());
+    await settle();
+    assert.equal(rec.got.length, 1, 'restarted');
+    assert.equal(restartNote(), null);
+    assert.deepEqual(positionPuts(p), []);
+});
+
+// Answered: from then on the film's place is the viewer's, and it is carried.
+test('the prompt answered "Continue", the film plays on: its place is carried', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    const p = await mountPlayer((page) => {
+        sessionWithSaved(page, { seek: () => ({ ok: true, status: 200, json: async () => ({ offset: 600 }) }) });
+        pageStartForm(page, 'item');
+    });
+    click(resumePrompt(p).querySelector('.wt-resume-btn--primary'));
+    await settle();
+    assert.equal(p.video.dataset.runOffset, '600', 'the new run starts at the saved place');
+    p.video.paused = false;
+    p.video.currentTime = 20;
+    window.hlsPlayer.trigger(Hls.Events.ERROR, deadFragment());
+    await settle();
+    assert.equal(rec.got.length, 1);
+    const note = restartNote();
+    assert.ok(note, 'the note');
+    assert.equal(note.at, 620);
+    assert.equal(note.play, true);
+});
+
+// An <audio> never draws the prompt: its question is settled once the
+// saved position is known, and a place in it is carried as a film's is.
+test('audio: no prompt to answer -- a place in it is carried', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    t.after(() => { destroyPlayer(); cleanRestart(); });
+    const p = await mountPlayer((page) => sessionWithSaved(page), { tag: 'audio' });
+    assert.equal(resumePrompt(p), null);
+    p.video.paused = false;
+    p.video.currentTime = 100;
+    window.hlsPlayer.trigger(Hls.Events.ERROR, deadFragment());
+    await settle();
+    const note = restartNote();
+    assert.ok(note, 'the note');
+    assert.equal(note.at, 100);
+});
+
+// "Continue" answered under the budget's card: its session seek finds the
+// session gone too (the card already up, so it is swallowed). Its target is
+// the viewer's answer, and the card's button restarts there: the note and
+// the PUT at 600, and the next player goes there without asking again.
+// (Iteration 1 restarted from the element's 0, wrote no note -- a note at 0
+// would have started the next player at 0 without asking -- and left the
+// question to the server's copy; review F2, 2026-09-30.)
+test('the prompt answered under the card, its seek found the session gone: the card\'s click restarts at the answer', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    window.sessionStorage.setItem(RESTART_BUDGET_KEY, JSON.stringify({ 'res:movie.mkv': Date.now() - 60 * 1000 }));
+    const p = await mountPlayer((page) => {
+        sessionWithSaved(page, { seek: () => ({ ok: false, status: 404, json: async () => null }) });
+        pageStartForm(page, 'item');
+    });
+    p.video.pause = () => { p.video.paused = true; };
+    window.hlsPlayer.trigger(Hls.Events.ERROR, deadMaster());
+    await settle();
+    const card = p.container.querySelector('.wt-recover');
+    assert.ok(card, 'the budget\'s card');
+    click(resumePrompt(p).querySelector('.wt-resume-btn--primary'));
+    await settle();
+    const posts = p.calls.filter((c) => c.params && c.params.method === 'POST' && String(c.url).includes('/seek'));
+    assert.equal(posts.length, 1, 'the answer\'s seek went out');
+    assert.equal(rec.got.length, 0);
+    assert.equal(p.video.currentTime, 0, 'the element never left the run\'s 0');
+    click(p.container.querySelector('.wt-recover button'));
+    await settle();
+    assert.equal(rec.got.length, 1, 'the card\'s click restarts');
+    const note = restartNote();
+    assert.ok(note, 'the note');
+    assert.equal(note.at, 600, 'the answer\'s place, not the element\'s 0');
+    assert.equal(note.play, true);
+    assert.equal(JSON.parse(positionPuts(p).at(-1).params.body).position, 600);
+});
+
+// ---- the card comes down when the film loads again under it ---------------
+
+// A fragment of the film as hls.js hands FRAG_LOADED (fragment-loader.ts):
+// an init segment, which hls.js's own listeners (abr-controller,
+// fragment-tracker) look at and let go.
+const filmLoaded = () => ({
+    frag: { type: 'main', sn: 'initSegment', level: 0, stats: { loading: { start: 0, first: 0, end: 0 }, loaded: 0 } },
+    part: null, payload: new ArrayBuffer(0), networkDetails: {},
+});
+
+test('the film loads again under the card: the card comes down, and a later dead session restarts', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page);
+        pageStartForm(page, 'item');
+    });
+    p.video.pause = () => { p.video.paused = true; };
+    const hls = window.hlsPlayer;
+    hls.trigger(Hls.Events.ERROR, { ...deadFragment(410, ''), frag: { url: 'https://api.test/x/movie.mp4', type: 'main' }, response: { url: 'https://api.test/x/movie.mp4', code: 410 } });
+    await settle();
+    assert.ok(p.container.querySelector('.wt-recover'), 'the card');
+    // Space under the card, a stall, loader-restart's startLoad: a fragment.
+    hls.trigger(Hls.Events.FRAG_LOADED, filmLoaded());
+    await settle();
+    assert.equal(p.container.querySelector('.wt-recover'), null, 'the card came down');
+    assert.ok(p.container.querySelector('.wt-player-big-play'), 'the big play button is back');
+    hls.trigger(Hls.Events.ERROR, deadFragment());
+    await settle();
+    assert.equal(rec.got.length, 1, 'the dead session restarts: neither layer swallowed it');
+    assert.deepEqual(p.events.filter((e) => e.name.startsWith('player-recover')).map((e) => e.name), [
+        'player-recover-card-shown', 'player-recover-restart',
+    ]);
+});
+
+// ---- iteration 2: what the real-Chrome run found (2026-09-30) ---------------
+
+// A. On the transcoder's EVENT variants hls.js makes almost none of a dead
+// session's answers fatal: a fragment's 404 is skipped as a gap and the next
+// one asked, a playlist's 404/403 asked again on a backoff. 3,000-5,600 404s
+// over ~300 s before the first fatal one. The first answer restarts.
+// The shape: an audio rendition's playlist that hls.js asks again
+// (playlist-loader.ts handleNetworkError; the body in the xhr). A fragment's
+// gap cannot be made here: this hls.js has no levels, and its own
+// error-controller would turn a fragment error fatal on the spot (the
+// fragment shapes are network-recovery.test.js's).
+const deadGap = () => ({
+    type: Hls.ErrorTypes.NETWORK_ERROR, details: Hls.ErrorDetails.AUDIO_TRACK_LOAD_ERROR, fatal: false,
+    url: 'https://api.test/x/movie.mkv~hls/session/f1097e82/a0.m3u8',
+    context: { type: 'audioTrack', url: 'https://api.test/x/movie.mkv~hls/session/f1097e82/a0.m3u8', groupId: 'aud', id: 0 },
+    response: { url: 'https://api.test/x/movie.mkv~hls/session/f1097e82/a0.m3u8', data: undefined, code: 404, text: '' },
+    networkDetails: { status: 404, responseType: 'text', responseText: 'session not found\n', getAllResponseHeaders: () => '' },
+});
+
+test('a dead session hls.js keeps asking (not fatal): the restart at the first answer, and the walk stopped', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page);
+        pageStartForm(page, 'item');
+    });
+    const hls = window.hlsPlayer;
+    let startLoads = 0;
+    let stops = 0;
+    hls.startLoad = () => { startLoads++; };
+    const stop = hls.stopLoad.bind(hls);
+    hls.stopLoad = () => { stops++; return stop(); };
+    await playPast(p, 34);
+    const fatal = [];
+    hls.on(Hls.Events.ERROR, (e, d) => fatal.push(d.fatal));
+    hls.trigger(Hls.Events.ERROR, deadGap());
+    assert.deepEqual(fatal, [false], 'hls.js left it non-fatal');
+    assert.equal(p.events.filter((e) => e.name === 'player-recover-restart').length, 1, 'restarted at the first answer');
+    assert.equal(stops, 1, 'and hls.js stopped');
+    // What hls.js would have gone on with: the next fragment, and the next.
+    for (let i = 0; i < 200; i++) hls.trigger(Hls.Events.ERROR, deadGap());
+    await settle();
+    assert.equal(rec.got.length, 1, 'one restart');
+    assert.equal(rec.got[0].purge, 'true');
+    assert.equal(startLoads, 0);
+    assert.deepEqual(p.events.filter((e) => e.name.startsWith('player-recover')), [
+        { name: 'player-recover-restart', data: { reason: '404', status: 404, via: 'error-nonfatal', loader: 'audio' } },
+    ]);
+});
+
+// B1. A free viewer over the cap answered the slow-download modal "watch as
+// is" (the force-slow run: data-offer-answered). The restart without it ran
+// the gate again and put the modal up before any player.
+test('a run answered "watch as is": the restart carries force-slow, with the purge', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page);
+        pageStartForm(page, 'item');
+        page.video.dataset.offerAnswered = 'continue-slow';
+    });
+    await playPast(p, 20);
+    window.hlsPlayer.trigger(Hls.Events.ERROR, deadFragment());
+    await settle();
+    assert.equal(rec.got.length, 1);
+    assert.equal(rec.got[0]['force-slow'], 'true', 'the modal is not asked again');
+    assert.equal(rec.got[0].purge, 'true');
+});
+
+// B2. The grace popup answered: the restarted player showed it a second
+// time. The note carries the answer; the next player marks its element as
+// every answered player is marked, and the popup stays down.
+const withGraceCta = (page) => {
+    page.video.dataset.graceDurationSec = '30';
+    const cta = document.createElement('div');
+    cta.id = 'grace-cta';
+    cta.className = 'hidden';
+    cta.innerHTML = '<button type="button" class="grace-cta-close"></button><button type="button" class="grace-cta-continue"></button>';
+    page.container.appendChild(cta);
+};
+
+test('the grace popup answered: the restart carries the answer, and the next player does not ask again', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page);
+        pageStartForm(page, 'item');
+        withGraceCta(page);
+    });
+    await playPast(p, 31);
+    click(document.querySelector('.grace-cta-continue'));
+    await settle();
+    p.video.paused = false;
+    p.video.currentTime = 40;
+    window.hlsPlayer.trigger(Hls.Events.ERROR, deadFragment());
+    await settle();
+    assert.equal(rec.got.length, 1);
+    assert.equal(restartNote().grace, 'continue');
+    destroyPlayer();
+    const next = await mountPlayer((page) => {
+        sessionPlayer(page);
+        withGraceCta(page);
+    });
+    assert.equal(next.video.dataset.graceCtaAnswered, 'continue', 'the answer, where the status and the label read it');
+    assert.ok('graceCtaShown' in next.video.dataset, 'and the popup is not "on its way"');
+    await playPast(next, 45);
+    assert.equal(document.getElementById('grace-cta').classList.contains('hidden'), true, 'the popup stays down');
+    assert.equal(next.events.find((e) => e.name === 'grace-soft-cta-shown'), undefined);
+});
+
+// C. The restarted session's run starts at the transcoder's quantized point:
+// the film came back 15-20 s early. Once the run has written the place, the
+// film goes there -- a currentTime write, no second session seek.
+const produced = (video, end) => Object.defineProperty(video, 'seekable', {
+    configurable: true, get: () => ({ length: 1, start: () => 0, end: () => end }),
+});
+const seekPosts = (p) => p.calls.filter((c) => c.params && c.params.method === 'POST' && String(c.url).includes('/seek'));
+
+test('the restarted player goes to the exact place inside the quantized run, without a second session seek', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    t.after(() => { destroyPlayer(); cleanRestart(); });
+    window.sessionStorage.setItem(RESTART_NOTE_KEY, JSON.stringify({
+        resourceID: 'res', path: 'movie.mkv', at: 1872, play: true, until: Date.now() + 60000,
+    }));
+    const p = await mountPlayer((page) => sessionPlayer(page, { seek: () => ({ ok: true, status: 200, json: async () => ({ offset: 1860 }) }) }));
+    await settle();
+    assert.equal(seekPosts(p).length, 1, 'the resume\'s session seek');
+    assert.equal(p.video.dataset.runOffset, '1860', 'the run starts 12 s early');
+    p.video.paused = false;
+    p.video.currentTime = 0.5;
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    produced(p.video, 10);
+    await new Promise((r) => setTimeout(r, 650));
+    assert.equal(p.video.currentTime, 0.5, 'not written yet: it waits');
+    produced(p.video, 30);
+    await new Promise((r) => setTimeout(r, 650));
+    assert.equal(p.video.currentTime, 12, 'at 1872: 1860 + 12');
+    assert.equal(seekPosts(p).length, 1, 'no second session seek');
+});
+
+test('the restarted player\'s exact place: a seek of the viewer\'s wins', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    // The headset's or the OS's seek bar (media-session.js seekto): a seek
+    // to an exact film time, through handleSeek like every other.
+    const handlers = {};
+    const saved = Object.getOwnPropertyDescriptor(navigator, 'mediaSession');
+    Object.defineProperty(navigator, 'mediaSession', { configurable: true, value: { setActionHandler: (a, fn) => { handlers[a] = fn; } } });
+    t.after(() => {
+        destroyPlayer();
+        cleanRestart();
+        if (saved) Object.defineProperty(navigator, 'mediaSession', saved);
+        else delete navigator.mediaSession;
+    });
+    window.sessionStorage.setItem(RESTART_NOTE_KEY, JSON.stringify({
+        resourceID: 'res', path: 'movie.mkv', at: 1872, play: true, until: Date.now() + 60000,
+    }));
+    const p = await mountPlayer((page) => sessionPlayer(page, { seek: () => ({ ok: true, status: 200, json: async () => ({ offset: 1860 }) }) }));
+    await settle();
+    p.video.paused = false;
+    p.video.currentTime = 0.5;
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await settle();
+    // The viewer goes to 31:03 -- inside the run, before the restart's place
+    // -- the moment the run has written it.
+    produced(p.video, 20);
+    assert.equal(typeof handlers.seekto, 'function');
+    handlers.seekto({ seekTime: 1863 });
+    assert.equal(p.video.currentTime, 3, 'a plain seek inside the run');
+    produced(p.video, 60);
+    await new Promise((r) => setTimeout(r, 650));
+    assert.equal(p.video.currentTime, 3, 'where the viewer went, not the restart\'s place');
+});
+
+// The resume's own session seek is out: the run playing is the old one, and
+// a place measured against it would be lost with the reload.
+test('the restarted player\'s exact place: not measured while the resume\'s seek is out', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    t.after(() => { destroyPlayer(); cleanRestart(); });
+    window.sessionStorage.setItem(RESTART_NOTE_KEY, JSON.stringify({
+        resourceID: 'res', path: 'movie.mkv', at: 21.2, play: true, until: Date.now() + 60000,
+    }));
+    let answer = null;
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page);
+        page.setResponse((url, params) => (params && params.method === 'POST'
+            ? new Promise((r) => { answer = r; })
+            : { ok: true, status: 200, json: async () => ({ offset: 0 }) }));
+    });
+    await settle();
+    assert.equal(seekPosts(p).length, 1, 'the resume\'s seek is out');
+    // The render's own run (from 0) has written the place already.
+    p.video.currentTime = 0.2;
+    produced(p.video, 40);
+    await new Promise((r) => setTimeout(r, 650));
+    assert.equal(p.video.currentTime, 0.2, 'not while the seek is out');
+    answer({ ok: true, status: 200, json: async () => ({ offset: 0 }) });
+    await settle();
+    p.video.paused = false;
+    p.video.currentTime = 0.3;
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await new Promise((r) => setTimeout(r, 650));
+    assert.equal(p.video.currentTime, 21.2, 'the new run: the exact place');
+});
+
+// Native HLS (iOS on ?mms=off) is left as it was: no hls.js, nothing moved.
+test('the restarted player\'s exact place: native HLS is left as it was', async (t) => {
+    cleanRestart();
+    t.after(() => { destroyPlayer(); cleanRestart(); });
+    window.sessionStorage.setItem(RESTART_NOTE_KEY, JSON.stringify({
+        resourceID: 'res', path: 'movie.mkv', at: 1872, play: true, until: Date.now() + 60000,
+    }));
+    const p = await mountPlayer((page) => sessionPlayer(page, { seek: () => ({ ok: true, status: 200, json: async () => ({ offset: 1860 }) }) }));
+    await settle();
+    assert.equal(window.hlsPlayer, null, 'native HLS');
+    p.video.paused = false;
+    p.video.currentTime = 0.5;
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    produced(p.video, 60);
+    await new Promise((r) => setTimeout(r, 650));
+    assert.equal(p.video.currentTime, 0.5);
+});
+
+// D. The card never stops a film that still plays from its buffer: it waits
+// for the element to starve. Chrome, 2026-09-30: the 429 give-up paused a
+// film at readyState 4 just as the refusals stopped.
+test('the card waits while the film plays from its buffer, and comes when it starves', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    window.sessionStorage.setItem(RESTART_BUDGET_KEY, JSON.stringify({ 'res:movie.mkv': Date.now() - 60 * 1000 }));
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page);
+        pageStartForm(page, 'item');
+    });
+    let paused = 0;
+    p.video.pause = () => { paused++; p.video.paused = true; };
+    let rs = 4;
+    Object.defineProperty(p.video, 'readyState', { configurable: true, get: () => rs });
+    await playPast(p, 50);
+    window.hlsPlayer.trigger(Hls.Events.ERROR, deadFragment());
+    await settle();
+    assert.equal(p.container.querySelector('.wt-recover'), null, 'no card over a film that plays');
+    assert.equal(paused, 0, 'and it is not paused');
+    assert.equal(p.events.filter((e) => e.name.startsWith('player-recover')).length, 0);
+    p.video.dispatchEvent(new dom.window.Event('timeupdate'));
+    await settle();
+    assert.equal(p.container.querySelector('.wt-recover'), null, 'still playing');
+    rs = 2;
+    p.video.dispatchEvent(new dom.window.Event('waiting'));
+    await settle();
+    assert.ok(p.container.querySelector('.wt-recover'), 'the buffer ran out: the card');
+    assert.equal(paused, 1);
+    assert.equal(p.events.filter((e) => e.name === 'player-recover-card-shown').length, 1);
+});
+
+test('the card waits, and the viewer\'s pause brings it', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    t.after(() => { destroyPlayer(); cleanRestart(); });
+    const p = await mountPlayer((page) => sessionPlayer(page));
+    Object.defineProperty(p.video, 'readyState', { configurable: true, get: () => 4 });
+    await playPast(p, 50);
+    window.hlsPlayer.trigger(Hls.Events.ERROR, { ...deadFragment(410, ''), frag: { url: 'https://api.test/x/movie.mp4', type: 'main' }, response: { url: 'https://api.test/x/movie.mp4', code: 410 } });
+    await settle();
+    assert.equal(p.container.querySelector('.wt-recover'), null);
+    p.video.paused = true;
+    p.video.dispatchEvent(new dom.window.Event('pause'));
+    await settle();
+    assert.ok(p.container.querySelector('.wt-recover'));
+});
+
+// E. One owner of what the viewer sees.
+test('player-dead has declared the player dead: a dead session after it is not restarted, and no card', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page);
+        pageStartForm(page, 'item');
+    });
+    mockClock(t, () => {
+        p.video.paused = false;
+        p.video.dispatchEvent(new dom.window.Event('play'));
+        tickBy(t, 32000);
+    });
+    assert.equal(p.events.filter((e) => e.name === 'player-dead').length, 1);
+    window.hlsPlayer.trigger(Hls.Events.ERROR, deadGap());
+    window.hlsPlayer.trigger(Hls.Events.ERROR, deadFragment());
+    await settle();
+    assert.equal(rec.got.length, 0, 'no restart');
+    assert.equal(p.container.querySelector('.wt-recover'), null, 'no card');
+    assert.equal(p.events.filter((e) => e.name.startsWith('player-recover')).length, 0, 'no second message');
+});
+
+// player-revived: the verdict was the rule's error, and the player is ours
+// again.
+test('player-dead, then it played after all: a later dead session restarts', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page);
+        pageStartForm(page, 'item');
+    });
+    mockClock(t, () => {
+        p.video.paused = false;
+        p.video.dispatchEvent(new dom.window.Event('play'));
+        tickBy(t, 32000);
+    });
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    assert.deepEqual(p.events.filter((e) => e.name.startsWith('player-')).map((e) => e.name).filter((n) => n === 'player-dead' || n === 'player-revived'),
+        ['player-dead', 'player-revived']);
+    window.hlsPlayer.trigger(Hls.Events.ERROR, deadGap());
+    await settle();
+    assert.equal(rec.got.length, 1);
+});
+
+// ---- a manifest the server holds, heard from its request -------------------
+//
+// hls.js's loadSource asks for the manifest at once (MANIFEST_LOADING is its
+// last line, hls.ts), and the HLS effect calls it at mount. The watch was
+// made in a later effect and took the instance at its first check, 2 s on,
+// never having heard that request: a manifest held for 60 s, and for 165 s
+// (2026-10-19, both played once it came), was player-dead at 32 s -- and the
+// verdict holds back the stream restart and the card. hls.js is real here
+// down to its playlist loader: its own loadSource, and a loader that holds
+// every request until the test answers it. jsdom has no MediaSource:
+// attachMedia only says where it attached, which is all the watch reads.
+const { LoadStats } = await import('hls.js');
+function withHeldRequests(t) {
+    const held = [];
+    class HeldLoader {
+        constructor() { this.context = null; this.stats = new LoadStats(); }
+        load(context, config, callbacks) {
+            this.context = context;
+            held.push({ context, stats: this.stats, callbacks });
+        }
+        abort() { this.stats.aborted = true; }
+        destroy() {}
+    }
+    const saved = { isSupported: Hls.isSupported, attachMedia: Hls.prototype.attachMedia, config: Hls.DefaultConfig, self: globalThis.self };
+    Hls.isSupported = () => true;
+    Hls.prototype.attachMedia = function attachMedia(media) { Object.defineProperty(this, 'media', { value: media, configurable: true }); };
+    Hls.DefaultConfig = { ...saved.config, loader: HeldLoader };
+    // loadSource resolves the URL against `self`, and hls.js's timers are
+    // self's: gone only after the player is.
+    globalThis.self = window;
+    t.after(() => {
+        destroyPlayer();
+        Hls.isSupported = saved.isSupported;
+        Hls.prototype.attachMedia = saved.attachMedia;
+        Hls.DefaultConfig = saved.config;
+        if (saved.self === undefined) delete globalThis.self;
+        else globalThis.self = saved.self;
+    });
+    return held;
+}
+const MASTER = '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=1280x720\nv0-720.m3u8\n';
+const answer = (req, data) => req.callbacks.onSuccess({ url: req.context.url, data }, req.stats, req.context, null);
+const refuse = (req, code) => req.callbacks.onError({ code, text: '' }, req.context,
+    { status: code, responseType: 'text', responseText: '', getAllResponseHeaders: () => '' }, req.stats);
+const playAsked = (p) => {
+    p.video.paused = false;
+    p.video.dispatchEvent(new dom.window.Event('play'));
+};
+const verdicts = (p) => p.events.filter((e) => e.name === 'player-dead' || e.name === 'player-revived');
+
+test('a manifest the server holds for a minute, or for 165 s: no player-dead while it is out; it answers, the film plays, nothing to revive', async (t) => {
+    const held = withHeldRequests(t);
+    for (const heldS of [60, 165]) {
+        held.length = 0;
+        const p = await mountPlayer(sessionPlayer);
+        assert.deepEqual(held.map((r) => r.context.type), ['manifest'], 'loadSource asked for it at mount');
+        mockClock(t, () => {
+            playAsked(p);
+            tickBy(t, heldS * 1000);
+            assert.deepEqual(verdicts(p), [], `${heldS} s held: waiting, not dead`);
+            answer(held[0], MASTER);
+            assert.deepEqual(held.map((r) => r.context.type), ['manifest', 'level'], 'parsed, and the level asked for');
+            tickBy(t, 2000);
+            p.video.dispatchEvent(new dom.window.Event('playing'));
+        });
+        assert.deepEqual(verdicts(p), [], `${heldS} s held`);
+        destroyPlayer();
+    }
+});
+
+// The other side: a watch bound before loadSource hears what is asked, it
+// does not take it for granted. An instance that asks for nothing is dead at
+// DEAD_AFTER_MS -- from the play request now, no longer from a first check
+// 2 s after it.
+test('hls.js that never asks for its manifest is still player-dead', async (t) => {
+    withHlsJs(t);
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer(sessionPlayer);
+    mockClock(t, () => {
+        playAsked(p);
+        tickBy(t, 28000);
+        assert.deepEqual(verdicts(p), [], 'not before the quiet');
+        tickBy(t, 4000);
+    });
+    const ev = verdicts(p);
+    assert.equal(ev.length, 1);
+    assert.equal(ev[0].name, 'player-dead');
+    assert.equal(ev[0].data.why, 'quiet');
+    assert.equal(ev[0].data.waited_s, 30);
+});
+
+test('a held manifest does not hide a real error: MediaError 4 that holds for the quiet is player-dead', async (t) => {
+    withHeldRequests(t);
+    const p = await mountPlayer(sessionPlayer);
+    mockClock(t, () => {
+        playAsked(p);
+        tickBy(t, 10000);
+        Object.defineProperty(p.video, 'error', { value: { code: 4 }, configurable: true });
+        p.video.dispatchEvent(new dom.window.Event('error'));
+        tickBy(t, 32000);
+    });
+    const ev = verdicts(p);
+    assert.equal(ev.length, 1);
+    assert.deepEqual([ev[0].data.why, ev[0].data.err, ev[0].data.path], ['error', 4, 'hlsjs']);
+});
+
+// The give-up after a held manifest is the card's: no verdict stands in front
+// of it (stream-restart.js blocked). A 4xx gives up at once
+// (network-recovery.js); every give-up goes through the same policy.
+test('a held manifest that ends in a give-up: the card, not held back by a verdict', async (t) => {
+    const held = withHeldRequests(t);
+    cleanRestart();
+    t.after(() => cleanRestart());
+    const p = await mountPlayer(sessionPlayer);
+    mockClock(t, () => {
+        playAsked(p);
+        tickBy(t, 120000);
+        refuse(held[0], 410);
+    });
+    await settle();
+    assert.deepEqual(verdicts(p), []);
+    assert.ok(p.container.querySelector('.wt-recover'), 'the card');
+    assert.deepEqual(p.events.find((e) => e.name === 'player-recover-card-shown').data, { reason: 'network', status: 410 });
+});
+
+// useHls makes a new instance for a new source; it is bound before its
+// loadSource too.
+test('a new source before the start: the new instance is heard from its own manifest request', async (t) => {
+    const held = withHeldRequests(t);
+    const p = await mountPlayer(sessionPlayer);
+    const first = window.hlsPlayer;
+    p.video.querySelector('source').setAttribute('src', 'https://api.test/x/next.mkv~hls/session/0b5e11aa/index.m3u8');
+    // A state change re-renders the player, which reads the new URL.
+    p.video.playbackRate = 1.1;
+    p.video.dispatchEvent(new dom.window.Event('ratechange'));
+    await settle();
+    assert.notEqual(window.hlsPlayer, first, 'a new instance');
+    assert.equal(held.length, 2);
+    assert.equal(held[1].context.url, 'https://api.test/x/next.mkv~hls/session/0b5e11aa/index.m3u8');
+    mockClock(t, () => {
+        playAsked(p);
+        tickBy(t, 90000);
+    });
+    assert.deepEqual(verdicts(p), []);
+});
+
+// Native HLS has no instance to bind: the element is what is watched, as
+// before -- loading is waiting, a pause or a hidden tab is not watched.
+test('native HLS, a pause, a hidden tab: watched as before', async (t) => {
+    t.after(() => { delete document.hidden; destroyPlayer(); });
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page);
+        page.video.canPlayType = () => 'maybe';
+        page.video.load = () => {};
+    });
+    assert.equal(window.hlsPlayer, null, 'the browser plays the m3u8 itself');
+    let ns = 2;
+    Object.defineProperty(p.video, 'networkState', { get: () => ns, configurable: true });
+    const setHidden = (h) => {
+        Object.defineProperty(document, 'hidden', { value: h, configurable: true });
+        document.dispatchEvent(new dom.window.Event('visibilitychange'));
+    };
+    mockClock(t, () => {
+        playAsked(p);
+        tickBy(t, 90000);
+        assert.deepEqual(verdicts(p), [], 'the element loading');
+        ns = 1;
+        p.video.paused = true;
+        p.video.dispatchEvent(new dom.window.Event('pause'));
+        tickBy(t, 120000);
+        assert.deepEqual(verdicts(p), [], 'paused');
+        playAsked(p);
+        setHidden(true);
+        tickBy(t, 120000);
+        assert.deepEqual(verdicts(p), [], 'hidden');
+        setHidden(false);
+        tickBy(t, 28000);
+        assert.deepEqual(verdicts(p), [], 'not before the quiet');
+        tickBy(t, 4000);
+    });
+    const ev = verdicts(p);
+    assert.equal(ev.length, 1);
+    assert.equal(ev[0].data.path, 'native');
+});
+
+test('a restart of ours gone out: the old player is not reported dead while the page restarts', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page);
+        pageStartForm(page, 'item');
+    });
+    mockClock(t, () => {
+        p.video.paused = false;
+        p.video.dispatchEvent(new dom.window.Event('play'));
+        window.hlsPlayer.trigger(Hls.Events.ERROR, deadGap());
+        assert.equal(p.events.filter((e) => e.name === 'player-recover-restart').length, 1, 'the restart');
+        // The job runs a median 58 s; the old player is still on the page.
+        tickBy(t, 60000);
+    });
+    await settle();
+    assert.equal(rec.got.length, 1);
+    assert.equal(p.events.find((e) => e.name === 'player-dead'), undefined);
+});
+
+const codecsRejected = () => ({ type: Hls.ErrorTypes.MEDIA_ERROR, details: 'manifestIncompatibleCodecsError', fatal: true });
+
+test('a guard\'s restart owns the player: a seek that then finds the session gone restarts nothing more', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    freshDecodeMemory();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); freshDecodeMemory(); });
+    const p = await mountPlayer((page) => {
+        passthroughPlayer(page);
+        sessionPlayer(page, { seek: () => ({ ok: false, status: 404, json: async () => null }) });
+        pageStartForm(page);
+    });
+    await playPast(p, 100);
+    window.hlsPlayer.trigger(Hls.Events.ERROR, codecsRejected());
+    await settle();
+    assert.equal(rec.got.length, 1, 'the guard\'s restart on the old route');
+    assert.ok(rec.got[0]['decode-fallback']);
+    document.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    await settle();
+    assert.equal(rec.got.length, 1, 'no restart of ours on top');
+    assert.equal(p.events.filter((e) => e.name.startsWith('player-recover')).length, 0);
+});
+
+test('a restart of ours gone out: a guard\'s failure after it restarts nothing more', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    freshDecodeMemory();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); freshDecodeMemory(); });
+    const p = await mountPlayer((page) => {
+        passthroughPlayer(page);
+        sessionPlayer(page);
+        pageStartForm(page);
+    });
+    await playPast(p, 100);
+    window.hlsPlayer.trigger(Hls.Events.ERROR, deadGap());
+    await settle();
+    assert.equal(rec.got.length, 1, 'ours');
+    window.hlsPlayer.trigger(Hls.Events.ERROR, codecsRejected());
+    await settle();
+    assert.equal(rec.got.length, 1, 'not the guard\'s on top');
+    assert.equal(p.events.find((e) => e.name === 'hevc-fallback'), undefined);
+});
+
+// The audio guard of the old route (passthrough.js createAudioGuard) gave
+// the file up: it stopped and detached hls.js and restarts the file without
+// its multichannel audio. The player is its: a seek that then finds the
+// session gone restarts nothing more, and no card comes.
+test('the audio guard gave up (stopLoad, detachMedia, its restart): nothing of ours after it', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const undo = declaringBrowser();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); undo(); });
+    const p = await mountPlayer((page) => {
+        oldRouteAudio(page);
+        sessionPlayer(page, { seek: () => ({ ok: false, status: 404, json: async () => null }) });
+        pageStartForm(page);
+    });
+    const hls = window.hlsPlayer;
+    let detached = 0;
+    hls.detachMedia = () => { detached++; };
+    hls.recoverMediaError = () => {};
+    await playPast(p, 10);
+    // The element names the audio's decoder (Chrome's MediaError message):
+    // the failure is the audio's; a recovery, then the same again.
+    Object.defineProperty(p.video, 'error', { value: { code: 3, message: 'PIPELINE_ERROR_DECODE: audio decode error!' }, configurable: true });
+    const media = () => ({ type: Hls.ErrorTypes.MEDIA_ERROR, details: 'bufferAppendError', fatal: true });
+    hls.trigger(Hls.Events.ERROR, media());
+    hls.trigger(Hls.Events.ERROR, media());
+    await settle();
+    assert.equal(rec.got.length, 1, 'the guard\'s restart');
+    assert.equal(rec.got[0]['decode-class'], 'aac51');
+    assert.equal(detached, 1, 'hls.js detached');
+    hls.trigger(Hls.Events.ERROR, deadGap());
+    hls.trigger(Hls.Events.ERROR, deadFragment());
+    document.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    await settle();
+    assert.equal(rec.got.length, 1, 'no restart of ours on top');
+    assert.equal(p.container.querySelector('.wt-recover'), null, 'no card');
+    assert.equal(p.events.filter((e) => e.name.startsWith('player-recover')).length, 0);
+});
+
+// The card waits for the element to starve or the viewer to pause -- not
+// for a pause of the page's own, nor for the film's end.
+const give410 = () => window.hlsPlayer.trigger(Hls.Events.ERROR, { ...deadFragment(410, ''), frag: { url: 'https://api.test/x/movie.mp4', type: 'main' }, response: { url: 'https://api.test/x/movie.mp4', code: 410 } });
+const pausing = (video) => { video.pause = () => { video.paused = true; video.dispatchEvent(new dom.window.Event('pause')); }; };
+
+test('the waiting card: a session seek\'s own pause is not the viewer\'s', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    t.after(() => { destroyPlayer(); cleanRestart(); });
+    const p = await mountPlayer((page) => sessionPlayer(page, { seek: () => ({ ok: true, status: 200, json: async () => ({ offset: 600 }) }) }));
+    Object.defineProperty(p.video, 'readyState', { configurable: true, get: () => 4 });
+    pausing(p.video);
+    await playPast(p, 20);
+    give410();
+    await settle();
+    assert.equal(p.container.querySelector('.wt-recover'), null, 'waiting');
+    // A far seek of the viewer's: the seek pauses the old run itself.
+    p.video.currentTime = 600;
+    document.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    await settle();
+    assert.equal(p.video.paused, true, 'the seek paused it');
+    assert.equal(p.container.querySelector('.wt-recover'), null, 'no card over the seek');
+});
+
+test('the waiting card: the grace popup\'s hold is not the viewer\'s pause', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    t.after(() => { destroyPlayer(); cleanRestart(); });
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page);
+        withGraceCta(page);
+    });
+    let rs = 4;
+    Object.defineProperty(p.video, 'readyState', { configurable: true, get: () => rs });
+    pausing(p.video);
+    await playPast(p, 20);
+    give410();
+    await settle();
+    await playPast(p, 31);
+    assert.equal(document.getElementById('grace-cta').classList.contains('hidden'), false, 'the popup is up');
+    assert.equal(p.video.paused, true, 'its hold paused the film');
+    assert.equal(p.container.querySelector('.wt-recover'), null, 'no card behind the popup');
+    click(document.querySelector('.grace-cta-continue'));
+    await settle();
+    p.video.paused = false;
+    rs = 2;
+    p.video.dispatchEvent(new dom.window.Event('waiting'));
+    await settle();
+    assert.ok(p.container.querySelector('.wt-recover'), 'once it starves: the card');
+});
+
+test('the waiting card: the film\'s end is no starving', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    t.after(() => { destroyPlayer(); cleanRestart(); });
+    const p = await mountPlayer((page) => sessionPlayer(page));
+    Object.defineProperty(p.video, 'readyState', { configurable: true, get: () => 4 });
+    await playPast(p, 20);
+    give410();
+    await settle();
+    Object.defineProperty(p.video, 'ended', { configurable: true, get: () => true });
+    p.video.paused = true;
+    p.video.dispatchEvent(new dom.window.Event('pause'));
+    p.video.dispatchEvent(new dom.window.Event('ended'));
+    await settle();
+    assert.equal(p.container.querySelector('.wt-recover'), null);
+});
+
+test('a restart of ours gone out: the audio guard giving up after it restarts nothing more', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const undo = declaringBrowser();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); undo(); });
+    const p = await mountPlayer((page) => {
+        oldRouteAudio(page);
+        sessionPlayer(page);
+        pageStartForm(page);
+    });
+    const hls = window.hlsPlayer;
+    hls.detachMedia = () => {};
+    hls.recoverMediaError = () => {};
+    await playPast(p, 10);
+    hls.trigger(Hls.Events.ERROR, deadGap());
+    await settle();
+    assert.equal(rec.got.length, 1, 'ours');
+    Object.defineProperty(p.video, 'error', { value: { code: 3, message: 'PIPELINE_ERROR_DECODE: audio decode error!' }, configurable: true });
+    const media = () => ({ type: Hls.ErrorTypes.MEDIA_ERROR, details: 'bufferAppendError', fatal: true });
+    hls.trigger(Hls.Events.ERROR, media());
+    hls.trigger(Hls.Events.ERROR, media());
+    await settle();
+    assert.equal(rec.got.length, 1, 'not the guard\'s on top');
+    assert.equal(p.events.find((e) => e.name === 'audio-fallback'), undefined);
+});
+
+// ---- review F2: the card's click goes where the viewer asked (2026-09-30) ---
+//
+// A session seek that finds the session gone moves neither the element nor
+// the run's offset: the element's place is where the viewer was before it.
+// Past the budget the card dropped the seek's target, and its click restarted
+// at that old place -- the note and a signed-in viewer's PUT with it.
+
+const deadSeek = () => ({ ok: false, status: 404, json: async () => null });
+const lastPut = (p) => JSON.parse(positionPuts(p).at(-1).params.body).position;
+
+test('past the budget, a seek that finds the session gone: the card, and its click restarts at the seek\'s target', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    window.sessionStorage.setItem(RESTART_BUDGET_KEY, JSON.stringify({ 'res:movie.mkv': Date.now() - 60 * 1000 }));
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page, { seek: deadSeek });
+        pageStartForm(page, 'item');
+    });
+    p.video.pause = () => { p.video.paused = true; };
+    await playPast(p, 50);
+    keydown('ArrowRight'); // 0:50 -> 1:05, past what the run has produced
+    await settle();
+    assert.equal(seekPosts(p).length, 1, 'a session seek');
+    const card = p.container.querySelector('.wt-recover');
+    assert.ok(card, 'the budget\'s card');
+    assert.deepEqual(p.events.filter((e) => e.name.startsWith('player-recover')).map((e) => e.data), [
+        { reason: 'limit', status: 404, cause: '404', via: 'seek' },
+    ]);
+    assert.equal(p.video.currentTime, 50, 'the element stayed where it was');
+    click(card.querySelector('button'));
+    await settle();
+    assert.equal(rec.got.length, 1, 'the click restarts');
+    const note = restartNote();
+    assert.equal(note.at, 65, 'the target, not 50');
+    assert.equal(note.play, true);
+    assert.equal(lastPut(p), 65);
+});
+
+// The one place that is still no place: 0. The prompt answered (the question
+// settled) and the film not moved yet -- a note at 0 would only make the
+// next player skip the server's copy. (Iteration 1 held this rule's only test
+// in the "Continue under the card" case, which now restarts at the answer.)
+test('a place at 0 is none: "Start over" answered, the session gone before the film moved -- no note, no PUT of the restart', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    const p = await mountPlayer((page) => {
+        sessionWithSaved(page);
+        pageStartForm(page, 'item');
+    });
+    click(resumePrompt(p).querySelector('.wt-resume-btn--ghost'));
+    await settle();
+    const puts = positionPuts(p).length;
+    assert.equal(p.video.currentTime, 0);
+    window.hlsPlayer.trigger(Hls.Events.ERROR, deadFragment());
+    await settle();
+    assert.equal(rec.got.length, 1, 'the restart');
+    assert.equal(restartNote(), null, 'no note at 0');
+    assert.equal(positionPuts(p).length, puts, 'no PUT of 0 on top of the answer\'s');
+});
+
+// The finding's second case: the restarted player's own resume seek finds
+// its session gone past the budget. The element stands at the run's 0; the
+// click restarted from there -- no note at 0, so a viewer without an account
+// (no server copy) started from the beginning.
+test('a restarted player whose resume seek finds the session gone past the budget: the card\'s click goes back to the note\'s place', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    window.sessionStorage.setItem(RESTART_BUDGET_KEY, JSON.stringify({ 'res:movie.mkv': Date.now() - 60 * 1000 }));
+    window.sessionStorage.setItem(RESTART_NOTE_KEY, JSON.stringify({
+        resourceID: 'res', path: 'movie.mkv', at: 1872, play: true, until: Date.now() + 60000,
+    }));
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page, { seek: deadSeek });
+        pageStartForm(page, 'item');
+    });
+    p.video.pause = () => { p.video.paused = true; };
+    await settle();
+    assert.equal(seekPosts(p).length, 1, 'the resume\'s session seek');
+    const card = p.container.querySelector('.wt-recover');
+    assert.ok(card, 'the budget\'s card');
+    assert.equal(p.video.currentTime, 0);
+    click(card.querySelector('button'));
+    await settle();
+    assert.equal(rec.got.length, 1);
+    const note = restartNote();
+    assert.ok(note, 'the note');
+    assert.equal(note.at, 1872);
+});
+
+// The card waiting for the buffer, then a far seek of the viewer's that finds
+// the session gone. The seek paused the old run itself while it was out (no
+// starving then) and never plays it again: no event of the element's
+// follows, so the waiting card never came -- a paused film, no card, the
+// timeline at the target.
+test('the waiting card, then a seek that finds the session gone: the card at once, and its click restarts at the target', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    window.sessionStorage.setItem(RESTART_BUDGET_KEY, JSON.stringify({ 'res:movie.mkv': Date.now() - 60 * 1000 }));
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page, { seek: deadSeek });
+        pageStartForm(page, 'item');
+    });
+    Object.defineProperty(p.video, 'readyState', { configurable: true, get: () => 4 });
+    pausing(p.video);
+    await playPast(p, 50);
+    give410();
+    await settle();
+    assert.equal(p.container.querySelector('.wt-recover'), null, 'waiting: the film plays from its buffer');
+    keydown('ArrowRight');
+    await settle();
+    assert.equal(seekPosts(p).length, 1);
+    assert.equal(p.video.paused, true, 'the seek paused it');
+    const card = p.container.querySelector('.wt-recover');
+    assert.ok(card, 'the card, at once');
+    assert.deepEqual(p.events.filter((e) => e.name.startsWith('player-recover')).map((e) => e.data), [
+        { reason: 'network', status: 410 },
+    ]);
+    click(card.querySelector('button'));
+    await settle();
+    assert.equal(rec.got.length, 1);
+    assert.equal(restartNote().at, 65);
+});
+
+// The target is the viewer's only until they seek again: a local seek under
+// the card (inside what the run has produced -- no POST, nothing reported)
+// moves the element, and the element's place is theirs.
+test('a dead seek\'s card, then a local seek under it: the click restarts where the local seek went', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    const handlers = {};
+    const saved = Object.getOwnPropertyDescriptor(navigator, 'mediaSession');
+    Object.defineProperty(navigator, 'mediaSession', { configurable: true, value: { setActionHandler: (a, fn) => { handlers[a] = fn; } } });
+    t.after(() => {
+        rec.stop();
+        destroyPlayer();
+        cleanRestart();
+        if (saved) Object.defineProperty(navigator, 'mediaSession', saved);
+        else delete navigator.mediaSession;
+    });
+    window.sessionStorage.setItem(RESTART_BUDGET_KEY, JSON.stringify({ 'res:movie.mkv': Date.now() - 60 * 1000 }));
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page, { seek: deadSeek });
+        pageStartForm(page, 'item');
+    });
+    p.video.pause = () => { p.video.paused = true; };
+    await playPast(p, 50);
+    handlers.seekto({ seekTime: 1500 });
+    await settle();
+    const card = p.container.querySelector('.wt-recover');
+    assert.ok(card, 'the budget\'s card');
+    produced(p.video, 100);
+    handlers.seekto({ seekTime: 30 });
+    await settle();
+    assert.equal(seekPosts(p).length, 1, 'a local seek: no POST');
+    assert.equal(p.video.currentTime, 30);
+    click(card.querySelector('button'));
+    await settle();
+    assert.equal(rec.got.length, 1);
+    assert.equal(restartNote().at, 30, 'the local seek\'s place, not 1500');
+});
+
+// ---- iteration 3: what the second Chrome run found (2026-09-30) -------------
+
+// 1. A paused film restarted played by itself (5 of 5, 1.7-2.5 s after the
+// restart's POST). The element's `autoplay`: Chrome plays a paused <video
+// autoplay> once a new source has data, and every reload of it -- hls.js's
+// attachMedia at mount, its loadSource on the resume's session seek -- arms
+// that again (Chrome 154, scratchpad repro: pause, reload -> play, playing at
+// canplay; `autoplay` off -> paused, readyState 4). jsdom plays nothing by
+// itself, so the element here does what Chrome does: a reload of an element
+// with `autoplay` plays it once the source "has data".
+function withAutoplayingReloads(t) {
+    withHlsJs(t);
+    const reload = () => {
+        const v = document.querySelector('video.player');
+        if (v && v.autoplay) setTimeout(() => { if (v.autoplay && v.paused) v.play(); }, 5);
+    };
+    Hls.prototype.loadSource = function loadSource() { reload(); };
+    Hls.prototype.attachMedia = function attachMedia() { reload(); };
+}
+
+// The restarted player of a paused film: its note, a render with `autoplay`.
+async function pausedRestart(t, { at = 1872, offset = 1860 } = {}) {
+    withAutoplayingReloads(t);
+    cleanRestart();
+    t.after(() => { destroyPlayer(); cleanRestart(); });
+    window.sessionStorage.setItem(RESTART_NOTE_KEY, JSON.stringify({
+        resourceID: 'res', path: 'movie.mkv', at, play: false, until: Date.now() + 60000,
+    }));
+    let log = null;
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page, { seek: () => ({ ok: true, status: 200, json: async () => ({ offset }) }) });
+        page.video.setAttribute('autoplay', '');
+        log = playback(page.video);
+    });
+    await settle();
+    return { p, log };
+}
+// The new run can play (a browser's readyState by then).
+async function newRunCanPlay(p) {
+    Object.defineProperty(p.video, 'readyState', { configurable: true, get: () => 4 });
+    p.video.dispatchEvent(new dom.window.Event('canplay'));
+    await settle();
+}
+
+test('a paused film restarted comes back paused: nothing starts it -- not the mount, not the resume\'s reload; it lands at canplay, the big Play up', async (t) => {
+    const { p, log } = await pausedRestart(t);
+    assert.equal(seekPosts(p).length, 1, 'the resume\'s session seek');
+    assert.ok(String(seekPosts(p)[0].url).endsWith('t=1872'), seekPosts(p)[0].url);
+    assert.equal(p.video.autoplay, false, 'autoplay held until the viewer\'s Play');
+    await settle();
+    assert.equal(log.play, 0, 'no sound from a tab the viewer left');
+    assert.equal(p.video.paused, true);
+    assert.ok(p.container.querySelector('.wt-buffering'), 'the seek is out: the pill');
+    await newRunCanPlay(p);
+    assert.equal(log.play, 0, 'the new run can play, and nothing plays it');
+    assert.equal(p.video.paused, true);
+    assert.equal(p.container.querySelector('.wt-buffering'), null, 'the seek let go: no spinner over a paused film');
+    assert.ok(p.container.querySelector('.wt-player-big-play'), 'the big Play: the viewer\'s to press');
+    assert.equal(p.container.querySelector('.wt-player-time span').textContent, '31:12', 'the timeline at the note\'s place');
+    click(p.container.querySelector('.wt-player-big-play'));
+    await settle();
+    assert.equal(log.play, 1, 'the viewer\'s Play');
+    assert.equal(p.video.autoplay, true, 'the element is as every other again');
+});
+
+// A playing film is left as it was: its element keeps `autoplay` from the
+// mount on (read while the resume's seek is still out -- the seek's own
+// play() would put it back anyway).
+// In an embed the page itself starts the player once it is ready
+// (app/embed/index.js startPlayer: player_play) -- autoplay by another name,
+// and the restart of a paused film (postEmbedStart) holds it too.
+test('a paused restart in an embed: the page\'s player_play does not start it; the viewer\'s Play does', async (t) => {
+    const { p, log } = await pausedRestart(t);
+    await newRunCanPlay(p);
+    window.dispatchEvent(new CustomEvent('player_play'));
+    await settle();
+    assert.equal(log.play, 0, 'held');
+    assert.equal(p.video.paused, true);
+    click(p.container.querySelector('.wt-player-big-play'));
+    await settle();
+    assert.equal(log.play, 1);
+    assert.equal(p.video.paused, false, 'and not paused back');
+});
+
+test('a playing film restarted keeps its autoplay', async (t) => {
+    withAutoplayingReloads(t);
+    cleanRestart();
+    t.after(() => { destroyPlayer(); cleanRestart(); });
+    window.sessionStorage.setItem(RESTART_NOTE_KEY, JSON.stringify({
+        resourceID: 'res', path: 'movie.mkv', at: 1872, play: true, until: Date.now() + 60000,
+    }));
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page);
+        page.setResponse((url, params) => (params && params.method === 'POST'
+            ? new Promise(() => {})
+            : { ok: true, status: 200, json: async () => ({ offset: 0 }) }));
+        page.video.setAttribute('autoplay', '');
+        playback(page.video);
+    });
+    await settle();
+    assert.equal(seekPosts(p).length, 1, 'the resume\'s seek is out');
+    assert.equal(p.video.autoplay, true);
+});
+
+// Held is only what was there: a render without `autoplay` gets none from the
+// viewer's Play.
+test('a paused restart of an element without autoplay: nothing held, nothing put back', async (t) => {
+    withAutoplayingReloads(t);
+    cleanRestart();
+    t.after(() => { destroyPlayer(); cleanRestart(); });
+    window.sessionStorage.setItem(RESTART_NOTE_KEY, JSON.stringify({
+        resourceID: 'res', path: 'movie.mkv', at: 1872, play: false, until: Date.now() + 60000,
+    }));
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page, { seek: () => ({ ok: true, status: 200, json: async () => ({ offset: 1860 }) }) });
+        playback(page.video);
+    });
+    await settle();
+    await newRunCanPlay(p);
+    click(p.container.querySelector('.wt-player-big-play'));
+    await settle();
+    assert.equal(p.video.paused, false);
+    assert.equal(p.video.autoplay, false);
+});
+
+// The exact place (C) of a paused restart comes with the viewer's Play -- as
+// documented -- and its two minutes count from that Play: a viewer back after
+// ten minutes still gets there.
+test('a paused restart goes to the exact place with the viewer\'s Play: not before, however long they were away', async (t) => {
+    const { p } = await pausedRestart(t);
+    await newRunCanPlay(p);
+    assert.equal(p.video.dataset.runOffset, '1860', 'the run starts 12 s early');
+    produced(p.video, 30);
+    await new Promise((r) => setTimeout(r, 650));
+    assert.equal(p.video.currentTime, 0, 'paused: the film stays where the seek landed it');
+    // Three minutes away: past the two minutes the place is looked for.
+    const realNow = Date.now;
+    Date.now = () => realNow() + 3 * 60 * 1000;
+    t.after(() => { Date.now = realNow; });
+    click(p.container.querySelector('.wt-player-big-play'));
+    await settle();
+    assert.equal(p.video.currentTime, 12, 'at 1872 the moment it plays: 1860 + 12');
+    assert.equal(seekPosts(p).length, 1, 'no second session seek');
+});
+
+test('a paused restart: a seek of the viewer\'s before their Play is the place -- Play does not jump away from it', async (t) => {
+    const handlers = {};
+    const saved = Object.getOwnPropertyDescriptor(navigator, 'mediaSession');
+    Object.defineProperty(navigator, 'mediaSession', { configurable: true, value: { setActionHandler: (a, fn) => { handlers[a] = fn; } } });
+    t.after(() => {
+        if (saved) Object.defineProperty(navigator, 'mediaSession', saved);
+        else delete navigator.mediaSession;
+    });
+    const { p } = await pausedRestart(t);
+    await newRunCanPlay(p);
+    produced(p.video, 60);
+    // 31:03, inside the run, before the restart's place -- still paused.
+    handlers.seekto({ seekTime: 1863 });
+    assert.equal(p.video.currentTime, 3, 'a plain seek inside the run');
+    click(p.container.querySelector('.wt-player-big-play'));
+    await new Promise((r) => setTimeout(r, 650));
+    assert.equal(p.video.currentTime, 3, 'where the viewer went, not the restart\'s place');
+});
+
+// The session seek itself: a seek that does not play, on an element nothing
+// will start, settles when the new run can play -- it waited for a `playing`
+// that never came (the spinner up, every later seek refused). With
+// `autoplay` it waits for the `playing` the reload brings, as before.
+test('a paused seek on an element without autoplay settles at canplay; with autoplay, on playing as before', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = await mountPlayer((it) => { it.installHls({}); });
+    const log = playback(p.video);
+    const seeker = () => createSessionSeeker({
+        hls: window.hlsPlayer, videoEl: p.video, sessionSeekUrl: '/session/seek',
+        sourceUrl: 'https://x.test/index.m3u8', trackContainer: p.container,
+    });
+    p.video.autoplay = false;
+    const a = seeker();
+    const first = a.seek(120);
+    await flush();
+    await flush();
+    assert.equal(a.isSeeking(), true);
+    p.video.dispatchEvent(new dom.window.Event('canplay'));
+    await flush();
+    assert.equal(a.isSeeking(), false, 'settled paused');
+    await first;
+    assert.equal(log.play, 0);
+    p.video.autoplay = true;
+    const b = seeker();
+    const second = b.seek(240);
+    await flush();
+    await flush();
+    p.video.dispatchEvent(new dom.window.Event('canplay'));
+    await flush();
+    assert.equal(b.isSeeking(), true, 'autoplay will start it: waits for playing');
+    p.video.dispatchEvent(new dom.window.Event('playing'));
+    await flush();
+    assert.equal(b.isSeeking(), false);
+    await second;
+});
+
+// 2. A card due before the first frame: the resource page keeps the rendered
+// player hidden until player_ready (app/action.js), and the restarted job
+// whose new session is dead at its first request never gets there -- its
+// card sat hidden, the viewer on "waiting for the player" (9b).
+test('the card before the first frame: player_show, so the page that hides the player until canplay shows it', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    window.sessionStorage.setItem(RESTART_BUDGET_KEY, JSON.stringify({ 'res:movie.mkv': Date.now() - 60 * 1000 }));
+    let shown = 0;
+    const onShow = () => { shown++; };
+    window.addEventListener('player_show', onShow);
+    t.after(() => window.removeEventListener('player_show', onShow));
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page);
+        pageStartForm(page, 'item');
+    });
+    assert.equal(shown, 0, 'nothing to show yet');
+    window.hlsPlayer.trigger(Hls.Events.ERROR, deadFragment());
+    await settle();
+    assert.ok(p.container.querySelector('.wt-recover'), 'the card');
+    assert.equal(shown, 1, 'the page is told to show it');
+    assert.equal(rec.got.length, 0);
+});
+
+// 3. That card's page: the viewer pressed the page's "Смотреть" instead of
+// the card's button, and the job cache replayed the job with the dead
+// session in it (9c). The card marks this file's start form; the card coming
+// down (the stream is back) takes the marks off.
+test('the card marks this file\'s start form: the viewer\'s own press goes past the job cache, the answer with it; the card coming down unmarks it', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    window.sessionStorage.setItem(RESTART_BUDGET_KEY, JSON.stringify({ 'res:movie.mkv': Date.now() - 60 * 1000 }));
+    let form = null;
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page);
+        form = pageStartForm(page, 'item');
+        page.video.dataset.offerAnswered = 'continue-slow';
+    });
+    await playPast(p, 50);
+    p.video.pause = () => { p.video.paused = true; };
+    const hls = window.hlsPlayer;
+    hls.trigger(Hls.Events.ERROR, deadFragment());
+    await settle();
+    assert.ok(p.container.querySelector('.wt-recover'), 'the card');
+    assert.equal(rec.got.length, 0, 'nothing started by the card itself');
+    form.requestSubmit();
+    assert.equal(rec.got.length, 1);
+    assert.equal(rec.got[0].purge, 'true', 'past the job cache: its replay is the dead session');
+    assert.equal(rec.got[0]['force-slow'], 'true', '"watch as is" rides along');
+    // The stream is back under the card after all: an ordinary start again.
+    hls.trigger(Hls.Events.FRAG_LOADED, filmLoaded());
+    await settle();
+    assert.equal(p.container.querySelector('.wt-recover'), null, 'the card came down');
+    form.requestSubmit();
+    assert.equal(rec.got[1].purge, undefined);
+    assert.equal(rec.got[1]['force-slow'], undefined);
+});
+
+// A restart that ends before any player mounts (the no-peers modal, an
+// error): the viewer's next press still goes past the job cache -- the fields
+// stay on the form until a player takes them off.
+test('a restart that ends before any player: the next press of the button is purged too; the next player takes it off', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    let form = null;
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page);
+        form = pageStartForm(page, 'item');
+        page.video.dataset.offerAnswered = 'continue-slow';
+    });
+    await playPast(p, 20);
+    window.hlsPlayer.trigger(Hls.Events.ERROR, deadFragment());
+    await settle();
+    assert.equal(rec.got.length, 1, 'the restart');
+    // Its job ends on a modal: the player goes, no other comes.
+    destroyPlayer();
+    form.requestSubmit();
+    assert.equal(rec.got[1].purge, 'true');
+    assert.equal(rec.got[1]['force-slow'], 'true');
+    // A player at last: the presses after it are ordinary starts.
+    window.sessionStorage.removeItem(RESTART_NOTE_KEY);
+    const host = document.getElementById('page');
+    const v = document.createElement('video');
+    v.className = 'player';
+    v.dataset.resourceId = 'res';
+    v.dataset.path = 'movie.mkv';
+    host.appendChild(v);
+    await initPlayer(host);
+    await settle();
+    form.requestSubmit();
+    assert.equal(rec.got[2].purge, undefined, 'once');
+    assert.equal(rec.got[2]['force-slow'], undefined);
+});
+
+// The card's marks are this file's (review of iteration 3, F1): with the card
+// up, the viewer moves on to the next file (N; nothing prewarmed, the film is
+// paused under the card), and next-item-go.js started it from a copy of this
+// file's start form -- marks and all: a purge past the next file's job cache,
+// and a force-slow that skipped its own slow-download question.
+test('the card up, the viewer moves on to the next file: its start carries neither the purge nor the force-slow', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    window.sessionStorage.setItem(RESTART_BUDGET_KEY, JSON.stringify({ 'res:movie.mkv': Date.now() - 60 * 1000 }));
+    const { p, streams, deliver } = await mountWithNext(t, (page) => {
+        sessionPlayer(page);
+        page.video.dataset.itemId = 'i1';
+        page.video.dataset.offerAnswered = 'continue-slow';
+        const rid = document.createElement('input');
+        rid.setAttribute('type', 'hidden');
+        rid.setAttribute('name', 'resource-id');
+        rid.setAttribute('value', 'res');
+        document.querySelector('form[action="/stream-video"]').appendChild(rid);
+    });
+    // A failed assertion before deliver() would leave the next file's render
+    // waiting out its 10-minute timeout, and the run with it.
+    t.after(() => { for (const s of streams) { try { s.onerror(); } catch (e) { /* closed */ } } });
+    const starts = [];
+    const inner = globalThis.fetch;
+    globalThis.fetch = (url, params) => {
+        if (params && params.method === 'POST' && String(url).endsWith('/stream-video')) starts.push(Object.fromEntries(params.body));
+        return inner(url, params);
+    };
+    window.fetch = globalThis.fetch;
+    await playPast(p, 50);
+    p.video.pause = () => { p.video.paused = true; };
+    window.hlsPlayer.trigger(Hls.Events.ERROR, deadFragment());
+    await settle();
+    assert.ok(p.container.querySelector('.wt-recover'), 'fixture: the card');
+    const form = document.querySelector('form[action="/stream-video"]');
+    assert.deepEqual(Object.fromEntries(new dom.window.FormData(form)),
+        { 'item-id': 'i1', 'resource-id': 'res', purge: 'true', 'force-slow': 'true' }, 'fixture: this file\'s form marked');
+    keydown('n');
+    await settle();
+    assert.equal(starts.length, 1, 'the next file\'s start');
+    assert.equal(starts[0]['item-id'], 'i2');
+    assert.equal(starts[0].purge, undefined, 'no purge: the next file\'s job cache is its own');
+    assert.equal(starts[0]['force-slow'], undefined, 'no force-slow: the next file asks its own question');
+    // Its job ends (else its render's 10-minute timeout holds the run): the
+    // next file's player is up, and it takes this file's marks off.
+    await deliver();
+    assert.equal(document.querySelector('video.player').getAttribute('data-path'), 'ep2.mkv', 'fixture: the next file\'s player is up');
+    assert.equal(document.querySelectorAll('input[data-stream-restart]').length, 0, 'the marks are gone from the page');
+});
+
+// ---- a fragment loaded again and again (fragment-loop.js) --------------------
+//
+// The player's answer to the watch: one fragment-loop event with what looped,
+// and a passthrough the old route plays given up to it -- the page's start
+// form again, decode-fallback=fragment_loop. Over 1080 the event is all: the
+// old route refuses those files.
+
+const { LOOP_LOADS } = await import('./fragment-loop.js');
+const passthroughSource = (page) => {
+    const src = document.createElement('source');
+    src.setAttribute('src', 'https://api.test/x/movie.mkv~hls/session/f1097e82/index.m3u8');
+    src.setAttribute('type', 'application/vnd.apple.mpegurl');
+    page.video.appendChild(src);
+};
+// A loaded fragment as hls.js's own FRAG_LOADED listeners need it (the ABR
+// controller reads its stats): one of theirs throwing ends the event before
+// the watch hears it -- hls.js's trigger catches and reports it as an
+// INTERNAL_EXCEPTION -- so the loads are counted as an error each.
+const loadedFragment = () => ({
+    frag: {
+        sn: 2, type: 'main', level: 0, duration: 4, start: 8,
+        stats: {
+            loading: { start: 0, first: 5, end: 10 }, parsing: { start: 10, end: 11 },
+            buffering: { start: 11, first: 11, end: 12 }, loaded: 1000, total: 1000, retry: 0, chunkCount: 1, bwEstimate: 0, aborted: false,
+        },
+    },
+    payload: new ArrayBuffer(8),
+});
+const loopFragment = (hls) => {
+    const internal = [];
+    const onError = (e, d) => { if (d.details === Hls.ErrorDetails.INTERNAL_EXCEPTION) internal.push(d.error); };
+    hls.on(Hls.Events.ERROR, onError);
+    for (let i = 0; i < LOOP_LOADS; i++) hls.trigger(Hls.Events.FRAG_LOADED, loadedFragment());
+    hls.off(Hls.Events.ERROR, onError);
+    assert.deepEqual(internal, [], 'fixture: hls.js took the fragment');
+};
+
+test('a fragment loop on a 1080 passthrough: the event, and the old route', async (t) => {
+    withHlsJs(t);
+    freshDecodeMemory();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); freshDecodeMemory(); });
+    const p = await mountPlayer((page) => {
+        passthroughPlayer(page);
+        page.video.setAttribute('data-video-class', 'hevc10');
+        passthroughSource(page);
+        pageStartForm(page);
+    });
+    const hls = window.hlsPlayer;
+    assert.ok(hls instanceof Hls, 'the player runs hls.js');
+    loopFragment(hls);
+    await settle();
+    assert.deepEqual(p.events.filter((e) => e.name === 'fragment-loop').map((e) => e.data), [
+        { type: 'main', sn: 2, level: 0, loads: LOOP_LOADS, fallback: true, route: 'passthrough', cls: 'hevc10', audio: 'none' },
+    ]);
+    assert.deepEqual(p.events.filter((e) => e.name === 'hevc-fallback').map((e) => e.data.reason), ['fragment_loop']);
+    assert.equal(rec.got.length, 1, 'the restart on the old route');
+    assert.equal(rec.got[0]['decode-fallback'], 'fragment_loop');
+});
+
+test('a fragment loop on a 4K passthrough: the event only -- the old route refuses the file', async (t) => {
+    withHlsJs(t);
+    freshDecodeMemory();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); freshDecodeMemory(); });
+    const p = await mountPlayer((page) => {
+        passthroughPlayer(page);
+        passthroughSource(page);
+        pageStartForm(page);
+    });
+    loopFragment(window.hlsPlayer);
+    await settle();
+    const ev = p.events.filter((e) => e.name === 'fragment-loop');
+    assert.equal(ev.length, 1);
+    assert.equal(ev[0].data.fallback, false);
+    assert.equal(ev[0].data.cls, 'hevc10-2160');
+    assert.equal(p.events.find((e) => e.name === 'hevc-fallback'), undefined);
+    assert.equal(rec.got.length, 0, 'no restart');
+});
+
+// ---- nginx-vod's stream refused by the browser (vod-guard.js) -----------------
+//
+// An MP4 nginx-vod serves as it is (~vod/) whose codecs the browser cannot add:
+// hls.js raises a fatal bufferAddCodecError, which the old route's handling
+// used to recover every ~110 ms for ever (2026-09-30). The player gives it up
+// once -- the page's start form again with vod_codecs -- and recovers nothing.
+
+const vodSource = (page) => {
+    const src = document.createElement('source');
+    src.setAttribute('src', 'https://api.test/x/movie.mp4~vod/hls/54e2/index.m3u8?token=T');
+    src.setAttribute('type', 'application/vnd.apple.mpegurl');
+    page.video.appendChild(src);
+    page.video.setAttribute('controls', '');
+    page.video.setAttribute('data-item-id', 'item1');
+};
+const codecRefusal = () => ({
+    type: Hls.ErrorTypes.MEDIA_ERROR,
+    details: Hls.ErrorDetails.BUFFER_ADD_CODEC_ERROR,
+    fatal: true,
+    error: new Error("Failed to execute 'addSourceBuffer' on 'MediaSource': The type provided ('video/mp4;codecs=ec-3,hev1.2.4.H150.B0') is unsupported."),
+    sourceBufferName: 'audiovideo',
+    mimeType: 'video/mp4;codecs=ec-3,hev1.2.4.H150.B0',
+});
+// raise: an error through hls.js's own listeners first, as it raises one; one
+// of theirs throwing would end the event before the player's.
+const raise = (hls, data) => {
+    const internal = [];
+    const onError = (e, d) => { if (d.details === Hls.ErrorDetails.INTERNAL_EXCEPTION) internal.push(d.error); };
+    hls.on(Hls.Events.ERROR, onError);
+    hls.trigger(Hls.Events.ERROR, data);
+    hls.off(Hls.Events.ERROR, onError);
+    assert.deepEqual(internal, [], 'fixture: hls.js took the error');
+};
+
+test('nginx-vod\'s stream refused: one restart with vod_codecs, no recovery, nothing after', async (t) => {
+    withHlsJs(t);
+    freshDecodeMemory();
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); freshDecodeMemory(); cleanRestart(); });
+    const p = await mountPlayer((page) => {
+        vodSource(page);
+        pageStartForm(page);
+    });
+    const hls = window.hlsPlayer;
+    assert.ok(hls instanceof Hls, 'the player runs hls.js');
+    let recovered = 0;
+    hls.recoverMediaError = () => { recovered++; };
+    for (let i = 0; i < 5; i++) raise(hls, codecRefusal());
+    await settle();
+    assert.equal(recovered, 0, 'recoverMediaError never');
+    assert.equal(rec.got.length, 1, 'one restart');
+    assert.equal(rec.got[0]['decode-fallback'], 'vod_codecs');
+    assert.equal(rec.got[0]['decode-class'], 'vod');
+    assert.deepEqual(p.events.filter((e) => e.name === 'vod-fallback').map((e) => e.data),
+        [{ reason: 'vod_codecs', mime: 'video/mp4;codecs=ec-3,hev1.2.4.H150.B0' }]);
+    assert.equal(p.events.find((e) => e.name === 'hevc-fallback'), undefined, 'not a passthrough fallback');
+    // Nothing restarts it again: the guard takes every fatal error after it
+    // gave up, so none reaches the stream restart (nor a non-fatal one).
+    hls.trigger(Hls.Events.ERROR, deadFragment());
+    hls.trigger(Hls.Events.ERROR, { ...deadFragment(), fatal: false });
+    await settle();
+    assert.equal(rec.got.length, 1, 'no second start');
+    assert.deepEqual(p.events.filter((e) => e.name.startsWith('player-recover')), []);
+});
+
+// The old route off nginx-vod is what it was: a fatal media error is recovered.
+test('a transcoder session\'s fatal media error: recovered as before, no vod restart', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    await mountPlayer((page) => {
+        sessionPlayer(page);
+        pageStartForm(page, 'item');
+    });
+    const hls = window.hlsPlayer;
+    let recovered = 0;
+    hls.recoverMediaError = () => { recovered++; };
+    raise(hls, codecRefusal());
+    await settle();
+    assert.equal(rec.got.filter((g) => g['decode-fallback'] === 'vod_codecs').length, 0);
+    assert.ok(recovered >= 1, 'hls-manager recovers it');
+});
+
+// The old route no longer recovers a fatal media error for ever
+// (media-recovery.js): recovered, recovered with the audio codec swapped,
+// then the card -- the one message, whose button restarts the stream.
+test('fatal media errors in a row on the old route: recovered, swapped, then the card', async (t) => {
+    withHlsJs(t);
+    cleanRestart();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); cleanRestart(); });
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page);
+        pageStartForm(page, 'item');
+    });
+    const hls = window.hlsPlayer;
+    let recovered = 0;
+    let swaps = 0;
+    hls.recoverMediaError = () => { recovered++; };
+    hls.swapAudioCodec = () => { swaps++; };
+    const appendFailed = { type: Hls.ErrorTypes.MEDIA_ERROR, details: Hls.ErrorDetails.BUFFER_APPEND_ERROR, fatal: true, error: new Error('append') };
+    for (let i = 0; i < 6; i++) raise(hls, appendFailed);
+    await settle();
+    assert.deepEqual([recovered, swaps], [2, 1], 'twice, the second with the audio codec swapped; never again');
+    assert.ok(p.container.querySelector('.wt-recover'), 'the card');
+    assert.deepEqual(p.events.filter((e) => e.name === 'player-recover-card-shown').map((e) => e.data.reason), ['media']);
+    assert.equal(rec.got.length, 0, 'no restart until the viewer asks');
+});
+
+// While the restart the vod guard began is on its way (a job, a new session:
+// tens of seconds), the player it leaves is not a dead one (handled()).
+test('an nginx-vod stream the guard gave up on is not a dead player', async (t) => {
+    withHlsJs(t);
+    freshDecodeMemory();
+    const rec = recordSubmits();
+    t.after(() => { rec.stop(); destroyPlayer(); freshDecodeMemory(); });
+    const p = await mountPlayer((page) => {
+        vodSource(page);
+        pageStartForm(page);
+    });
+    const hls = window.hlsPlayer;
+    hls.recoverMediaError = () => {};
+    p.video.paused = false;
+    mockClock(t, () => {
+        p.video.dispatchEvent(new dom.window.Event('play'));
+        raise(hls, codecRefusal());
+        assert.equal(rec.got.length, 1, 'fixture: the restart to the transcoder');
+        tickBy(t, 60000);
+    });
+    assert.equal(p.events.find((e) => e.name === 'player-dead'), undefined);
+});
+
+// Background recovery: exercise the actual POST -> job render -> Preact swap,
+// including the controls before the new stream has any media to display.
+test('background recovery keeps the stage and timeline through a fresh player mount, then follows the clock', async (t) => {
+    withHlsJs(t); cleanRestart();
+    const saved = { ES: window.EventSource, form: globalThis.FormData, parser: globalThis.DOMParser };
+    globalThis.FormData = dom.window.FormData; globalThis.DOMParser = dom.window.DOMParser;
+    let source;
+    window.EventSource = class { constructor() { source = this; } close() { this.closed = true; } };
+    t.after(() => { destroyPlayer(); cleanRestart(); window.EventSource = saved.ES; globalThis.FormData = saved.form; globalThis.DOMParser = saved.parser; window.dispatchEvent(new CustomEvent('player_ready')); });
+    const rec = recordSubmits(); t.after(() => rec.stop());
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page); pageStartForm(page, 'item');
+        page.video.dataset.itemId = 'item';
+        page.video.pause = () => { page.video.paused = true; page.video.dispatchEvent(new dom.window.Event('pause')); };
+        page.setResponse((url, params) => {
+            if (String(url).endsWith('/stream-video')) return { ok: true, text: async () => '<div data-async-progress-log="/job/recovery"></div>' };
+            return { ok: true, json: async () => ({ offset: 0 }), headers: new dom.window.Headers() };
+        });
+    });
+    const stage = p.container.querySelector('.wt-player-stage');
+    await playPast(p, 1397);
+    window.hlsPlayer.trigger(Hls.Events.ERROR, deadFragment());
+    await settle();
+    assert.equal(rec.got.length, 0, 'no visible form submit');
+    assert.equal(p.video.isConnected, true, 'buffer stays mounted during the job');
+    const post = p.calls.find((c) => String(c.url).endsWith('/stream-video'));
+    assert.equal(post.body.purge, 'true');
+    assert.equal(post.body['item-id'], 'item');
+    // The buffer advanced while the fresh session was being prepared.
+    p.video.currentTime = 1410;
+    source.onmessage({ data: JSON.stringify({ level: 'rendertemplate', body: '<div><video class="player" controls autoplay data-resource-id="res" data-item-id="item" data-path="movie.mkv" data-duration="3600"></video></div>' }) });
+    await settle(); await settle();
+    const next = p.container.querySelector('video.player');
+    assert.notEqual(next, p.video);
+    assert.equal(p.container.querySelector('.wt-player-stage'), stage);
+    assert.equal(p.container.querySelector('.wt-player-time span').textContent, '23:30');
+    assert.equal(next.currentTime, 1410, 'resume targets the latest position');
+    // Simulate source attachment briefly resetting the browser's media clock.
+    next.currentTime = 0; next.paused = false;
+    next.dispatchEvent(new dom.window.Event('play'));
+    await settle();
+    assert.equal(p.container.querySelector('.wt-player-time span').textContent, '23:30', 'never shows 0 during recovery');
+    next.currentTime = 1412;
+    await settle();
+    assert.equal(p.container.querySelector('.wt-player-time span').textContent, '23:32');
+    assert.equal(source.closed, true);
+    assert.equal(rec.got.length, 0);
+});
+
+test('a background restart mounted paused retains time and suppresses autoplay before HLS attaches, audio too', async (t) => {
+    cleanRestart(); t.after(() => { destroyPlayer(); cleanRestart(); });
+    for (const tag of ['video', 'audio']) {
+        const p = mount({ tag });
+        p.video.setAttribute('controls', ''); p.video.autoplay = true;
+        p.video.dataset.duration = '3600';
+        await initPlayer(p.container, { restartState: { at: 1397, play: false, settled: true } });
+        assert.equal(p.container.querySelector('.wt-player-time span').textContent, '23:17', 'time is retained on the very first render');
+        assert.equal(p.video.autoplay, false);
+        await settle(); await settle();
+        assert.equal(p.video.currentTime, 1397);
+        assert.equal(p.video.paused, true);
+        assert.equal(p.container.querySelector('.wt-player-time span').textContent, '23:17');
+        destroyPlayer();
+    }
+});
+
+test('failed background audio fallback offers an in-player retry with its original place and codec fields', async (t) => {
+    withHlsJs(t); cleanRestart(); freshDecodeMemory();
+    const saved = { ES: window.EventSource, form: globalThis.FormData, parser: globalThis.DOMParser };
+    globalThis.FormData = dom.window.FormData; globalThis.DOMParser = dom.window.DOMParser;
+    window.EventSource = class {
+        constructor() { setTimeout(() => this.onmessage?.({ data: JSON.stringify({ level: 'rendertemplate', body: '<div><video class="player" controls autoplay data-resource-id="res" data-item-id="item" data-path="movie.mkv" data-duration="3600"></video></div>' }) }), 0); }
+        close() {}
+    };
+    t.after(() => { destroyPlayer(); cleanRestart(); freshDecodeMemory(); window.EventSource = saved.ES; globalThis.FormData = saved.form; globalThis.DOMParser = saved.parser; window.dispatchEvent(new CustomEvent('player_ready')); });
+    let posts = 0;
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page); pageStartForm(page, 'item');
+        Object.assign(page.video.dataset, { itemId: 'item', decode: 'aac51', audioClass: 'aac51', videoRoute: 'reencode' });
+        page.video.pause = () => { page.video.paused = true; page.video.dispatchEvent(new dom.window.Event('pause')); };
+        page.setResponse((url) => {
+            if (String(url).endsWith('/stream-video')) {
+                posts++;
+                return posts === 1 ? { ok: false } : { ok: true, text: async () => '<div data-async-progress-log="/job/retry"></div>' };
+            }
+            return { ok: true, json: async () => ({ offset: 0 }), headers: new dom.window.Headers() };
+        });
+    });
+    await playPast(p, 1397);
+    const hls = window.hlsPlayer;
+    hls.detachMedia = () => { p.video.currentTime = 0; p.video.paused = true; };
+    hls.trigger(Hls.Events.BUFFER_CODECS, { audio: { codec: 'mp4a.40.2', metadata: { channelCount: 6 } } });
+    const appending = { type: Hls.ErrorTypes.MEDIA_ERROR, details: Hls.ErrorDetails.BUFFER_APPENDING_ERROR, sourceBufferName: 'audio', fatal: false };
+    const media = { type: Hls.ErrorTypes.MEDIA_ERROR, details: Hls.ErrorDetails.BUFFER_APPEND_ERROR, fatal: true };
+    hls.trigger(Hls.Events.ERROR, appending); hls.trigger(Hls.Events.ERROR, media);
+    await settle();
+    hls.trigger(Hls.Events.ERROR, appending); hls.trigger(Hls.Events.ERROR, media);
+    await settle();
+    const card = p.container.querySelector('.wt-recover');
+    assert.ok(card, 'the guard ownership permits its failed background transport to show the card');
+    assert.equal(posts, 1);
+    click(card.querySelector('button'));
+    await settle(); await settle();
+    assert.equal(posts, 2);
+    const starts = p.calls.filter(c => String(c.url).endsWith('/stream-video'));
+    assert.equal(starts[1].body['decode-class'], 'aac51');
+    assert.equal(starts[1].body['decode-fallback'], starts[0].body['decode-fallback']);
+    assert.equal(starts[1].body.purge, 'true');
+    assert.equal(p.container.querySelector('.wt-player-time span').textContent, '23:17');
+    assert.equal(p.container.querySelector('video.player').currentTime, 1397);
+    assert.equal(p.events.filter(e => e.name === 'audio-fallback').length, 1, 'retry did not strike/count the class again');
+});
+
+test('a viewer seek during background recovery overrides the failed seek target', async (t) => {
+    withHlsJs(t); cleanRestart();
+    const handlers = {};
+    const saved = { ES: window.EventSource, form: globalThis.FormData, parser: globalThis.DOMParser, media: Object.getOwnPropertyDescriptor(navigator, 'mediaSession') };
+    Object.defineProperty(navigator, 'mediaSession', { configurable: true, value: { setActionHandler: (a, fn) => { handlers[a] = fn; } } });
+    globalThis.FormData = dom.window.FormData; globalThis.DOMParser = dom.window.DOMParser;
+    let source;
+    window.EventSource = class { constructor() { source = this; } close() {} };
+    t.after(() => {
+        destroyPlayer(); cleanRestart(); window.EventSource = saved.ES; globalThis.FormData = saved.form; globalThis.DOMParser = saved.parser;
+        if (saved.media) Object.defineProperty(navigator, 'mediaSession', saved.media); else delete navigator.mediaSession;
+        window.dispatchEvent(new CustomEvent('player_ready'));
+    });
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page); pageStartForm(page, 'item'); page.video.dataset.itemId = 'item';
+        page.video.pause = () => { page.video.paused = true; page.video.dispatchEvent(new dom.window.Event('pause')); };
+        page.setResponse((url) => {
+            if (String(url).includes('/seek?')) return deadSeek();
+            if (String(url).endsWith('/stream-video')) return { ok: true, text: async () => '<div data-async-progress-log="/job/recovery"></div>' };
+            return { ok: true, json: async () => ({ offset: 0 }), headers: new dom.window.Headers() };
+        });
+    });
+    await playPast(p, 50);
+    handlers.seekto({ seekTime: 1500 }); await settle(); await settle();
+    assert.ok(source, 'background restart has begun after the failed session seek');
+    assert.equal(p.video.isConnected, true, 'the old buffer is still available');
+    produced(p.video, 100);
+    handlers.seekto({ seekTime: 30 }); await settle();
+    assert.equal(p.video.currentTime, 30, 'the viewer successfully sought to a different place while recovery was pending');
+    source.onmessage({ data: JSON.stringify({ level: 'rendertemplate', body: '<div><video class="player" controls autoplay data-resource-id="res" data-item-id="item" data-path="movie.mkv" data-duration="3600"></video></div>' }) });
+    await settle(); await settle();
+    const video = p.container.querySelector('video.player');
+    assert.equal(video.currentTime, 30);
+});
+
+test('a second failed seek during background recovery becomes the replacement position', async (t) => {
+    withHlsJs(t); cleanRestart();
+    const saved = { ES: window.EventSource, form: globalThis.FormData, parser: globalThis.DOMParser };
+    globalThis.FormData = dom.window.FormData; globalThis.DOMParser = dom.window.DOMParser;
+    let source;
+    window.EventSource = class { constructor() { source = this; } close() {} };
+    t.after(() => { destroyPlayer(); cleanRestart(); window.EventSource = saved.ES; globalThis.FormData = saved.form; globalThis.DOMParser = saved.parser; window.dispatchEvent(new CustomEvent('player_ready')); });
+    const p = await mountPlayer((page) => {
+        sessionPlayer(page); pageStartForm(page, 'item'); page.video.dataset.itemId = 'item';
+        page.video.pause = () => { page.video.paused = true; page.video.dispatchEvent(new dom.window.Event('pause')); };
+        page.setResponse((url) => {
+            if (String(url).includes('/seek?')) return deadSeek();
+            if (String(url).endsWith('/stream-video')) return { ok: true, text: async () => '<div data-async-progress-log="/job/recovery"></div>' };
+            return { ok: true, json: async () => ({ offset: 0 }), headers: new dom.window.Headers() };
+        });
+    });
+    await playPast(p, 50);
+    keydown('ArrowRight'); await settle();
+    assert.ok(source);
+    keydown('ArrowRight'); await settle();
+    assert.equal(seekPosts(p).length, 2);
+    assert.match(String(seekPosts(p)[1].url), /t=80$/);
+    source.onmessage({ data: JSON.stringify({ level: 'rendertemplate', body: '<div><video class="player" controls autoplay data-resource-id="res" data-item-id="item" data-path="movie.mkv" data-duration="3600"></video></div>' }) });
+    await settle(); await settle();
+    assert.equal(p.container.querySelector('video.player').currentTime, 80);
+});
+
+test('leaving a player cancels its pending Next job and a late result leaves the new player and URL alone', async (t) => {
+    const { streams, deliver } = await mountWithNext(t);
+    t.after(() => { for (const source of streams) source.onerror?.(); });
+    keydown('n'); await settle();
+    assert.equal(streams.length, 1);
+    let closed = 0;
+    streams[0].close = () => closed++;
+    destroyPlayer();
+    assert.equal(closed, 1, 'unmount aborts SSE before its result arrives');
+    const p = await mountPlayer();
+    const url = window.location.href;
+    await deliver();
+    assert.equal(closed, 1, 'unmount aborts SSE');
+    assert.equal(document.querySelector('video.player'), p.video);
+    assert.equal(window.location.href, url);
+});
+
+test('a transition whose stage disappears during initialization does not register a detached player', async (t) => {
+    t.after(() => destroyPlayer());
+    const p = mount();
+    const stage = document.createElement('div'); p.container.append(stage);
+    const pending = initPlayer(p.container, { stage });
+    stage.remove(); await pending;
+    assert.equal(p.video.parentNode, p.container);
+    assert.equal(stage.children.length, 0);
+});
+
+test('a paused direct-file seek updates the displayed position', async (t) => {
+    cleanRestart();
+    const handlers = {};
+    const saved = Object.getOwnPropertyDescriptor(navigator, 'mediaSession');
+    Object.defineProperty(navigator, 'mediaSession', { configurable: true, value: { setActionHandler: (a, fn) => { handlers[a] = fn; } } });
+    t.after(() => {
+        destroyPlayer(); cleanRestart();
+        if (saved) Object.defineProperty(navigator, 'mediaSession', saved); else delete navigator.mediaSession;
+    });
+    const p = await mountPlayer((page) => {
+        page.video.setAttribute('controls', ''); page.video.dataset.duration = '3600';
+        page.video.pause = () => { page.video.paused = true; page.video.dispatchEvent(new dom.window.Event('pause')); };
+    });
+    await playPast(p, 50); p.video.pause(); await settle();
+    handlers.seekto({ seekTime: 120 });
+    p.video.dispatchEvent(new dom.window.Event('seeked')); await settle();
+    assert.equal(p.video.currentTime, 120);
+    const shown = p.container.querySelector('.wt-player-time span').textContent;
+    assert.equal(shown, '2:00');
+});

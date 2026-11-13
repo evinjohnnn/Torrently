@@ -1,0 +1,86 @@
+.auth-page {
+  display: flex;
+  justify-content: center;
+  padding-top: clamp(24px, 8vh, 96px);
+  padding-bottom: 64px;
+}
+.auth-pane {
+  width: 100%;
+  max-width: 520px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  padding: 32px;
+  border-radius: var(--r-xl);
+}
+.auth-pane h1 {
+  font-size: var(--step-4);
+  letter-spacing: -0.04em;
+}
+.auth-pane header .lede {
+  margin-top: 8px;
+  font-size: 16px;
+}
+.auth-pane .notice ul {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  list-style: disc;
+}
+.auth-providers {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.auth-providers .button {
+  width: 100%;
+}
+.auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--ink-3);
+  font-size: 14px;
+}
+.auth-divider::before,
+.auth-divider::after {
+  content: "";
+  flex: 1;
+  border-top: 1px solid var(--hairline);
+}
+.auth-row {
+  display: flex;
+  gap: 8px;
+}
+.auth-row .input {
+  flex: 1;
+  min-width: 0;
+}
+.auth-progress {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 15px;
+}
+.auth-progress.done .job-mark {
+  background: var(--olive-wash);
+}
+.auth-progress.error .job-mark {
+  background: var(--brick-wash);
+  color: var(--brick);
+}
+.auth-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.auth-legal a {
+  color: inherit;
+}
+@media (max-width: 480px) {
+  .auth-pane {
+    padding: 22px;
+  }
+  .auth-row {
+    flex-direction: column;
+  }
+}

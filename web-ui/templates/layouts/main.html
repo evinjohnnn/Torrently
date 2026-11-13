@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="{{ $.Lang }}" data-theme="night" class="scroll-smooth">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+        <title>{{ template "title" . }} | Torrently</title>
+        {{ block "description" . }}{{ end }}
+        {{ block "canonical" . }}{{ end }}
+        {{ range hrefLangs $.Path }}<link rel="alternate" hreflang="{{ .Lang }}" href="{{ .URL }}">
+        {{ end }}
+        {{ block "og" . }}
+        <meta property="og:type" content="website">
+        <meta property="og:site_name" content="Torrently">
+        <meta property="og:title" content="{{ template "title" . }} | Torrently">
+        {{ template "og_card" . }}
+        {{ end }}
+        <link rel="shortcut icon" href="/favicon.ico">
+        <link rel="icon" type="image/svg+xml" href="/favicon.svg" >
+        <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+        <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+        <link rel="icon" type="image/png" sizes="48x48" href="/favicon-48x48.png">
+        <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+        <meta name="theme-color" content="#0a0e1a">
+        <link rel="manifest" href="/manifest.webmanifest">
+        {{ "inter.css" | asset }}
+        {{ "comfortaa.css" | asset }}
+        <script>
+            window._CSRF = "{{ .CSRF }}";
+            window._sessionID = "{{ .SessionID }}";
+            window._domain = "{{ domain }}";
+            window._showAdult = {{ if and .UserSettings .UserSettings.ShowAdult }}true{{ else }}false{{ end }};
+            {{- if useUmami }}
+            window._umami = {{ umamiConfig | json }};
+            {{- end }}
+        </script>
+        {{ "style.css" | asset }}
+        {{- template "head_extra" . }}
+    </head>
+    <body class="flex flex-col min-h-screen font-sans antialiased">
+        {{ template "open_instance_banner" $ }}
+        <div id="lang-suggest">{{ template "lang_suggest_banner" $ }}</div>
+        <script>
+            // Anti-FOUC hide; layout.js unhides once it runs. The load/timeout
+            // fallbacks guarantee the page never stays blank if layout.js
+            // fails to load (stale cached bundle after a deploy, network flap
+            // on tab restore) — display '' falls back to the body's flex class.
+            (function () {
+                document.body.style.display = 'none';
+                var show = function () { document.body.style.display = ''; };
+                window.addEventListener('load', show);
+                setTimeout(show, 5000);
+            })();
+        </script>
+        <progress id="progress" class="progress fixed progress-accent h-1 z-toast"></progress>
+        <header>
+            <nav data-async-layout="{{`{{ template "nav" . }}`}}">{{ template "nav" . }}</nav>
+        </header>
+        <div id="wrapper" class="flex flex-col w-full items-center flex-1">
+            <main id="main" class="w-full" data-async-scroll-top data-async-layout="{{`{{ template "main" . }}`}}" data-async-update-title="{{`{{ template "title" . }} | Torrently`}}" data-async-update-description="{{`{{ block "description" . }}{{ end }}`}}" data-async-update-nav="{{`{{ template "nav" . }}`}}" data-async-update-footer="{{`{{ template "footer" . }}`}}" data-async-update-lang="{{`{{ $.Lang }}`}}" data-async-update-langsuggest="{{`{{ template "lang_suggest_banner" . }}`}}">
+            {{ template "main" . }}
+            </main>
+        </div>
+        <div id="footer" data-async-layout="{{`{{ template "footer" . }}`}}">
+            {{ template "footer" . }}
+        </div>
+        <div id="toast-container" class="toast toast-end toast-bottom z-toast" role="status" aria-live="assertive" aria-atomic="false"></div>
+        {{/* Target for the navbar activation counter. It lives at body level,
+             not inside <nav>: the navbar is backdrop-blur-xl, and a filtered
+             ancestor becomes the containing block for position:fixed children,
+             so a dialog rendered in there is measured against the 72px bar and
+             gets clipped instead of covering the viewport.
+
+             Always present, even for users with no checklist — the container
+             is empty until the counter asks for it, and rendering it
+             conditionally would leave the target missing after an async
+             navigation that changed the checklist state.
+
+             data-async-update-nav re-renders the navbar from the same response,
+             so the counter cannot disagree with the modal the user is looking
+             at. */}}
+        <div id="onboarding-modal" data-async-layout="{{`{{ template "onboarding_checklist/modal" (withContext $ .Onboarding) }}`}}" data-async-update-nav="{{`{{ template "nav" . }}`}}"></div>
+        {{ if and useActionTurnstile (not (.User | hasAuth)) }}
+        {{/* Turnstile for job starts (lib/turnstileAction.js), anonymous visitors only — the
+             server does not check a signed-in account (handlers/action.verifyAction), so no
+             widget and no "checking" step for one either. A managed widget, appearance
+             interaction-only, rendered here at page load so the challenge is warm when a
+             button is pressed. On submit the script writes a "checking" step into the
+             form's job-log block (data-label is that line); when Cloudflare wants a click
+             a fresh widget is rendered inside that block, under the step. */}}
+        <div id="turnstile-action" class="hidden" data-sitekey="{{ actionTurnstileSiteKey }}" data-label="{{ t $.Lang "action.turnstileCheck" }}" data-label-interactive="{{ t $.Lang "action.turnstileInteractive" }}"></div>
+        <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" async defer></script>
+        {{ end }}
+        {{ "layout.js" | asset }}
+        {{- if useSuperTokens }}
+        {{ "auth.js" | asset }}
+        {{ end }}
+    </body>
+</html>

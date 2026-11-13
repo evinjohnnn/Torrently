@@ -1,0 +1,315 @@
+package resource
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	ra "github.com/webtor-io/rest-api/services"
+	"github.com/webtor-io/web-ui/helpers"
+	"github.com/webtor-io/web-ui/models"
+	"github.com/webtor-io/web-ui/services/pagination"
+	"github.com/webtor-io/web-ui/services/statusview"
+	w "github.com/webtor-io/web-ui/services/web"
+)
+
+type ButtonItem struct {
+	ID         string
+	CSRF       string
+	ItemID     string
+	ResourceID string
+	Name       string
+	Size       string
+	Action     string
+	Endpoint   string
+}
+
+// NameWithSize returns the display name, appending size in brackets if present.
+// Used for rendering in templates: {{ .NameWithSize }}
+func (b *ButtonItem) NameWithSize() string {
+	if b.Size != "" {
+		return b.Name + " [" + b.Size + "]"
+	}
+	return b.Name
+}
+
+type Breadcrumb struct {
+	Name    string
+	PathStr string
+	Active  bool
+}
+
+// Pagination aliases the shared model so templates keep referring to
+// .Page/.Active/.Number/.Prev/.Next/.Gap unchanged.
+type Pagination = pagination.Item
+
+func (s *Helper) MakeButton(ctx *w.Context, gd *GetData, name string, action string, endpoint string) *ButtonItem {
+	return &ButtonItem{
+		ID:         gd.Item.ID,
+		ItemID:     gd.Item.ID,
+		ResourceID: gd.Resource.ID,
+		Name:       name,
+		Action:     action,
+		Endpoint:   endpoint,
+		CSRF:       ctx.CSRF,
+	}
+}
+
+func (s *Helper) MakeDirButton(ctx *w.Context, gd *GetData, name string, action string, endpoint string) *ButtonItem {
+	return &ButtonItem{
+		ID:         gd.List.ID,
+		ItemID:     gd.List.ID,
+		ResourceID: gd.Resource.ID,
+		Name:       name,
+		Action:     action,
+		Endpoint:   endpoint,
+		CSRF:       ctx.CSRF,
+	}
+}
+
+func (s *Helper) MakeResourceButton(ctx *w.Context, gd *GetData, name string, action string, endpoint string) *ButtonItem {
+	return &ButtonItem{
+		ID:         gd.Resource.ID,
+		ItemID:     gd.Resource.ID,
+		ResourceID: gd.Resource.ID,
+		Name:       name,
+		Action:     action,
+		Endpoint:   endpoint,
+		CSRF:       ctx.CSRF,
+	}
+}
+
+func (s *Helper) MakeFileDownload(ctx *w.Context, gd *GetData) *ButtonItem {
+	b := s.MakeButton(ctx, gd, "resource.download", "download", "/download-file")
+	b.Size = helpers.Bytes(uint64(gd.Item.Size))
+	return b
+}
+
+func (s *Helper) MakeImage(ctx *w.Context, gd *GetData) *ButtonItem {
+	return s.MakeButton(ctx, gd, "resource.preview", "preview", "/preview-image")
+}
+
+// MakeAudio is Listen: "Watch" read wrong on a song in the languages whose
+// stream label is about watching (owner, 2026-10-18).
+func (s *Helper) MakeAudio(ctx *w.Context, gd *GetData) *ButtonItem {
+	return s.MakeButton(ctx, gd, "resource.listen", "stream", "/stream-audio")
+}
+
+func (s *Helper) MakeVideo(ctx *w.Context, gd *GetData) *ButtonItem {
+	return s.MakeButton(ctx, gd, "resource.stream", "stream", "/stream-video")
+}
+
+// MakeFileInfo is the "File info" button: the file's probe as a card in a
+// dialog of the file card (jobs/scripts/file_info.go). Video and audio only
+// (file.html).
+func (s *Helper) MakeFileInfo(ctx *w.Context, gd *GetData) *ButtonItem {
+	return s.MakeButton(ctx, gd, "resource.fileInfo", "file-info", "/file-info")
+}
+
+func (s *Helper) MakeDirDownload(ctx *w.Context, gd *GetData) *ButtonItem {
+	b := s.MakeDirButton(ctx, gd, "resource.downloadDir", "download-dir", "/download-dir")
+	b.Size = helpers.Bytes(uint64(gd.List.Size))
+	return b
+}
+
+func (s *Helper) HasBreadcrumbs(lr *ra.ListResponse) bool {
+	hasDir := false
+	for _, i := range lr.Items {
+		if i.Type == ra.ListTypeDirectory {
+			hasDir = true
+			break
+		}
+	}
+	return hasDir || lr.ListItem.PathStr != "/"
+}
+
+func (s *Helper) MakeBreadcrumbs(pathStr string) []Breadcrumb {
+	var res []Breadcrumb
+	if pathStr != "/" {
+		var t []string
+		path := strings.Split(strings.Trim(pathStr, "/"), "/")
+		for _, p := range path {
+			t = append(t, p)
+			res = append(res, Breadcrumb{
+				Name:    p,
+				PathStr: "/" + strings.Join(t, "/"),
+			})
+		}
+	}
+	if len(res) > 0 {
+		res[len(res)-1].Active = true
+	}
+	return res
+}
+
+func (s *Helper) HasPagination(lr *ra.ListResponse) bool {
+	return lr.Count > len(lr.Items)
+}
+
+func (s *Helper) MakePagination(lr *ra.ListResponse, page uint, pageSize uint) []Pagination {
+	return pagination.Build(lr.Count, page, pageSize)
+}
+
+type Helper struct {
+	// secret signs .torrent links; empty means links stay plain (no session
+	// secret configured — the check is skipped on the way in as well).
+	secret string
+}
+
+func NewHelper(secret string) *Helper {
+	return &Helper{secret: secret}
+}
+
+// StatusToken is the credential a page hands to whatever opens the status
+// stream for resourceID — the badge on the resource page, the progress rows
+// on /vault. Every page that opens the stream must render one: the handler
+// refuses the stream without it. Empty when no session secret is configured
+// (the stream then checks nothing, as before).
+func (s *Helper) StatusToken(resourceID string) string {
+	if s.secret == "" {
+		return ""
+	}
+	tok, err := SignStatusToken(s.secret, resourceID, time.Now())
+	if err != nil {
+		return ""
+	}
+	return tok
+}
+
+// StatusBadge is a status pill the page draws itself, in the transfer
+// status's own badge element (partials/status/badge.html): the Vault page's
+// pledge states ("Saved", "Expiring") and its rows' badge before their first
+// status message. tone and icon are the element's (style.css .tx-badge
+// [data-tone], #tx-b-* in status/badge_symbols). Placed without an id: a
+// page carries many.
+func (s *Helper) StatusBadge(tone, icon, label string) statusview.BadgeEl {
+	return statusview.Badge{Tone: tone, Icon: icon, Label: label}.El("")
+}
+
+// TorrentFileURL is the download link for the resource's .torrent file,
+// signed for a few hours so the URL cannot be planted on a torrent index as a
+// permanent host (see torrent_link.go).
+func (s *Helper) TorrentFileURL(r *ExtendedResource) string {
+	plain := "/" + r.ID + ".torrent"
+	if s.secret == "" {
+		return plain
+	}
+	tok, err := SignTorrentFileToken(s.secret, r.ID, time.Now())
+	if err != nil {
+		return plain
+	}
+	return plain + "?token=" + tok
+}
+
+func (s *Helper) getMetadata(gd *GetData) *models.VideoMetadata {
+	if gd.Movie != nil {
+		return gd.Movie.GetMetadata()
+	}
+	if gd.Series != nil {
+		return gd.Series.GetMetadata()
+	}
+	return nil
+}
+
+func (s *Helper) HasEnrichment(gd *GetData) bool {
+	return s.getMetadata(gd) != nil
+}
+
+func (s *Helper) GetEnrichedTitle(gd *GetData) string {
+	md := s.getMetadata(gd)
+	if md != nil {
+		return md.Title
+	}
+	return ""
+}
+
+func (s *Helper) HasEnrichedYear(gd *GetData) bool {
+	md := s.getMetadata(gd)
+	return md != nil && md.Year != nil && *md.Year != 0
+}
+
+func (s *Helper) GetEnrichedYear(gd *GetData) int {
+	md := s.getMetadata(gd)
+	if md != nil && md.Year != nil {
+		return int(*md.Year)
+	}
+	return 0
+}
+
+func (s *Helper) GetEnrichedPlot(gd *GetData) string {
+	md := s.getMetadata(gd)
+	if md != nil {
+		return md.Plot
+	}
+	return ""
+}
+
+func (s *Helper) HasEnrichedRating(gd *GetData) bool {
+	md := s.getMetadata(gd)
+	return md != nil && md.Rating != nil && *md.Rating > 0
+}
+
+func (s *Helper) GetEnrichedRating(gd *GetData) float64 {
+	md := s.getMetadata(gd)
+	if md != nil && md.Rating != nil {
+		return *md.Rating
+	}
+	return 0
+}
+
+func (s *Helper) HasEnrichedPoster(gd *GetData) bool {
+	md := s.getMetadata(gd)
+	return md != nil && md.PosterURL != ""
+}
+
+// GetOGImageURL returns the path of the unified poster endpoint in OG
+// canvas mode. The handler picks the best available source (IMDb
+// poster first, then thumbnail, then a brand-default banner) — the
+// template never branches on which kind of preview exists, and the
+// URL is guaranteed to resolve (brand banner is the safety net so
+// Telegram never caches a 404).
+func (s *Helper) GetOGImageURL(gd *GetData) string {
+	if gd == nil || gd.Resource == nil {
+		return ""
+	}
+	return fmt.Sprintf("/lib/poster/%s/og.jpg", gd.Resource.ID)
+}
+
+// GetResourcePosterURL returns the path of the unified poster endpoint
+// in resize mode at the given width. Used by the resource page header
+// to show the same image visitors see in a shared preview — IMDb
+// poster, generated thumbnail, or nothing (handler returns 404 and
+// the template's CSS placeholder takes over).
+//
+// Delegates the /raw/ switch to web.PosterURL so the adult-opt-in
+// behaviour stays consistent with library cards and continue-watching.
+func (s *Helper) GetResourcePosterURL(gd *GetData, width int, ctx *w.Context) string {
+	if gd == nil || gd.Resource == nil {
+		return ""
+	}
+	return w.PosterURL(gd.Resource.ID, width, s.IsAdult(gd), ctx)
+}
+
+// IsAdult reports whether the torrent's name/paths tripped the adult
+// classifier during enrichment. Drives both the server-side poster
+// blur and the 18+ overlay/footnote. Nil-safe — un-classified
+// resources (rows added before this feature, or while backfill is in
+// flight) return false so they render normally.
+func (s *Helper) IsAdult(gd *GetData) bool {
+	return gd != nil && gd.ResourceMetadata != nil && gd.ResourceMetadata.IsAdult
+}
+
+// IsSport reports whether the torrent looks like a sports broadcast.
+// Stored for future filters (skip-from-recommendations etc.); does
+// NOT trigger blur or the 18+ overlay.
+func (s *Helper) IsSport(gd *GetData) bool {
+	return gd != nil && gd.ResourceMetadata != nil && gd.ResourceMetadata.IsSport
+}
+
+func (s *Helper) IsEnrichedMovie(gd *GetData) bool {
+	return gd.Movie != nil && gd.Movie.GetMetadata() != nil
+}
+
+func (s *Helper) IsEnrichedSeries(gd *GetData) bool {
+	return gd.Series != nil && gd.Series.GetMetadata() != nil
+}

@@ -1,0 +1,254 @@
+.tiers-form {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+.tiers-toggle {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 14px;
+}
+.switch {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 44px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.switch input {
+  position: absolute;
+  opacity: 0;
+  width: 1px;
+  height: 1px;
+}
+.switch-track {
+  position: relative;
+  flex: none;
+  width: 44px;
+  height: 26px;
+  border-radius: var(--pill);
+  background: rgba(28, 31, 20, 0.2);
+  transition: background-color 200ms var(--ease);
+}
+.switch-track::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(28, 31, 20, 0.3);
+  transition: transform 200ms var(--ease);
+}
+.switch input:checked + .switch-track {
+  background: var(--olive);
+}
+.switch input:checked + .switch-track::after {
+  transform: translateX(18px);
+}
+.switch input:focus-visible + .switch-track {
+  outline: 2px solid var(--olive);
+  outline-offset: 3px;
+}
+
+.tiers {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.tier {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 26px 24px;
+  border-radius: var(--r-xl);
+  border: 1px solid var(--hairline);
+}
+.tier.recommended {
+  border: 1.5px solid var(--olive);
+}
+.tier-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.tier-head h2 {
+  font-size: var(--step-1);
+  letter-spacing: -0.02em;
+}
+.tier-price {
+  min-height: 64px;
+}
+.tier-price strong {
+  font-size: var(--step-4);
+  font-weight: 600;
+  letter-spacing: -0.04em;
+}
+.tier-price span {
+  color: var(--ink-2);
+}
+.tier-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+}
+.tier-crypto {
+  min-height: 40px;
+  font-size: 14px;
+  color: var(--ink-2);
+  text-decoration: underline;
+  text-decoration-color: rgba(28, 31, 20, 0.25);
+  text-underline-offset: 3px;
+}
+button.tier-crypto:hover {
+  color: var(--olive-ink);
+}
+.tier-crypto.off {
+  display: grid;
+  place-items: center;
+  text-decoration: none;
+  color: var(--ink-3);
+  cursor: help;
+}
+.tier-tagline {
+  color: var(--ink-2);
+}
+.tier-benefits p {
+  margin-bottom: 8px;
+  font-weight: 600;
+}
+.tier-benefits ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border-top: 1px solid var(--hairline);
+}
+.tier-benefits li {
+  padding: 9px 0;
+  border-bottom: 1px solid var(--hairline);
+  font-size: 15px;
+  color: var(--ink-2);
+}
+.tier-trial {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 8px;
+  text-align: center;
+}
+.tier-trial .button {
+  border-color: var(--olive);
+  color: var(--olive-ink);
+  font-weight: 600;
+}
+.gift {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 16px;
+  padding: 14px 16px 14px 20px;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--hairline);
+}
+.gift > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--ink-2);
+}
+.gift svg {
+  color: var(--olive);
+}
+.gift .button {
+  min-height: 44px;
+}
+.tiers-note {
+  max-width: 70ch;
+}
+.or-rule {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  max-width: 560px;
+  margin: 48px auto;
+  color: var(--ink-3);
+}
+.or-rule::before,
+.or-rule::after {
+  content: "";
+  flex: 1;
+  border-top: 1px solid var(--hairline);
+}
+.patreon {
+  max-width: 560px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 26px;
+  border-radius: var(--r-xl);
+}
+.patreon-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+.patreon-head h2 {
+  font-size: var(--step-2);
+  letter-spacing: -0.03em;
+}
+.patreon p {
+  color: var(--ink-2);
+}
+.patreon .button {
+  align-self: flex-start;
+}
+
+.payment-pane {
+  max-width: 640px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 16px;
+  padding: 24px;
+  border-radius: var(--r-xl);
+}
+.payment-pane .job-steps {
+  align-self: stretch;
+}
+.payment-note {
+  color: var(--ink-2);
+}
+
+@media (max-width: 900px) {
+  .tiers {
+    grid-template-columns: 1fr;
+    max-width: 560px;
+  }
+  /* the recommended plan first, where it is seen without scrolling */
+  .tier.recommended {
+    order: -1;
+  }
+}
+@media (max-width: 640px) {
+  .wide-only {
+    display: none;
+  }
+  .tier {
+    padding: 22px 20px;
+  }
+}

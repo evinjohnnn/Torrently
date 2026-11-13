@@ -1,0 +1,12 @@
+{
+  "input": "The Purge: Election Year (2016) HC - 720p HDRiP - 900MB - ShAaNi",
+  "want": {
+    "title": "The Purge: Election Year",
+    "year": 2016,
+    "resolution": "720p",
+    "quality": "HDRip",
+    "group": "ShAaNi",
+    "hardcoded": true,
+    "size": "900MB"
+  }
+}

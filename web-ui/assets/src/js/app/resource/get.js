@@ -1,0 +1,189 @@
+import av from '../../lib/av';
+import { waitForElement } from '../../lib/waitForElement';
+import { findTextCut, trimTextCut } from '../../lib/textClamp';
+import { initStickyStatus, stickyBottom } from '../../lib/stickyStatus';
+import { initLandscapeFocus } from '../../lib/landscapeFocus';
+import { initToolIntent } from '../../lib/toolIntent';
+import { initStreamToggle } from '../../lib/streamToggle';
+import '../../lib/share/share';
+import { takesPart, whenDeclared, setPendingFallback } from '../../lib/player/decode-declaration';
+import { hasJob } from '../../lib/actionBusy';
+// Plot clamp: when the 3-line clamped paragraph overflows, cut the text
+// at the longest fitting prefix (shared findTextCut from lib/textClamp)
+// and append a clickable inline "\u2026" that expands the full plot; an
+// inline "\u2191" at the end of the expanded text collapses it back.
+// Mirrors the Preact ExpandableText used in Discover.
+//
+// ONE av() per script: lib/asyncView.js registers a script's init under its
+// URL (`__async/assets/resource/get_loaded`) and runs only the first
+// registration — a second av() in the same file is silently dropped. That
+// is how the `#action=stream` deep link went dead in June 2026: the plot
+// clamp was added as its own av() above it. Everything this script does
+// on init therefore lives in the single callback at the bottom.
+function initPlotClamp() {
+    const plot = document.querySelector('[data-plot-clamp]');
+    if (!plot) return;
+    const full = plot.textContent;
+    const cut = findTextCut(plot, full);
+    if (cut == null) return;
+    const cutText = trimTextCut(full, cut) + ' ';
+
+    function toggleBtn(label, onClick) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.textContent = label;
+        btn.className = 'text-w-cyan hover:underline cursor-pointer font-bold';
+        btn.addEventListener('click', onClick);
+        return btn;
+    }
+    function renderCollapsed() {
+        plot.style.maxHeight = '';
+        plot.textContent = cutText;
+        plot.appendChild(toggleBtn('\u2026', renderExpanded));
+    }
+    function renderExpanded() {
+        plot.style.maxHeight = 'none';
+        plot.textContent = full + ' ';
+        plot.appendChild(toggleBtn('\u2191', renderCollapsed));
+    }
+    renderCollapsed();
+}
+av( async function() {
+    initPlotClamp();
+    // The line under the .torrent button for a visitor from a tool page
+    // (partials/resource/tool_intent) — before the #action early return.
+    initToolIntent(this);
+    // Watch / Listen pressed while its player plays pauses it (once per
+    // page: lib/streamToggle.js guards a second wiring).
+    initStreamToggle(document);
+    // Before the early return below: the status mirror is for every visit to
+    // this page, not only the ones that arrive with #action=stream.
+    const stopSticky = initStickyStatus(document);
+    this._stickyStatusStop = stopSticky;
+    // A phone on its side: the film takes the window (lib/landscapeFocus.js).
+    this._landscapeFocusStop = initLandscapeFocus(document);
+    // Picking a file swaps #content only (views/resource/get.html), so this
+    // view is not re-run and nothing scrolls. The card that just changed is
+    // ABOVE the list the viewer clicked in -- bring it into view, under the
+    // navbar and the sticky status. The sticky status mirrors the whole
+    // status block, plan box included, so it is measured (stickyBottom), not
+    // assumed: a fixed scroll margin sized for the old one-line badge left
+    // the file's name and buttons under it. Only when the card is actually
+    // out of sight: a short list needs no movement.
+    const onContentSwap = (e) => {
+        if (!e.detail || !e.detail.target || e.detail.target.id !== 'content') return;
+        const file = document.getElementById('file');
+        if (!file) return;
+        // A film that has the window (lib/landscapeFocus.js) came over into
+        // the new card -- the next episode, quietly: it stays where it is,
+        // and landscapeFocus puts it back at the top if the swap moved it.
+        if (document.documentElement.classList.contains('wt-focus')) return;
+        const top = stickyBottom(document) + 12;
+        const r = file.getBoundingClientRect();
+        if (r.top >= top && r.top < window.innerHeight / 2) return;
+        window.scrollTo({ top: window.scrollY + r.top - top, behavior: 'smooth' });
+    };
+    window.addEventListener('async', onContentSwap);
+    this._contentSwapStop = () => window.removeEventListener('async', onContentSwap);
+    if (window._ads !== undefined && window._sessionExpired !== true) {
+        const renderAd = (await import('../../lib/ads')).default;
+        for (const ad of window._ads) {
+            renderAd(this, ad);
+        }
+    }
+    const query = window.location.hash.replace('#', '');
+    const urlParams = new URLSearchParams(query);
+    const action = urlParams.get('action');
+    const modal = urlParams.get('modal');
+    const purge = urlParams.get('purge');
+    // The slow-download modal already answered "watch as is" for this file:
+    // a player's restart of its stream (lib/player/stream-restart.js
+    // restartURL) does not ask it again.
+    const forceSlow = urlParams.get('force-slow') === 'true';
+    const debug = urlParams.get('debug');
+    if (!action) return;
+    // "stream" is a shorthand — try stream-video first, then stream-audio.
+    const findForm = () => document.querySelector('form.' + action)
+        || (action === 'stream' ? (document.querySelector('form.stream-video') || document.querySelector('form.stream-audio')) : null);
+    // The av() queue is drained before the file card (and its form) is in
+    // the DOM, so a one-shot lookup here found nothing and the deep link did
+    // nothing at all. Wait for the form instead (lib/waitForElement.js).
+    const form = await waitForElement(findForm);
+    if (!form) return;
+    // This view runs again on every swap of main, and #action stays in the
+    // address. A watched toggle or a rating keeps the job this link started
+    // (lib/loadAsyncView.js keepJobs): a second start would throw its player
+    // away.
+    const logSel = form.getAttribute('data-async-target');
+    const log = logSel && document.querySelector(logSel);
+    if (log && hasJob(log)) return;
+    // Marked as the stream restart's fields (lib/player/stream-restart.js
+    // PURGE_MARK; the literal here keeps the player's code out of this
+    // page's bundle): they ride on this start, and on the viewer's next
+    // press of the button if this start ends before any player (the no-peers
+    // or the slow-download modal), and the next player takes them off -- the
+    // presses after it are ordinary starts again, as on the form path.
+    if (purge) {
+        const purgeInput = document.createElement('input');
+        purgeInput.setAttribute('type', 'hidden');
+        purgeInput.setAttribute('name', 'purge');
+        purgeInput.setAttribute('value', 'true');
+        purgeInput.setAttribute('data-stream-restart', '');
+        form.appendChild(purgeInput);
+    }
+    if (forceSlow) {
+        const forceSlowInput = document.createElement('input');
+        forceSlowInput.setAttribute('type', 'hidden');
+        forceSlowInput.setAttribute('name', 'force-slow');
+        forceSlowInput.setAttribute('value', 'true');
+        forceSlowInput.setAttribute('data-stream-restart', '');
+        form.appendChild(forceSlowInput);
+    }
+    if (debug) {
+        const debugInput = document.createElement('input');
+        debugInput.setAttribute('type', 'hidden');
+        debugInput.setAttribute('name', 'debug');
+        debugInput.setAttribute('value', debug);
+        form.appendChild(debugInput);
+    }
+    // A restart after a passthrough failed, sent here because the page's
+    // start form was another file's (lib/player/passthrough.js
+    // fallbackToOldRoute): this start carries why and declares nothing for
+    // the file -- or, after its multichannel audio failed (an audio class,
+    // fallbackAudio), declares it without that audio
+    // (decode-declaration.js setPendingFallback).
+    const fallback = urlParams.get('decode-fallback');
+    if (fallback) {
+        try {
+            const field = (n) => { const el = form.querySelector(`input[name="${n}"]`); return el ? el.value : ''; };
+            setPendingFallback(window, { resourceId: field('resource-id'), itemId: field('item-id'), reason: fallback, cls: urlParams.get('decode-class') || 'unknown' });
+        } catch (e) { /* start anyway */ }
+    }
+    // A deep link starts at once, possibly before the page's decoder probe
+    // has answered; a browser that declares gets up to 300 ms for it, then
+    // goes with its cached answer or `unknown` (decode-declaration.js).
+    try {
+        if (takesPart(window)) await whenDeclared(window, 300);
+    } catch (e) { /* start anyway */ }
+    form.requestSubmit();
+    if (modal) {
+        window.addEventListener('player_ready', function () {
+            if (!modal) return;
+            const checkbox = document.getElementById(modal + '-checkbox');
+            checkbox.checked = true;
+        });
+    }
+}, function () {
+    if (this._contentSwapStop) {
+        this._contentSwapStop();
+        this._contentSwapStop = null;
+    }
+    if (this._stickyStatusStop) {
+        this._stickyStatusStop();
+        this._stickyStatusStop = null;
+    }
+    if (this._landscapeFocusStop) {
+        this._landscapeFocusStop();
+        this._landscapeFocusStop = null;
+    }
+});

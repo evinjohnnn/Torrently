@@ -1,0 +1,9 @@
+{
+  "input": "Anna.Karenina.02.-.Seriya.mkv",
+  "want": {
+    "title": "Anna Karenina",
+    "episode": 2,
+    "container": "mkv",
+    "extra": "Seriya"
+  }
+}

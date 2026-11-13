@@ -1,0 +1,207 @@
+package api
+
+import (
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+	"github.com/webtor-io/web-ui/services/libapi"
+)
+
+func docsEngine() *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	registerDocs(r, "/api/v1", "http://localhost:8080/api/v1", "https://example.com/api-credentials/key")
+	return r
+}
+
+func getDocs(r *gin.Engine, path string, requestURI string) *httptest.ResponseRecorder {
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", path, nil)
+	req.RequestURI = requestURI
+	r.ServeHTTP(w, req)
+	return w
+}
+
+// The Swagger UI page is only as alive as its assets: the HTML always renders,
+// so a broken bundle shows up as a blank page, not an error.
+func TestDocsServesUIAssets(t *testing.T) {
+	r := docsEngine()
+	for _, p := range []string{
+		"/api/v1/docs/index.html",
+		"/api/v1/docs/swagger-ui-bundle.js",
+		"/api/v1/docs/swagger-ui-standalone-preset.js",
+		"/api/v1/docs/swagger-ui.css",
+	} {
+		if w := getDocs(r, p, p); w.Code != 200 || w.Body.Len() == 0 {
+			t.Errorf("%s: got %d (%d bytes), want 200 with content", p, w.Code, w.Body.Len())
+		}
+	}
+}
+
+// A middleware that rewrites URL.Path but not RequestURI (the i18n lang prefix,
+// the api-host rewrite) must not break asset serving: ginSwagger derives the
+// webdav strip-prefix from the FIRST matched request's RequestURI and freezes
+// it on a package-global, so one mismatched request used to 404 every asset
+// until process restart.
+func TestDocsSurvivesRewrittenFirstRequest(t *testing.T) {
+	r := docsEngine()
+
+	// First request arrives as /ru/... with the prefix already stripped from
+	// URL.Path, exactly as the i18n middleware leaves it.
+	if w := getDocs(r, "/api/v1/docs/index.html", "/ru/api/v1/docs/index.html"); w.Code != 200 {
+		t.Fatalf("rewritten index.html: got %d, want 200", w.Code)
+	}
+
+	p := "/api/v1/docs/swagger-ui-bundle.js"
+	if w := getDocs(r, p, p); w.Code != 200 || w.Body.Len() == 0 {
+		t.Errorf("%s after rewritten first request: got %d (%d bytes), want 200 with content", p, w.Code, w.Body.Len())
+	}
+}
+
+// The key prefill rides on the initializer and must stay off everything else —
+// on index.html it would run twice, on the bundle it would corrupt a file
+// served with the webdav path.
+func TestDocsPrefillInjectedIntoInitializerOnly(t *testing.T) {
+	r := docsEngine()
+
+	p := "/api/v1/docs/swagger-initializer.js"
+	w := getDocs(r, p, p)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "preauthorizeApiKey") {
+		t.Errorf("initializer: got %d, prefill present=%v, want 200 with prefill",
+			w.Code, strings.Contains(w.Body.String(), "preauthorizeApiKey"))
+	}
+	if !strings.Contains(w.Body.String(), CredentialsPath+"/key") {
+		t.Errorf("prefill does not fetch %s/key", CredentialsPath)
+	}
+
+	p = "/api/v1/docs/index.html"
+	if w := getDocs(r, p, p); strings.Contains(w.Body.String(), "preauthorizeApiKey") {
+		t.Errorf("prefill leaked into index.html")
+	}
+}
+
+// Cloudflare caches .js by extension with a default browser TTL, so the
+// initializer (which changes with every release) must carry an explicit
+// revalidation header; the immutable UI bundles must not.
+func TestDocsInitializerIsNotCacheable(t *testing.T) {
+	r := docsEngine()
+	p := "/api/v1/docs/swagger-initializer.js"
+	if cc := getDocs(r, p, p).Header().Get("Cache-Control"); cc != "no-cache" {
+		t.Errorf("initializer Cache-Control: got %q, want no-cache", cc)
+	}
+	p = "/api/v1/docs/swagger-ui-bundle.js"
+	if cc := getDocs(r, p, p).Header().Get("Cache-Control"); cc != "" {
+		t.Errorf("bundle Cache-Control: got %q, want none", cc)
+	}
+}
+
+// The key endpoint must never answer without a session: its body is a secret,
+// and the in-handler auth check (not just the middleware) is what this pins.
+func TestCredentialsKeyRejectsAnonymous(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	h := &Handler{}
+	r.GET(CredentialsPath+"/key", h.getCredentialsKey)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", CredentialsPath+"/key", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != 401 || w.Body.Len() != 0 {
+		t.Errorf("anonymous key request: got %d (%d bytes), want 401 with empty body", w.Code, w.Body.Len())
+	}
+}
+
+// The prefill must fetch the key from the configured absolute URL with
+// credentials — on the dedicated api host a relative fetch would be
+// host-rewritten into /api/... and 404, exactly what broke auto-authorize
+// there first time around.
+func TestDocsPrefillUsesConfiguredKeyURL(t *testing.T) {
+	r := docsEngine()
+	p := "/api/v1/docs/swagger-initializer.js"
+	body := getDocs(r, p, p).Body.String()
+	if !strings.Contains(body, `fetch("https://example.com/api-credentials/key"`) {
+		t.Errorf("prefill does not fetch the configured absolute key URL")
+	}
+	if !strings.Contains(body, `credentials:"include"`) {
+		t.Errorf("prefill fetch does not include credentials")
+	}
+}
+
+// The API surface must answer browser preflights and carry a wildcard CORS
+// header — with a dedicated host in the spec, "Try it out" always calls
+// cross-origin. Bearer auth (no cookies) is what makes the wildcard safe.
+func TestAPICORSPreflightAndResponses(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	libapi.RegisterCORSMiddleware(r, libapi.MountPath)
+	r.GET(libapi.MountPath+"/library", func(c *gin.Context) { c.Status(200) })
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("OPTIONS", "/api/v1/library", nil)
+	req.Header.Set("Origin", "https://webtor.io")
+	req.Header.Set("Access-Control-Request-Method", "GET")
+	req.Header.Set("Access-Control-Request-Headers", "authorization")
+	r.ServeHTTP(w, req)
+	if w.Code != 204 || w.Header().Get("Access-Control-Allow-Origin") != "*" ||
+		w.Header().Get("Access-Control-Allow-Headers") == "" {
+		t.Errorf("preflight: got %d ACAO=%q, want 204 with wildcard and headers",
+			w.Code, w.Header().Get("Access-Control-Allow-Origin"))
+	}
+
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/library", nil))
+	if w.Header().Get("Access-Control-Allow-Origin") != "*" {
+		t.Errorf("plain response lacks wildcard CORS header")
+	}
+
+	// Non-API paths stay untouched.
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("OPTIONS", "/profile", nil))
+	if w.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Errorf("CORS header leaked onto a non-API path")
+	}
+}
+
+// The key endpoint answers credentialed CORS ONLY to the configured api-host
+// origins: reflecting arbitrary origins would hand the session user's secret
+// to any website.
+func TestCredentialsKeyCORSRestrictedToAPIHosts(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	h := &Handler{keyOrigins: libapi.AllowedKeyOrigins([]string{"api.example.com"})}
+	r.GET(CredentialsPath+"/key", h.getCredentialsKey)
+
+	get := func(origin string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", CredentialsPath+"/key", nil)
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		r.ServeHTTP(w, req)
+		return w
+	}
+
+	w := get("https://api.example.com")
+	if w.Header().Get("Access-Control-Allow-Origin") != "https://api.example.com" ||
+		w.Header().Get("Access-Control-Allow-Credentials") != "true" {
+		t.Errorf("allowed origin: ACAO=%q ACAC=%q, want echo + true",
+			w.Header().Get("Access-Control-Allow-Origin"), w.Header().Get("Access-Control-Allow-Credentials"))
+	}
+	if w := get("https://evil.example.net"); w.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Errorf("foreign origin got a CORS grant")
+	}
+}
+
+// The api host's root (which the host middleware rewrites onto /api/) and the
+// mount roots must land on the reference — a bare-host 404 reads as an outage.
+func TestDocsRootsRedirectToReference(t *testing.T) {
+	r := docsEngine()
+	for _, p := range []string{"/api", "/api/", "/api/v1", "/api/v1/"} {
+		w := getDocs(r, p, p)
+		if w.Code != 302 || !strings.HasSuffix(w.Header().Get("Location"), "/docs/index.html") {
+			t.Errorf("%s: got %d → %q, want 302 to the docs", p, w.Code, w.Header().Get("Location"))
+		}
+	}
+}

@@ -1,0 +1,2112 @@
+package scripts
+
+import (
+	"context"
+	"crypto/sha1"
+	"fmt"
+	"golang.org/x/text/language"
+	"math"
+	"net/url"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/pkg/errors"
+	"github.com/webtor-io/web-ui/helpers"
+	"github.com/webtor-io/web-ui/models"
+	"github.com/webtor-io/web-ui/services/embed"
+	"github.com/webtor-io/web-ui/services/enrich"
+	"github.com/webtor-io/web-ui/services/i18n"
+	"github.com/webtor-io/web-ui/services/metrics"
+	"github.com/webtor-io/web-ui/services/statusview"
+	"github.com/webtor-io/web-ui/services/streamprefs"
+	thumb "github.com/webtor-io/web-ui/services/thumbnail"
+	us "github.com/webtor-io/web-ui/services/user_subtitle"
+	"github.com/webtor-io/web-ui/services/web"
+
+	log "github.com/sirupsen/logrus"
+	ra "github.com/webtor-io/rest-api/services"
+	"github.com/webtor-io/web-ui/services/template"
+
+	"github.com/webtor-io/web-ui/services/api"
+	"github.com/webtor-io/web-ui/services/job"
+)
+
+type StreamContent struct {
+	ExportTag *ra.ExportTag
+	Resource  *ra.ResourceResponse
+	Item      *ra.ListItem
+	// Title is the leaf label the player overlay shows in its top bar.
+	// Prefer the played file's basename (without extension) when one
+	// is present, otherwise the torrent name. Computed server-side so
+	// the player JS doesn't have to scrape document.title.
+	Title                string
+	MediaProbe           *api.MediaProbe
+	OpenSubtitles        []api.OpenSubtitleTrack
+	UserSubtitles        []models.UserSubtitleTrack
+	UserSubtitlesEnabled bool
+	// EIURL is the ExportItem "stream" URL — the torrent-http-proxy
+	// origin carrying whatever auth the cluster embeds (subdomain,
+	// path, query). Handed to the upload form as a hidden field so the
+	// async re-render can wrap newly uploaded user subtitles through
+	// /ext/ with the same credentials as the initial render.
+	EIURL               string
+	VideoStreamUserData *models.VideoStreamUserData
+	// CreditsAt is where the closing credits begin, in seconds, as the
+	// container's chapters say it (credits.go); 0 when they do not.
+	CreditsAt float64
+	// Next is the file that follows this one, nil when there is none.
+	Next              *NextItem
+	Settings          *models.StreamSettings
+	ExternalData      *models.ExternalData
+	DomainSettings    *embed.DomainSettingsData
+	TranscoderSession *api.TranscoderSession
+	SessionSeekURL    string
+	// GraceDurationSec is non-zero only for free-tier users when grace rules
+	// are enabled. Surfaced to the player JS so it knows when to show the
+	// soft signup CTA after the grace window passes.
+	GraceDurationSec int
+	// GraceFreeRateMbps is the user's plan-cap rate (in Mbps) parsed from
+	// ApiClaims.Rate (statusview.RateMbps). Shown on the "Continue at X Mbps" secondary CTA. Zero
+	// when the claim is missing/unparseable — template hides the line.
+	GraceFreeRateMbps int
+	// SubtitleOpts carries the viewer-specific inputs of the subtitle
+	// ladder (preferred language, translate/paid gating, display names).
+	// Computed in a later task; the zero value keeps template calls to
+	// getSubtitles well-formed in the meantime.
+	SubtitleOpts models.SubtitleOpts
+	// SubtitlesNotReady is "the OpenSubtitles lookup never finished", as
+	// opposed to "it finished and found nothing". video-info answers a 200
+	// with a Retry-After while a search leg is still waiting on the seeder;
+	// the step retries once and then renders without those tracks.
+	//
+	// It is rendered as data-subtitles-not-ready on the picker and reported
+	// on subtitle-resolved, because this render is cached for ten minutes
+	// like any other and nothing else would tell the two apart afterwards.
+	// The job queue has no per-run "do not cache": the key is computed
+	// before the script runs and the TTL is set at enqueue time.
+	SubtitlesNotReady bool
+	// StatusStallSub is the resource status's plan-box line for this very
+	// stream while its player buffers under the viewer's cap: "Without a
+	// subscription — up to 5 Mbps, and this file needs 8 Mbps"
+	// (statusview.StallSub). The status stream cannot know what the player
+	// pulls; this job probed the file (playedBitrate: one video and one
+	// audio track, as the player gets them). The page prefers this line over
+	// the status's own, which lacks the second half. "" without a cap.
+	StatusStallSub string
+	// StatusFitsCap: the played stream needs no more than the viewer's cap,
+	// with statusview.FitsMargin to spare (statusview.FitsCap) -- or, what
+	// it pulls not known, a bound on that does (playedBitrateRouted's
+	// ceiling: the file for tracks served as they are, the transcoder's
+	// cap on a re-encode) -- so it plays smoothly at the cap and the status
+	// says nothing under the bar while it plays. Only that: a real stall of
+	// it while thp's limiter holds the requests still gets the stream box
+	// -- the estimate is not proof (the page's present, lib/transferStatus.js).
+	StatusFitsCap bool
+	// StatusOverCap: the played stream needs more than the viewer's cap
+	// (statusview.OverCap). At the cap its player stalls once the buffer
+	// runs out, so the status shows the stream box as soon as it is due,
+	// while the player still plays. Never from a bound. Neither this nor
+	// StatusFitsCap: what the player pulls is not known (playedBitrate 0:
+	// re-encoded video, no per-track numbers, stale ones) and no bound on
+	// it fits, or it is under the cap by less than statusview.FitsMargin;
+	// the fact while it plays, the box at a real stall.
+	StatusOverCap bool
+	// StatusAnswered: this run is the slow-download modal's "watch as is"
+	// (force-slow) -- the viewer was just told the stream will be slower
+	// than the file needs and chose to watch anyway. The player element
+	// carries it (data-offer-answered) and the status treats it as an
+	// answered offer, like the grace popup's "continue at N Mbps": a file
+	// over the cap is not sold again until the player really stalls
+	// (lib/playerActivity.js offerAnswered).
+	StatusAnswered bool
+	// CapCard is the lock and card the player's buffering label draws by
+	// itself once the viewer has answered the grace popup (cap_card.go),
+	// rendered on the <video> as data-cap-card-*. nil without a grace
+	// window, in an embed, or without a cap.
+	CapCard *CapCard
+	// VideoClass is, for a passthrough session, the decoder class its video
+	// needs (passthroughClass: hevc8, hevc10, hevc8-2160, hevc10-2160 --
+	// "unknown" when the master does not say): the class a failure in the
+	// browser is charged to (data-video-class). "" on every other route.
+	VideoClass string
+	// FragLoadMs is, for a passthrough session, how long one segment may
+	// take to load before the player gives up on it (passthroughFragLoadMs,
+	// data-frag-load-ms). 0 on every other route.
+	FragLoadMs int
+	// AudioClass is what the start's declaration made of the session's
+	// audio, on any route (sessionAudioClass: "dolby", "aac51"): the class a
+	// failure of that audio in the browser is charged to
+	// (data-audio-class). "" for a start that declared no audio token, and
+	// for audio the transcoder did not change.
+	AudioClass string
+}
+
+// VideoRoute is the transcoder session's route ("" without a session or
+// from a transcoder that predates routes).
+func (sc *StreamContent) VideoRoute() string {
+	if sc == nil || sc.TranscoderSession == nil {
+		return ""
+	}
+	return sc.TranscoderSession.VideoRoute
+}
+
+// Passthrough: the session hands the browser the source's video as it is.
+func (sc *StreamContent) Passthrough() bool {
+	return sc.VideoRoute() == videoRoutePassthrough
+}
+
+// PlayerRestarts: the player may give this file up to a restart of its own
+// -- a passthrough, or a start that declared multichannel audio on any
+// route (lib/player/passthrough.js) -- and needs the file's item id for it
+// (data-item-id). A start that declared nothing restarts itself only off
+// nginx-vod.
+func (sc *StreamContent) PlayerRestarts() bool {
+	return sc.Passthrough() || (sc.VideoStreamUserData != nil && sc.VideoStreamUserData.DeclaresAudio()) || sc.vodStream()
+}
+
+// vodStream: the player's source is nginx-vod's (rest-api's ~vod URL), which
+// the player gives up to a restart where the browser refuses its codecs
+// (lib/player/vod-guard.js).
+func (sc *StreamContent) vodStream() bool {
+	if sc.ExportTag == nil {
+		return false
+	}
+	for _, src := range sc.ExportTag.Sources {
+		if strings.Contains(src.Src, "~vod/") {
+			return true
+		}
+	}
+	return false
+}
+
+const (
+	// How much of the head a stream warms up before playback. 10MB since
+	// 2026-09-19 (was 50MB): measured over six hours of production jobs, the
+	// warm-up is a median 21 s and p90 81 s of a wait whose median from the
+	// click to the first frame is 58 s -- a third of all the waiting, and on
+	// a cold swarm 50MB at 2MB/s is exactly the 25 s we saw. Playback needs
+	// the first segment, not fifty megabytes; the rest of the file arrives
+	// while it plays.
+	streamWarmupSize = 10 * 1024 * 1024 // 10MB
+	// What the bandwidth gate needs when it has to MEASURE, which is only
+	// when the quick warm-up above was not evidently fast enough (see
+	// needsFullMeasure). These two did not shrink with the warm-up, and
+	// cannot: the seeder's counter moves only when a whole piece is verified
+	// and counts only the bytes inside the requested range, so over 10MB a
+	// torrent with 8MB pieces reads "2MB in the time 8MB took" -- four times
+	// too slow, a false slow-download modal -- and one with 16MB pieces reads
+	// nothing at all and the gate silently switched off. The gate fires on
+	// 3.5% of stream starts (1362 in 7 days, 2026-09-20) and a quarter of
+	// those are within 2x of the bitrate, so it has to be right.
+	bandwidthTestSize = 50 * 1024 * 1024 // 50MB
+	bandwidthSkipSize = 10 * 1024 * 1024 // 10MB — skip for speed measurement
+)
+
+// lowerBoundSpeed is the slowest the swarm can have been, in bytes per
+// second: the whole warm-up range over everything the warm-up took -- finding
+// peers, the slow start, the lot. Piece granularity cannot inflate it (the
+// range did arrive in that time), so when even this clears the bitrate there
+// is nothing left to measure.
+func lowerBoundSpeed(bytes int, elapsed time.Duration) float64 {
+	if bytes <= 0 || elapsed <= 0 {
+		return 0
+	}
+	return float64(bytes) / elapsed.Seconds()
+}
+
+// needsFullMeasure says whether the quick warm-up left the bandwidth question
+// open: the lower bound does not cover the bitrate, and there is more of the
+// file to measure on than the quick warm-up already took.
+func needsFullMeasure(lowerBound float64, bitrate int64, quickSize int, fullSize int) bool {
+	if bitrate <= 0 || fullSize <= quickSize {
+		return false
+	}
+	return lowerBound*8 < float64(bitrate)
+}
+
+// swarmTooSlow says whether a measured swarm speed (bytes a second) fails
+// the file's bitrate: the BT-slow modal. An unmeasured swarm (0) does not.
+func swarmTooSlow(bytesPerSec float64, bitrate int64) bool {
+	return bytesPerSec > 0 && bytesPerSec*8 < float64(bitrate)
+}
+
+// halfCapped keeps a warm-up range within half the file, so a small file is
+// not "warmed up" in its entirety before it plays.
+func halfCapped(size int, fileSize int) int {
+	if half := fileSize / 2; half > 0 && size > half {
+		return half
+	}
+	return size
+}
+
+// WarmupSettings groups all torrent warmup tuning knobs so call-sites pass a
+// single value rather than three loose ints. Wired from CLI/env flags in
+// jobs.New() and threaded through Action/Embed scripts unchanged.
+type WarmupSettings struct {
+	// TimeoutMin is the hard warmup deadline (overall context.WithTimeout).
+	TimeoutMin int
+	// NoPeersTimeoutSec is the watchdog cutoff for "no bytes AND no peers" —
+	// when no peers have appeared within this window we surface the no_peers
+	// CTA early instead of waiting the full TimeoutMin.
+	NoPeersTimeoutSec int
+	// SlowPeersTimeoutSec is the watchdog cutoff for "peers exist but the
+	// rate is below the early-min threshold" — surfaces the no_peers CTA
+	// before probe hangs on its own deadline.
+	SlowPeersTimeoutSec int
+	// SeederProbeTimeoutSec bounds the fast-path probe that asks the seeder
+	// pod (via one Stats SSE event) whether the head + tail pieces of the
+	// target file are already Complete locally. When they are, we treat the
+	// content as cached and skip the full warmup — common in share flows
+	// where the sharer's seeder pod just served them and the new viewer
+	// arrives moments later. 0 disables the probe (kill-switch).
+	SeederProbeTimeoutSec int
+}
+
+// SlowDownloadData is the slow-download modal's. Its speeds are in the
+// megabit of the transfer status and of thp's limiter (statusview.mbit, 2^20
+// bits): at a "5M" cap the modal says 5, and a stream reads the same number
+// here as in the status's "…and this file needs N".
+type SlowDownloadData struct {
+	MeasuredSpeedMbps float64
+	RequiredSpeedMbps float64
+	BitrateMbps       float64
+	IsRateLimited     bool
+	RateLimitMbps     float64
+	TierName          string
+	// Form-resubmit context — populated in ErrorWrapperScript right before
+	// rendering. Lets the "Continue at slow speed" button POST back to the
+	// originating action endpoint with force-slow=true and target the same
+	// progress-log container so the new job replaces the failed one in place.
+	// ArchiveFormat and SelectedPaths ride along so a directory download
+	// resubmits with the same format and partial-archive selection instead
+	// of silently falling back to a whole-directory zip.
+	Action        string
+	Endpoint      string
+	ResourceID    string
+	ItemID        string
+	LogTargetID   string
+	ArchiveFormat string
+	SelectedPaths []string
+	// Purge: the start this modal answers asked past the job cache
+	// (purge=true) -- the player's own restart of a stream whose transcoder
+	// session was gone (assets/src/js/lib/player/stream-restart.js). Its
+	// "watch as is" asks past it too: the force-slow job of the same 10-min
+	// bucket is the one whose session died, and a replay hands it back.
+	Purge bool
+}
+
+type SlowDownloadError struct {
+	Data SlowDownloadData
+}
+
+// MeasuredLabel is the modal's "you have" number, printed the way the
+// transfer status prints a speed (statusview.Quantize, FormatNumber): "5",
+// "9,2" in Russian, "9.2" in English.
+func (d SlowDownloadData) MeasuredLabel(lang string) string {
+	return statusview.FormatNumber(lang, statusview.Quantize(d.MeasuredSpeedMbps))
+}
+
+// RequiredLabel is the modal's "the file needs" number, printed as
+// MeasuredLabel is: for a stream over the cap it is the N of the status's
+// "…and this file needs N" (statusview.StallSub), byte for byte.
+func (d SlowDownloadData) RequiredLabel(lang string) string {
+	return statusview.FormatNumber(lang, statusview.Quantize(d.RequiredSpeedMbps))
+}
+
+func (e *SlowDownloadError) Error() string {
+	return "download speed too slow for streaming"
+}
+
+// NoPeersError ends a warmup that produced nothing to play. Reason tells the
+// modal (and analytics) WHICH of three different situations it was, because
+// they call for different words and different next steps:
+//
+//	dead    — zero peers and zero bytes for NoPeersTimeoutSec: the swarm is gone
+//	slow    — peers exist but under 1 MiB arrived in SlowPeersTimeoutSec
+//	timeout — the hard warmup deadline passed before the measurement window
+//
+// The counters are the last values seen when the decision was made.
+type NoPeersError struct {
+	Reason   string
+	Peers    int
+	Seeders  int
+	Leechers int
+	Bytes    int64
+	Elapsed  time.Duration
+}
+
+func (e *NoPeersError) Error() string {
+	return "no peers / nothing downloaded during warmup"
+}
+
+// resourceLeafTitle picks the human label the player overlay shows.
+// Order:
+//  1. Enriched metadata title (e.g. "Title (2010)") — best UX for
+//     anything that matched IMDb/TMDB; survives sloppy filenames.
+//  2. File basename minus extension — fallback for un-enriched
+//     torrents; reflects what's actually playing in a multi-file pack.
+//  3. Torrent name — single-file no-Item case.
+//
+// Length-bounded extension trim (≤5 chars) avoids eating "Movie 2020.
+// Director's Cut" where the dot is meaningful.
+func resourceLeafTitle(md *models.VideoMetadata, ref *models.VideoRef, r *ra.ResourceResponse, item *ra.ListItem) string {
+	if md != nil && md.Title != "" {
+		title := md.Title
+		if md.Year != nil && *md.Year > 0 {
+			title = fmt.Sprintf("%s (%d)", md.Title, *md.Year)
+		}
+		if tag := episodeTag(ref); tag != "" {
+			title += " \u00b7 " + tag
+		}
+		return title
+	}
+	if item != nil {
+		name := item.Name
+		if name == "" {
+			name = filepath.Base(item.PathStr)
+		}
+		if name != "" && name != "." && name != "/" {
+			if ext := filepath.Ext(name); ext != "" && len(ext) <= 5 {
+				name = strings.TrimSuffix(name, ext)
+			}
+			return name
+		}
+	}
+	if r != nil {
+		return r.Name
+	}
+	return ""
+}
+
+// episodeTag is "S01E02" for an episode, "" for anything else. The compact
+// form on purpose: it is the same in every locale, and the title bar of a
+// phone-width player has room for little more.
+func episodeTag(ref *models.VideoRef) string {
+	if ref == nil || ref.Kind != models.VideoRefKindEpisode || ref.Episode <= 0 || ref.Season < 0 {
+		return ""
+	}
+	return fmt.Sprintf("S%02dE%02d", ref.Season, ref.Episode)
+}
+
+// capGateBitrate is what the bandwidth gate (streamContent, Step 3) holds the
+// plan's cap against, in bits a second: what the player pulls
+// (playedBitrate: the video and one audio track, as the transcoder or
+// nginx-vod serve them), because that is what thp caps -- the same number
+// the transfer status's "…and this file needs N" and its over-the-cap mark
+// are made of (setStatusMarks), so the cap modal's "file needs" and the
+// status say one thing. The file's own rate counts every dub and commentary
+// besides: a 3.5 Mbps H.264 with two 1.5 Mbps DTS dubs reads 6.6 as a file,
+// and at a 5 Mbps cap the gate showed the cap modal, "file needs 6.6", for a
+// transcoded stream of 3.6. Where what the player pulls is not known
+// (re-encoded video, tags that disagree with the file, no per-track numbers)
+// it falls back to the file's rate, as the cap was always held: an unknown
+// stream is no reason to skip the check.
+//
+// The swarm is not held against it: see getVideoBitrate.
+func capGateBitrate(mp *api.MediaProbe, transcoded bool, vsud *models.VideoStreamUserData) int64 {
+	if bps := playedBitrate(mp, transcoded, vsud); bps > 0 {
+		return bps
+	}
+	return getVideoBitrate(mp)
+}
+
+// getVideoBitrate is the file's own bitrate: the container's, or the sum of
+// its streams' where the container has none. It is what the bandwidth gate
+// holds the SWARM against (needsFullMeasure, swarmTooSlow, the BT-slow
+// modal): the warm-up measures file bytes the seeder fetched from its peers,
+// and to play the file the seeder has to fetch all of it, every dub
+// included -- the transcoder's ffmpeg reads every interleaved Matroska block
+// whatever it maps, and nginx-vod's ranges land inside whole pieces. Held
+// against the played stream instead, the two-DTS-dub file above (6.6 as a
+// file, 3.6 played) passed a 4.8 Mbps swarm at once, and the viewer stalled
+// on a swarm that cannot keep up with the file.
+func getVideoBitrate(mp *api.MediaProbe) int64 {
+	if mp.Format.BitRate != "" {
+		br, err := strconv.ParseInt(mp.Format.BitRate, 10, 64)
+		if err == nil && br > 0 {
+			return br
+		}
+	}
+	var total int64
+	for _, s := range mp.Streams {
+		if s.BitRate != "" {
+			br, err := strconv.ParseInt(s.BitRate, 10, 64)
+			if err == nil {
+				total += br
+			}
+		}
+	}
+	return total
+}
+
+// buildSlowDownloadData is the slow-download modal's data for a swarm that
+// delivers less than the file needs: measuredBytesPerSec is what the seeder
+// fetched from its peers during the warm-up, not what reaches the viewer, so
+// it is never the plan's cap (IsRateLimited stays false). The swarm is the
+// bottleneck there whatever the plan: a faster one would still get at most
+// the swarm's speed, and under grace (the first minutes at 50M for a free
+// viewer) the cap is not even in play. It used to call a swarm within 90% of
+// the cap "rate-limited" and sell a faster plan on it -- 674 modals a week
+// in 2026-09 for free viewers, 4 trial clicks from them (owner, 2026-09-26:
+// the modal promised slow video to viewers grace gave full speed). The cap
+// variant is checkCachedRateLimit's alone.
+//
+// Both speeds are in the status's megabit (statusview.BytesToMbps,
+// BitsToMbps). Until 2026-09-29 the modal counted 10^6 bits: the owner's
+// 1080p file "needed 9.1" here and 8,7 in the status, a 1.2 MB/s swarm read
+// 9.6 here and 9,2 there.
+func buildSlowDownloadData(c *web.Context, measuredBytesPerSec float64, bitrate int64) SlowDownloadData {
+	sdd := SlowDownloadData{
+		MeasuredSpeedMbps: statusview.BytesToMbps(measuredBytesPerSec),
+		RequiredSpeedMbps: statusview.BitsToMbps(float64(bitrate)),
+		BitrateMbps:       statusview.BitsToMbps(float64(bitrate)),
+	}
+	if c.Claims != nil && c.Claims.Context != nil && c.Claims.Context.Tier != nil {
+		sdd.TierName = c.Claims.Context.Tier.Name
+	}
+	if sdd.TierName == "" {
+		sdd.TierName = "free"
+	}
+	return sdd
+}
+
+// checkCachedRateLimit decides whether a cached stream should raise the
+// slow-download warning based purely on the user's subscription-tier rate cap.
+// Cached content comes from CDN/S3 fast enough to saturate the cap, so the cap
+// itself is the effective throughput — no probe download needed.
+//
+// The cap is read the way thp's limiter reads it (statusview.RateMbps: "5M"
+// is 5·2^20 bits a second, 655,360 B/s delivered), and the stream is over it
+// only as the labels say them (statusview.OverCap, the status's own
+// over-the-cap mark): the modal never reads "5 → 5", and a stream the
+// status calls not over the cap gets no cap modal.
+//
+// That leaves a stream in FitsMargin's band -- at the cap as the labels say
+// them, or under it by less than 1.2 -- with no upfront warning, from the
+// modal or from the status, which calls it unknown and shows its stream box
+// only once it really stalls. It is not known to fit: the player pulls more
+// than the estimate. The file FitsMargin records pulled 1.16 times it and,
+// at 0.869 of the cap, stalled four times in 180 s; at that ratio every
+// stream from 0.862 of the cap up pulls over it. It gets no modal because
+// the modal says "the file needs more than you have", and by its own numbers
+// it would read "5 → 4,9". Warning that band upfront is open: it needs
+// wording of its own (docs/warmup.md, Units).
+//
+// Until 2026-09-29 the cap was taken as 5,000,000 b/s, 0.954 of what the
+// limiter delivers: the modal fired for the top of that band (5,000,001 to
+// 5,295,308 b/s at 5M, reading "5.0 → 5.0" to "5.0 → 5.3") by the unit
+// error, not by design, and never for the rest of it (the 0.869 file got
+// none then either).
+func checkCachedRateLimit(c *web.Context, bitrate int64) (SlowDownloadData, bool) {
+	if c.ApiClaims == nil {
+		return SlowDownloadData{}, false
+	}
+	capMbps := statusview.RateMbps(c.ApiClaims.Rate)
+	if !statusview.OverCap(capMbps, statusview.BitsToMbps(float64(bitrate))) {
+		return SlowDownloadData{}, false
+	}
+	sdd := buildSlowDownloadData(c, statusview.RateBytesPerSec(c.ApiClaims.Rate), bitrate)
+	sdd.IsRateLimited = true
+	sdd.RateLimitMbps = capMbps
+	return sdd, true
+}
+
+// exportMeta returns an export item's meta, or a zero meta when the item is
+// absent or carries none, so callers never dereference a nil Meta.
+func exportMeta(it ra.ExportItem) ra.ExportMeta {
+	if it.Meta == nil {
+		return ra.ExportMeta{}
+	}
+	return *it.Meta
+}
+
+func contentProbeURL(downloadURL string) string {
+	if i := strings.IndexByte(downloadURL, '?'); i >= 0 {
+		return downloadURL[:i] + "~cp" + downloadURL[i:]
+	}
+	return downloadURL + "~cp"
+}
+
+func sessionBaseURL(streamURL string) (string, error) {
+	u, err := url.Parse(streamURL)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to parse stream URL")
+	}
+	idx := strings.Index(u.Path, "~hls/")
+	if idx < 0 {
+		return "", errors.New("stream URL does not contain ~hls/ suffix")
+	}
+	u.Path = u.Path[:idx] + "~hls"
+	return u.String(), nil
+}
+
+func sessionHLSURL(baseURL string, sessionID string) (string, error) {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to parse base URL")
+	}
+	u.Path += "/session/" + sessionID + "/index.m3u8"
+	return u.String(), nil
+}
+
+func sessionSeekURL(baseURL string, sessionID string) (string, error) {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to parse base URL")
+	}
+	u.Path += "/session/" + sessionID + "/seek"
+	return u.String(), nil
+}
+
+func (s *ActionScript) streamContent(ctx context.Context, j *job.Job, c *web.Context, resourceID string, itemID string, template string, settings *models.StreamSettings, vsud *models.VideoStreamUserData, dsd *embed.DomainSettingsData) (err error) {
+	sc := &StreamContent{
+		Settings:       settings,
+		ExternalData:   &models.ExternalData{},
+		DomainSettings: dsd,
+		StatusAnswered: s.forceSlow,
+		// Here, not with the render's other fields: the status marks read
+		// it (setStatusMarks), and a passthrough's are made again before
+		// those fields are set.
+		VideoStreamUserData: vsud,
+	}
+	// Dev-only short-circuit: render the slow_download / no_peers error
+	// modals without any rest-api work. Wired from the resource-page hash
+	// (`#action=stream&debug=slow_download|slow_download_bt|no_peers`);
+	// the handler gates on gin.Mode != release so this never fires in
+	// prod even if a client posts the field.
+	if strings.HasPrefix(s.debug, "error:") {
+		// Renders any user-facing error key in the job log for review, e.g.
+		// debug=error:error.transcode_failed — the classified failures are
+		// otherwise reachable only by finding a torrent that triggers them.
+		return web.NewUserError(strings.TrimPrefix(s.debug, "error:"), errors.New("debug error preview"))
+	}
+	switch s.debug {
+	case "slow_download":
+		// Cap-modal variant (IsRateLimited=true) — under grace=ON this
+		// branch is unreachable for free; debug is the only way to see it.
+		// Rate is force-pinned to 5 Mbps so the modal renders even for
+		// paid tiers whose real cap sits above the synthetic bitrate.
+		// TierName still comes from real claims so the rendered tier
+		// label matches the logged-in user.
+		sdd := SlowDownloadData{
+			MeasuredSpeedMbps: 5,
+			RequiredSpeedMbps: 10,
+			BitrateMbps:       10,
+			IsRateLimited:     true,
+			RateLimitMbps:     5,
+			TierName:          "free",
+		}
+		if c.Claims != nil && c.Claims.Context != nil && c.Claims.Context.Tier != nil && c.Claims.Context.Tier.Name != "" {
+			sdd.TierName = c.Claims.Context.Tier.Name
+		}
+		return &SlowDownloadError{Data: sdd}
+	case "slow_download_bt":
+		// BT-slow variant (IsRateLimited=false) — swarm-bottleneck path.
+		sdd := SlowDownloadData{
+			MeasuredSpeedMbps: 1,
+			RequiredSpeedMbps: 10,
+			BitrateMbps:       10,
+			IsRateLimited:     false,
+			TierName:          "free",
+		}
+		if c.Claims != nil && c.Claims.Context != nil && c.Claims.Context.Tier != nil && c.Claims.Context.Tier.Name != "" {
+			sdd.TierName = c.Claims.Context.Tier.Name
+		}
+		return &SlowDownloadError{Data: sdd}
+	case "swarm_demo":
+		// Plays the warm-up status line for review: eight seconds of a silent
+		// swarm with the countdown, eight seconds of a crawling download with
+		// the percent, then the slow verdict. No network involved.
+		const demoTarget = 2 * 1024 * 1024
+		j.InProgress(fmt.Sprintf("%v, %v", s.t("job.warmingUp"), s.tp("job.downloading", map[string]any{"Bytes": helpers.Bytes(demoTarget)})))
+		for i := 0; i < 16 && ctx.Err() == nil; i++ {
+			var line string
+			if i < 8 {
+				line = formatWarmupLine(s.tp, 0, demoTarget, time.Duration(60-i*5)*time.Second)
+			} else {
+				line = formatWarmupLine(s.tp, int64(i-7)*40*1024, demoTarget, 0)
+			}
+			j.StatusUpdate(line)
+			time.Sleep(time.Second)
+		}
+		return &NoPeersError{Reason: "slow", Peers: 7, Seeders: 2, Leechers: 5, Bytes: 320 * 1024, Elapsed: 120 * time.Second}
+	case "no_peers":
+		return &NoPeersError{Reason: "dead", Elapsed: 60 * time.Second}
+	case "no_peers_slow":
+		return &NoPeersError{Reason: "slow", Peers: 3, Seeders: 1, Leechers: 2, Bytes: 340 * 1024, Elapsed: 120 * time.Second}
+	case "no_peers_timeout":
+		return &NoPeersError{Reason: "timeout", Peers: 7, Seeders: 2, Leechers: 5, Bytes: 6 * 1024 * 1024, Elapsed: 180 * time.Second}
+	}
+	// Free-tier grace: attach rules to the outgoing primary claims BEFORE
+	// the export call so rest-api carries them into every signed URL token
+	// it returns. THP reads them off the segment-request token. See
+	// docs/grace_token.md.
+	graceMode := s.grace.Enabled && isFreeTier(c)
+	if graceMode {
+		s.applyGraceRules(sc, resourceID, c)
+		s.setCapCard(sc, c, dsd != nil)
+	}
+	j.InProgress(s.t("job.retrievingData"))
+	resCtx, resCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer resCancel()
+	resourceResponse, err := s.api.GetResource(resCtx, c.ApiClaims, resourceID)
+	if err != nil {
+		return errors.Wrap(err, "failed to retrieve resource")
+	}
+	j.Done()
+	sc.Resource = resourceResponse
+	j.InProgress(s.t("job.retrievingStreamUrl"))
+	exportCtx, exportCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer exportCancel()
+	exportResponse, err := s.api.ExportResourceContent(exportCtx, c.ApiClaims, resourceID, itemID, settings.ImdbID)
+	if err != nil {
+		return errors.Wrap(err, "failed to retrieve stream url")
+	}
+	j.Done()
+	sc.ExportTag = exportResponse.ExportItems["stream"].Tag
+	sc.Item = &exportResponse.Source
+
+	// Pull persisted enrichment once — drives both the player overlay
+	// title (prefer "Movie Title (2020)" over "S01E03.mkv") and the
+	// thumbnail-skip decision below (no point regenerating a worse
+	// preview when an IMDb poster already exists). Apply localized
+	// title/plot in-place so non-EN viewers see the matching language.
+	//
+	// Resolved against the exported file's path: a resource can hold
+	// several movie rows (multi-film pack), and the content type tells
+	// subtitleHints whether the id addresses a film or a show.
+	var enrichedMD *models.VideoMetadata
+	var enrichedCT models.ContentType
+	var titleRef *models.VideoRef
+	if s.enricher != nil {
+		emdCtx, emdCancel := context.WithTimeout(ctx, 5*time.Second)
+		enrichedMD, enrichedCT, _ = s.enricher.GetEnrichedResourceForPath(emdCtx, resourceID, exportResponse.Source.PathStr)
+		if enrichedMD != nil {
+			s.enricher.Localize(emdCtx, enrichedMD, c.Lang)
+		}
+		// Which episode this file is: a series title alone names eight
+		// files of a season identically, in the player's title bar, on the
+		// lock screen and in the share text (owner, 2026-09-20).
+		if enrichedMD != nil && enrichedCT == models.ContentTypeSeries {
+			titleRef, _ = s.enricher.ResolveVideoRef(emdCtx, resourceID, exportResponse.Source.PathStr)
+		}
+		emdCancel()
+	}
+	sc.Title = resourceLeafTitle(enrichedMD, titleRef, sc.Resource, sc.Item)
+
+	// Subtitle-ladder inputs. The feature flag and the embed widget are the
+	// master switch (subtitleOptsFor): with either in force the render must
+	// be byte-for-byte phase 1, so none of the reads that feed the ladder
+	// happen at all -- no profile language, no TMDB credits. On a
+	// deployment with the flag off this is two DB round trips per stream
+	// page that never run. (The adult bit is not one of them: see below.)
+	translateEnabled, isEmbed := s.prefs.TranslateEnabled(), dsd != nil
+	var preferred string
+	var castNames []string
+	// Read for every stream, embeds and flag-off deployments included: the
+	// imdb hint below names what the viewer is watching to a third party
+	// (OpenSubtitles), and an adult resource must not be named there (owner
+	// ruling 2026-09-18) — the same bit that hides the AI track and blurs
+	// the poster. The derived hint is built for embeds too, so the embed
+	// switch does not cover this read. Bounded like CastNames below: a
+	// slow metadata read must not hold up the stream page. The two
+	// consumers read a failed lookup differently: the AI track treats it
+	// as not adult (spec decision 13), the hint as adult — not naming a
+	// film costs a worse subtitle match, naming the wrong one is not
+	// undoable.
+	adult, hintWithheld := readAdultBit(ctx, s.prefs, resourceID)
+	if translateEnabled && !isEmbed {
+		preferred = s.prefs.PreferredContentLang(ctx, c.User, pickedLang(vsud), acceptLangTags(vsud), c.Lang)
+		// The same language decides the audio default: the template's
+		// getAudioTracks and the ladder's fallbacks read it off vsud.
+		if vsud != nil {
+			vsud.ResolvedLang = preferred
+		}
+		if enrichedMD != nil {
+			nCtx, nCancel := context.WithTimeout(ctx, 3*time.Second)
+			castNames = s.prefs.CastNames(nCtx, enrichedMD.VideoID, 30)
+			nCancel()
+		}
+	}
+	sc.SubtitleOpts = previewAsFree(subtitleOptsFor(translateEnabled, isEmbed, c, s.prefs.FreeForAll(), adult, preferred, castNames), s.debug)
+
+	se, ok := exportResponse.ExportItems["stream"]
+	if !ok {
+		// rest-api omits the stream item for files it cannot stream (no
+		// media format, .vtt). Dereferencing the zero item's Meta was the
+		// nil-pointer panic seen 5-7 times a day through 09.2026.
+		return errors.New("resource has no stream export")
+	}
+	seMeta := exportMeta(se)
+	noteCache(s.cacheIndex, resourceID, exportResponse.Source, seMeta.Cache)
+	// Whether the file goes to the transcoder, and its stream URL: rest-api's
+	// word by extension, until the probe says an MP4's audio does not play
+	// as nginx-vod serves it (vod_route.go).
+	transcode, streamURL := seMeta.Transcode, se.URL
+
+	var downloadSpeed float64
+	var quickElapsed time.Duration
+	fileSize := int(exportResponse.Source.Size)
+	warmupSize := halfCapped(streamWarmupSize, fileSize)
+	fullMeasureSize := halfCapped(bandwidthTestSize, fileSize)
+	downloadURL := exportResponse.ExportItems["download"].URL
+
+	// Step 1: Torrent warmup (skip for cached/vault content; also skipped on
+	// forceSlow — the user already accepted slow playback, so we save the warmup
+	// budget and let the transcoder pull cold instead).
+	//
+	// "Cached" has two sources: rest-api long-term cache (S3) via se.Meta.Cache
+	// AND a seeder pod that already holds our head+tail pieces locally (common
+	// in share flows). The fast-path probe — first event of the Stats SSE that
+	// warmUp opens for the UI peer-counter — detects the latter inline: on a
+	// hit warmUp returns immediately with cached=true and bandwidth-check
+	// routes through the plan-cap branch instead of using a never-measured
+	// downloadSpeed.
+	const tailWarmupBytes = 500 * 1024
+	statsURL := exportResponse.ExportItems["torrent_client_stat"].URL
+	effectiveCache := seMeta.Cache
+	if !effectiveCache {
+		if s.forceSlow {
+			j.Skip(s.t("job.warmingUp"))
+		} else {
+			// The quick warm-up. Its skipBytes is the whole range: here it
+			// is only warmUp's "a hard timeout with less than this is a dead
+			// torrent" threshold -- the same 10MB that rule has always used
+			// -- and the speed warmUp returns is not read. The speed that
+			// counts is the lower bound over the whole call.
+			var hit bool
+			quickStart := time.Now()
+			if _, hit, err = s.warmUp(ctx, j, s.t("job.warmingUp"), statsURL, fileSize, warmupSize, tailWarmupBytes, warmupSize, true, log.Fields{"phase": "quick"}); err != nil {
+				return
+			}
+			quickElapsed = time.Since(quickStart)
+			if hit {
+				effectiveCache = true
+			} else {
+				downloadSpeed = lowerBoundSpeed(warmupSize, quickElapsed)
+			}
+		}
+	}
+
+	// Step 2: Content probe via ~cp (before transcoder warmup)
+	j.InProgress(s.t("job.probingMedia"))
+	mpCtx, mpCancel := context.WithTimeout(ctx, 1*time.Minute)
+	defer mpCancel()
+	probeURL := contentProbeURL(downloadURL)
+	mp, probeErr := s.api.GetMediaProbe(mpCtx, probeURL)
+	if probeErr != nil {
+		if mpItem, ok := exportResponse.ExportItems["media_probe"]; ok {
+			// Second chance through rest-api's media_probe URL, on its own
+			// deadline (the shared one may be spent by the first try). The
+			// first error is the real cause and is kept: letting the
+			// fallback overwrite it meant every probe failure was logged as
+			// the fallback's own text — "404 page not found" for the six
+			// months that route was dead.
+			fbCtx, fbCancel := context.WithTimeout(ctx, 30*time.Second)
+			fbMp, fbErr := s.api.GetMediaProbe(fbCtx, mpItem.URL)
+			fbCancel()
+			if fbErr == nil {
+				mp, probeErr = fbMp, nil
+			} else {
+				probeErr = errors.Wrapf(probeErr, "media_probe fallback also failed (%v)", fbErr)
+			}
+		}
+	}
+	if probeErr != nil && seMeta.Transcode {
+		return errors.Wrap(probeErr, "failed to get probe data")
+	}
+	// An MP4 nginx-vod would serve and the browser cannot play goes to the
+	// transcoder (vod_route.go) -- decided without a probe too: a restart
+	// after the browser refused nginx-vod's stream must not land back on it
+	// because the probe failed (the transcoder probes for itself).
+	if !transcode && vsud != nil && exportResponse.Source.MediaFormat == ra.Video {
+		var probed *api.MediaProbe
+		if probeErr == nil {
+			probed = mp
+		}
+		if why := vodReroute(probed, vsud.DecodeRequest); why != "" {
+			if u, uerr := transcodeURLFromVOD(streamURL); uerr == nil {
+				transcode, streamURL = true, u
+				metrics.VODReroute(why)
+				log.WithFields(log.Fields{"reason": why, "decode": vsud.DecodeRequest.Decode}).Info("stream: MP4 sent to the transcoder instead of nginx-vod")
+			} else {
+				log.WithError(uerr).WithField("reason", why).Warn("stream: MP4 kept on nginx-vod, no transcoder URL for it")
+			}
+		}
+	}
+	if probeErr != nil {
+		log.WithError(probeErr).Warn("failed to get content probe")
+	} else {
+		sc.MediaProbe = mp
+		sc.CreditsAt = creditsFromChapters(mp)
+		s.setStatusMarks(sc, c, mp, transcode)
+		log.Infof("got media probe %+v", mp)
+	}
+	j.Done()
+
+	// Step 2.5: Resource thumbnail — fire-and-forget so the player isn't
+	// blocked. The service probes the picked video itself for the
+	// ffmpeg seek offset; consumed later by the OG-image endpoint when
+	// the user shares.
+	s.generateThumbnailAsync(c.ApiClaims, resourceID)
+
+	// Step 3: Bandwidth check.
+	//
+	// BT-slow path: when probe is needed (non-cached), we compare measured
+	// download speed against required bitrate. Even under grace mode this is
+	// kept — grace rate won't help if the user's own internet is the bottleneck.
+	// Two rates: the swarm is held against the file's own (fileRate,
+	// getVideoBitrate -- the seeder fetches every track), the plan's cap
+	// against what the player pulls (streamRate, capGateBitrate -- what thp
+	// caps, the rate the transfer status's "…and this file needs N" states).
+	//
+	// Cap-modal path (cached content + plan cap below bitrate): kept under
+	// flag-off, skipped under graceMode. Under grace, THP delivers the first
+	// DurationSec at full grace rate, and the soft CTA replaces the upfront
+	// modal as the conversion surface.
+	//
+	// On forceSlow we emit Skip instead of running the gate — the user already
+	// opted into slow playback.
+	if sc.MediaProbe != nil {
+		fileRate := getVideoBitrate(sc.MediaProbe)
+		// Falls back to fileRate, so it is known whenever fileRate is.
+		streamRate := capGateBitrate(sc.MediaProbe, transcode, vsud)
+		if streamRate > 0 {
+			if s.forceSlow {
+				j.Skip(s.t("job.checkingBandwidth"))
+			} else if effectiveCache && !graceMode {
+				j.InProgress(s.t("job.checkingBandwidth"))
+				if sdd, limited := checkCachedRateLimit(c, streamRate); limited {
+					return &SlowDownloadError{Data: sdd}
+				}
+				j.Done()
+			} else if !effectiveCache && downloadSpeed > 0 && fileRate > 0 {
+				// The quick warm-up gave a lower bound. A swarm that clears
+				// the bitrate even on that plays at once -- that is the
+				// whole saving. One that does not is either slow or merely
+				// took a while to find peers, and the two look the same from
+				// here: measure it the way this gate always has, over the
+				// full range. Those viewers wait what everyone waited before
+				// 2026-09-19, and no longer. The budget is what is left of
+				// the warm-up deadline, so a crawl is not given it twice.
+				if needsFullMeasure(downloadSpeed, fileRate, warmupSize, fullMeasureSize) {
+					left := time.Duration(s.warmup.TimeoutMin)*time.Minute - quickElapsed
+					if left < 30*time.Second {
+						left = 30 * time.Second
+					}
+					fullCtx, fullCancel := context.WithTimeout(ctx, left)
+					skipBytes := bandwidthSkipSize
+					if fullMeasureSize <= skipBytes {
+						skipBytes = 0
+					}
+					measured, hit, werr := s.warmUp(fullCtx, j, s.t("job.checkingBandwidth"), statsURL, fileSize, fullMeasureSize, tailWarmupBytes, skipBytes, true, log.Fields{"phase": "full", "bitrate": fileRate, "lower_bound": downloadSpeed})
+					fullCancel()
+					if werr != nil {
+						return werr
+					}
+					if hit {
+						// The pod turned out to hold the whole range (someone
+						// else's stream filled it in meanwhile): there is no
+						// swarm speed to judge, only the plan cap -- the
+						// cached branch above, arrived at late.
+						if !graceMode {
+							if sdd, limited := checkCachedRateLimit(c, streamRate); limited {
+								return &SlowDownloadError{Data: sdd}
+							}
+						}
+						downloadSpeed = 0
+					} else if measured > downloadSpeed {
+						// A lower bound stays a lower bound: a measurement
+						// below it (or empty -- one huge piece) is the
+						// counter's granularity, not the swarm. Both fail
+						// the gate either way; this only picks the truer
+						// number for the modal.
+						downloadSpeed = measured
+					}
+					// warmUp wrote and closed the "checking bandwidth" line.
+					if swarmTooSlow(downloadSpeed, fileRate) {
+						return &SlowDownloadError{Data: buildSlowDownloadData(c, downloadSpeed, fileRate)}
+					}
+				} else {
+					j.InProgress(s.t("job.checkingBandwidth"))
+					if swarmTooSlow(downloadSpeed, fileRate) {
+						return &SlowDownloadError{Data: buildSlowDownloadData(c, downloadSpeed, fileRate)}
+					}
+					j.Done()
+				}
+			}
+		}
+	}
+
+	// Step 4: Session transcoder (after bandwidth check)
+	if transcode && (exportResponse.Source.MediaFormat == ra.Video || exportResponse.Source.MediaFormat == ra.Audio) {
+		result, serr := s.bufferSessionHLS(ctx, j, streamURL, 30*time.Second, vsud.DecodeRequest)
+		if serr != nil {
+			return errors.Wrap(serr, "failed to buffer session HLS")
+		}
+		s.applySessionRoute(sc, c, result)
+		sc.ExportTag.Sources = []ra.ExportSource{{
+			Src:  result.HLSURL,
+			Type: "application/vnd.apple.mpegurl",
+		}}
+		sc.SessionSeekURL = result.SeekURL
+		if base, err := sessionBaseURL(streamURL); err == nil {
+			if u, perr := url.Parse(base); perr == nil {
+				u.Path += "/session/" + result.Session.ID
+				sc.SubtitleOpts.HLSSessionBase = u.String()
+			}
+		}
+	}
+	// What plays after this file (next_item.go). Not for the embed: there is
+	// no file list there to move through.
+	if dsd == nil {
+		sc.Next = s.resolveNextItem(ctx, c.ApiClaims, resourceID, sc.Item)
+	}
+	sc.UserSubtitlesEnabled = s.userSubtitles.Enabled()
+	sc.EIURL = se.URL
+	if exportResponse.Source.MediaFormat == ra.Video {
+		if s.userSubtitles.Enabled() && c.User != nil && c.User.HasAuth() {
+			usCtx, usCancel := context.WithTimeout(ctx, 10*time.Second)
+			// DB stores bindings keyed by Source.PathStr (matching the
+			// convention used by watch_history and the upload form).
+			// itemID here is ra.ListItem.ID, which is NOT the same.
+			list, listErr := s.userSubtitles.List(usCtx, c.User.ID, resourceID, exportResponse.Source.PathStr)
+			usCancel()
+			if listErr != nil {
+				log.WithError(listErr).Warn("failed to load user subtitles")
+			} else {
+				// Same mapper as the async reload after an upload or a
+				// delete (handlers/user_subtitle.buildView): a field only
+				// one of the two paths fills is a field the page loses on
+				// reload — SrcLang was exactly that, and without it every
+				// upload landed in the "Unknown" language group after F5.
+				sc.UserSubtitles = us.Tracks(list, func(sub *models.UserSubtitle) string {
+					return s.api.AttachExternalSubtitle(se, s.userSubtitles.PublicURL(sub.Hash, sub.OriginalName))
+				})
+			}
+		}
+		if subtitles, ok := exportResponse.ExportItems["subtitles"]; ok {
+			// debug=no-os (dev-only, see handlers/action): skip the
+			// OpenSubtitles lookup so a file with embedded tracks exercises
+			// the live translation path — with OpenSubtitles present a file
+			// source always wins over the embedded playlist.
+			if osEnabled, ok := settings.Features["opensubtitles"]; ((ok && osEnabled) || !ok) && s.debug != DebugNoOpenSubtitles {
+				j.InProgress(s.t("job.loadingSubtitles"))
+				osCtx, osCancel := context.WithTimeout(ctx, 30*time.Second)
+				defer osCancel()
+				var videoRef *models.VideoRef
+				if s.enricher != nil && !hintWithheld {
+					refCtx, refCancel := context.WithTimeout(ctx, 5*time.Second)
+					videoRef, _ = s.enricher.ResolveVideoRef(refCtx, resourceID, exportResponse.Source.PathStr)
+					refCancel()
+				}
+				subsURL := api.WithSubtitleHints(subtitles.URL, subtitleHints(settings.ImdbID, enrichedMD, enrichedCT, sc.Item, videoRef, hintWithheld))
+				subs, notReady, err := fetchOpenSubtitles(osCtx, s.api.GetOpenSubtitles, subsURL)
+				// notReady survives into the render even though err is
+				// set: the page goes out without OpenSubtitles tracks and
+				// is cached for ten minutes either way, so the one thing
+				// left is to keep "this file has none" and "we did not get
+				// to look" apart -- in the log, and on subtitle-resolved.
+				sc.SubtitlesNotReady = notReady
+				if notReady {
+					// The page is correct and goes out; it just has no
+					// OpenSubtitles rungs because the lookup never
+					// finished. Keeping it would hand that gap to every
+					// viewer of this file for the rest of the ten-minute
+					// bucket, long after the seeder warmed up.
+					j.DoNotCache()
+				}
+				if err != nil {
+					log.WithError(err).WithField("notReady", notReady).
+						WithField("resource", s.resourceId).Warn("failed to get opensubtitles")
+					j.Warn(errors.Wrap(err, "failed to get OpenSubtitles"))
+				} else {
+					sc.OpenSubtitles = subs
+					j.Done()
+				}
+			}
+		}
+	}
+	if settings.Poster != "" {
+		sc.ExternalData.Poster = s.api.AttachExternalFile(se, settings.Poster)
+	}
+	for _, v := range settings.Subtitles {
+		sc.ExternalData.Tracks = append(sc.ExternalData.Tracks, models.ExternalTrack{
+			Src:     s.api.AttachExternalSubtitle(se, v.Src),
+			Label:   v.Label,
+			SrcLang: v.SrcLang,
+			Default: v.Default != nil,
+		})
+	}
+
+	err = s.renderActionTemplate(j, c, sc, template)
+	if err != nil {
+		return errors.Wrap(err, "failed to render resource")
+	}
+	j.InProgress(s.t("job.waitingPlayer"))
+	return
+}
+
+// generateThumbnailAsync fires a background goroutine that generates a
+// share-preview poster for the resource. Non-blocking and silent — the
+// stream/download flow continues immediately and never surfaces the
+// step in the job UI. Consumed later by the OG-image endpoint when the
+// user shares.
+//
+// Self-contained: the goroutine re-checks for an IMDb poster (skipping
+// the thumbnail entirely when one exists) and the thumbnail service
+// itself probes the picked video for duration before seeking. Callers
+// don't need to feed in probe results or pre-loaded enrichment.
+//
+// Detached from the request context with a 2-minute budget so a cold
+// torrent + ffmpeg seek can finish even after the player template has
+// already rendered and the job has closed.
+func (s *ActionScript) generateThumbnailAsync(claims *api.Claims, resourceID string) {
+	if !s.thumbnail.Enabled() {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if s.enricher != nil {
+			if md, _ := s.enricher.GetEnrichedResource(ctx, resourceID); md != nil && md.PosterURL != "" {
+				return
+			}
+		}
+		if _, err := s.thumbnail.Generate(ctx, claims, resourceID); err != nil {
+			if !errors.Is(err, thumb.ErrNoSource) {
+				log.WithError(err).WithField("resource_id", resourceID).
+					Warn("background thumbnail generation failed")
+			}
+		}
+	}()
+}
+
+func (s *ActionScript) previewImage(ctx context.Context, j *job.Job, c *web.Context, resourceID string, itemID string, settings *models.StreamSettings, vsud *models.VideoStreamUserData, dsd *embed.DomainSettingsData) error {
+	return s.streamContent(ctx, j, c, resourceID, itemID, "preview_image", settings, vsud, dsd)
+}
+
+func (s *ActionScript) streamAudio(ctx context.Context, j *job.Job, c *web.Context, resourceID string, itemID string, settings *models.StreamSettings, vsud *models.VideoStreamUserData, dsd *embed.DomainSettingsData) error {
+	return s.streamContent(ctx, j, c, resourceID, itemID, "stream_audio", settings, vsud, dsd)
+}
+
+func (s *ActionScript) streamVideo(ctx context.Context, j *job.Job, c *web.Context, resourceID string, itemID string, settings *models.StreamSettings, vsud *models.VideoStreamUserData, dsd *embed.DomainSettingsData) error {
+	return s.streamContent(ctx, j, c, resourceID, itemID, "stream_video", settings, vsud, dsd)
+}
+
+func (s *ActionScript) renderActionTemplate(j *job.Job, c *web.Context, data any, name string) error {
+	actionTemplate := "action/" + name
+	tpl := s.tb.Build(actionTemplate).WithLayoutBody(`{{ template "main" . }}`)
+	str, err := tpl.ToString(c.WithData(data))
+	if err != nil {
+		return err
+	}
+	j.RenderTemplate("rendering action", actionTemplate, strings.TrimSpace(str))
+	return nil
+}
+
+type FileDownload struct {
+	URL      string
+	TierName string
+	// RateMbps is the viewer's download cap (0 = unlimited or unknown) and
+	// SizeBytes what this link downloads (0 = unknown); together they price
+	// the download in time against the promo plan (offer.DownloadPitch).
+	RateMbps  int
+	SizeBytes int64
+	// Cached: the file is already whole on our side, so the viewer's cap is
+	// the only thing setting the pace — the nudge may promise the full
+	// speed-up. Otherwise the swarm can be slower than any plan, and the
+	// promise is "up to".
+	Cached bool
+	// ZipWarning surfaces the CRC note for on-the-fly ZIP archives: they
+	// carry no per-file checksums, so picky unpackers may warn. TAR (the
+	// default) has no such problem.
+	ZipWarning bool
+	// IsArchive: the link is an on-the-fly directory archive. Nothing on our
+	// side sees the download after this point, so the view says what the user
+	// can rely on: the archive is built as it streams and can be resumed.
+	IsArchive bool
+}
+
+type NoPeersData struct {
+	TierName string
+	// Reason and the counters come from NoPeersError (see there); Reason is
+	// "timeout" for a bare context deadline with no swarm facts at all.
+	Reason     string
+	Peers      int
+	Seeders    int
+	Leechers   int
+	Bytes      string
+	BytesRaw   int64
+	ElapsedSec int
+	// Form-resubmit context for "try again", same shape as SlowDownloadData.
+	Action        string
+	Endpoint      string
+	ResourceID    string
+	ItemID        string
+	LogTargetID   string
+	ArchiveFormat string
+	SelectedPaths []string
+}
+
+func (s *ActionScript) download(ctx context.Context, j *job.Job, c *web.Context, resourceID string, itemID string) (err error) {
+	j.InProgress(s.t("job.retrievingDownloadLink"))
+	exportCtx, exportCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer exportCancel()
+	resp, err := s.api.ExportResourceContentWithArchiveFormat(exportCtx, c.ApiClaims, resourceID, itemID, "", s.archiveFormat, s.selectedPaths)
+	if err != nil {
+		return errors.Wrap(err, "failed to retrieve download link")
+	}
+	j.Done()
+	de := resp.ExportItems["download"]
+	//url := de.URL
+	// A directory download has no file of its own to index (noteCache skips it).
+	noteCache(s.cacheIndex, resourceID, resp.Source, exportMeta(de).Cache)
+	if !exportMeta(de).Cache {
+		const downloadHeadWarmup = 1024 * 1024
+		statsURL := resp.ExportItems["torrent_client_stat"].URL
+		fileSize := int(resp.Source.Size)
+		// Silent fast-path: warmUp opens Stats and short-circuits on its own
+		// when the pod already holds the head pieces — no separate probe call.
+		if _, _, err := s.warmUp(ctx, j, s.t("job.warmingUp"), statsURL, fileSize, downloadHeadWarmup, 0, 0, true, log.Fields{"phase": "download"}); err != nil {
+			return err
+		}
+	}
+	j.DoneWithMessage(s.t("job.downloadReady"))
+	// Fire-and-forget poster generation so a shared download link has
+	// artwork on Telegram/iMessage. The service handles duration probing
+	// internally.
+	s.generateThumbnailAsync(c.ApiClaims, resourceID)
+	tpl := s.tb.Build("action/download_file").WithLayoutBody(`{{ template "main" . }}`)
+	tierName := "free"
+	rate := 0
+	if c.Claims != nil {
+		if c.Claims.Claims != nil && c.Claims.Claims.Connection != nil && c.Claims.Claims.Connection.Rate != nil {
+			rate = int(*c.Claims.Claims.Connection.Rate)
+		}
+		if c.Claims.Context != nil && c.Claims.Context.Tier != nil && c.Claims.Context.Tier.Name != "" {
+			tierName = c.Claims.Context.Tier.Name
+		}
+	}
+	// A partial archive is some of the directory: its size is unknown here,
+	// and quoting the whole directory's wait would overstate it.
+	var size int64
+	if len(s.selectedPaths) == 0 {
+		size = int64(resp.Source.Size)
+	}
+	fd := &FileDownload{
+		URL:        de.URL,
+		TierName:   tierName,
+		RateMbps:   rate,
+		SizeBytes:  size,
+		Cached:     exportMeta(de).Cache,
+		ZipWarning: s.archiveFormat == "zip",
+		IsArchive:  s.archiveFormat != "",
+	}
+	str, err := tpl.ToString(c.WithData(fd))
+	if err != nil {
+		return err
+	}
+	j.CustomWithData("action/download_file", strings.TrimSpace(str), fd)
+	metrics.DownloadReady(s.archiveFormat != "", exportMeta(de).Cache)
+	return
+}
+
+// piecesCoverRange returns true when every piece touching [0..head) ∪
+// [size-tail..size) carries Complete=true in the SSE event. Head/tail piece
+// counts are rounded up; overlap (small files where head+tail ≥ size) is
+// handled by clamping the tail start at headPieces.
+func piecesCoverRange(ev api.EventData, fileSize, head, tail int) bool {
+	n := len(ev.Pieces)
+	if n == 0 || fileSize <= 0 {
+		return false
+	}
+	pieceSize := fileSize / n
+	if fileSize%n != 0 {
+		pieceSize++
+	}
+	if pieceSize <= 0 {
+		return false
+	}
+	if head > fileSize {
+		head = fileSize
+	}
+	if tail > fileSize {
+		tail = fileSize
+	}
+
+	headPieces := 0
+	if head > 0 {
+		headPieces = (head + pieceSize - 1) / pieceSize
+		if headPieces > n {
+			headPieces = n
+		}
+	}
+	for i := 0; i < headPieces; i++ {
+		if !ev.Pieces[i].Complete {
+			return false
+		}
+	}
+	if tail > 0 {
+		tailPieces := (tail + pieceSize - 1) / pieceSize
+		if tailPieces > n {
+			tailPieces = n
+		}
+		start := n - tailPieces
+		if start < headPieces {
+			start = headPieces
+		}
+		for i := start; i < n; i++ {
+			if !ev.Pieces[i].Complete {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// warmUp's trace goes into its "warmup measured" line: the phase, and what
+// the caller knows that warmUp does not (the bitrate, the lower bound).
+func (s *ActionScript) warmUp(ctx context.Context, j *job.Job, m string, su string, size int, limitStart int, limitEnd int, skipBytes int, useStatus bool, trace log.Fields) (downloadSpeed float64, cached bool, err error) {
+	if limitStart > size {
+		limitStart = size
+	}
+	if limitEnd > size-limitStart {
+		limitEnd = size - limitStart
+	}
+	warmupCtx, warmupCancel := context.WithTimeout(ctx, time.Duration(s.warmup.TimeoutMin)*time.Minute)
+	defer warmupCancel()
+
+	var peerCount atomic.Int32
+	var noPeersFlag atomic.Bool
+	// statsEverSeen flips on the first SSE statupdate from torrent-web-seeder.
+	// The watchdog requires this before firing the no-peers predicate so a
+	// late SSE stream (cold-started seeder pod, proxy hop) cannot be
+	// misread as "no peers" — absence of stats is not evidence of absence
+	// of peers.
+	var statsEverSeen atomic.Bool
+
+	// Stats SSE: one subscription per warmUp invocation. The first statupdate
+	// doubles as the seeder fast-path probe (its pieces array reflects what
+	// the pod has locally); subsequent events feed the UI peer counter.
+	// Opening Stats twice (probe + UI) previously doubled the 1 MB scanner
+	// buffer churn and pushed prod pods into OOM under load — see docs/warmup.md.
+	var statsCh chan api.EventData
+	var probeEvent api.EventData
+	var probeHadEvent bool
+	if useStatus && su != "" {
+		ch, statsErr := s.api.Stats(warmupCtx, su)
+		if statsErr != nil {
+			// rest-api signals fully-cached content with 404 on torrent_client_stat
+			// (see handlers/resource/status.go:329). api.Stats wraps that as
+			// errors.New("cached"). Should normally not fire here because the
+			// caller already gated on se.Meta.Cache, but treat as a hit either way.
+			if statsErr.Error() == "cached" {
+				cached = true
+				return
+			}
+			log.WithError(statsErr).Error("failed to get stats")
+		} else {
+			statsCh = ch
+		}
+	}
+
+	// Fast-path probe: read the first event (if any) within
+	// SeederProbeTimeoutSec. If all pieces covering [0..limitStart) ∪
+	// [size-limitEnd..size) are Complete on the pod, return cached=true and
+	// skip the actual warmup. forceSlow callsites never reach here.
+	if statsCh != nil && s.warmup.SeederProbeTimeoutSec > 0 && size > 0 {
+		probeCtx, probeCancel := context.WithTimeout(warmupCtx, time.Duration(s.warmup.SeederProbeTimeoutSec)*time.Second)
+		select {
+		case ev, ok := <-statsCh:
+			if ok {
+				probeEvent = ev
+				probeHadEvent = true
+				if piecesCoverRange(ev, size, limitStart, limitEnd) {
+					probeCancel()
+					cached = true
+					log.WithField("file_size", size).
+						WithField("head_bytes", limitStart).
+						WithField("tail_bytes", limitEnd).
+						WithField("pieces", len(ev.Pieces)).
+						Info("seeder probe hit: skipping warmup")
+					return
+				}
+			}
+		case <-probeCtx.Done():
+			// No event before deadline — fall through to full warmup with the
+			// same Stats subscription still live for the UI goroutine below.
+		}
+		probeCancel()
+	}
+
+	// Warmup-SSE bookkeeping: the seeder's ?warmup endpoint bumps
+	// PiecePriorityHigh on every piece overlapping the requested range
+	// and streams api.WarmupEvent once per second. Stream close = warmup
+	// done. We open head and tail in parallel so both priority bumps land
+	// up front and anacrolix can parallelise peer requests across both
+	// ranges; the speed estimate is computed off the combined counter.
+	//
+	// The verdicts and the speed the gate reads stay on the verified
+	// counter. have/span (a seeder since 2026-10) drive what the viewer
+	// reads -- the line's percent and the no-peers card's "received" -- and
+	// a shadow speed in the "warmup measured" line, until its numbers say
+	// whether the gate should read it (docs/warmup.md).
+	var (
+		head, tail         warmStream
+		headEventsReceived atomic.Bool
+		verified, have     speedLatch
+	)
+	totalDownloaded := func() int64 {
+		return head.verified.Load() + tail.verified.Load()
+	}
+	warmupTarget := int64(limitStart + limitEnd)
+	// haveSpan is have of span over both ranges, once each range opened has
+	// sent them; ok false with a seeder that does not (nor while a range's
+	// first frame is still on its way, nor after its stream failed to open).
+	haveSpan := func() (h, sp int64, ok bool) {
+		hs, ts := head.span.Load(), tail.span.Load()
+		if (limitStart > 0 && hs <= 0) || (limitEnd > 0 && ts <= 0) || hs+ts <= 0 {
+			return 0, 0, false
+		}
+		return head.have.Load() + tail.have.Load(), hs + ts, true
+	}
+	// progress is what has arrived, and of what, for the viewer: have of
+	// span, else the verified bytes of the range.
+	progress := func() (int64, int64) {
+		if h, sp, ok := haveSpan(); ok {
+			return h, sp
+		}
+		return totalDownloaded(), warmupTarget
+	}
+	// updateMeasure latches the speed-measurement windows once their
+	// counters cross skipBytes — same slow-start skip the old
+	// io.Copy-based path used, just driven off the SSE counters.
+	updateMeasure := func() {
+		verified.update(totalDownloaded(), int64(skipBytes))
+		if h, _, ok := haveSpan(); ok {
+			have.update(h, int64(skipBytes))
+		}
+	}
+
+	warmupStart := time.Now()
+
+	// Swarm facts for the no-peers verdict. Seeders and leechers come from the
+	// seeder's stats events; Peers is the older combined count and the
+	// fallback when a seeder reports neither.
+	var seederCount, leecherCount atomic.Int32
+	const earlyMinBytes = 1 * 1024 * 1024
+	noPeersAfter := time.Duration(s.warmup.NoPeersTimeoutSec) * time.Second
+	slowPeersAfter := time.Duration(s.warmup.SlowPeersTimeoutSec) * time.Second
+	// updateWarmupLine rewrites the job's status line: the seconds left before
+	// the no-peers verdict while nothing has arrived, the percent of the
+	// warm-up (progress) once bytes flow — the same shape as buffering's
+	// "37%". By the verified counter alone a range inside one 16 MiB piece
+	// read nothing until the piece was whole: a countdown to "no peers"
+	// while the data came.
+	// Seeders, leechers and speed are not repeated here: the resource badge
+	// and the piece bar carry them, and the no-peers card gets the counts
+	// when they matter. Called from the stats goroutine on every event and
+	// from the watchdog every tick, so the countdown keeps moving on a silent
+	// swarm.
+	updateWarmupLine := func() {
+		if !useStatus {
+			return
+		}
+		bytes, of := progress()
+		var left time.Duration
+		if bytes == 0 {
+			left = noPeersAfter - time.Since(warmupStart)
+		}
+		if line := formatWarmupLine(s.tp, bytes, of, left); line != "" {
+			j.StatusUpdate(line)
+		}
+	}
+	// Probe missed: announce the step and start the UI peer-count goroutine.
+	if size > 0 {
+		downloading := s.tp("job.downloading", map[string]any{
+			"Bytes": helpers.Bytes(uint64(limitStart + limitEnd)),
+		})
+		j.InProgress(fmt.Sprintf("%v, %v", m, downloading))
+	} else {
+		j.InProgress(m)
+	}
+
+	if useStatus {
+		j.StatusUpdate(s.t("job.waitingForPeers"))
+		// If the probe already consumed event #1 (just with pieces incomplete),
+		// surface its peer count now so the UI isn't blank until event #2.
+		if probeHadEvent {
+			statsEverSeen.Store(true)
+			peerCount.Store(int32(probeEvent.Peers))
+			seederCount.Store(int32(probeEvent.Seeders))
+			leecherCount.Store(int32(probeEvent.Leechers))
+			updateWarmupLine()
+		}
+		if statsCh != nil {
+			go func() {
+				for {
+					select {
+					case ev, ok := <-statsCh:
+						if !ok {
+							return
+						}
+						statsEverSeen.Store(true)
+						peerCount.Store(int32(ev.Peers))
+						seederCount.Store(int32(ev.Seeders))
+						leecherCount.Store(int32(ev.Leechers))
+						updateWarmupLine()
+					case <-warmupCtx.Done():
+						return
+					}
+				}
+			}()
+		}
+	}
+
+	// Watchdog: surface no_peers CTA early instead of waiting the full warmup
+	// deadline. Two thresholds (both configurable via env):
+	//   - WARMUP_NO_PEERS_TIMEOUT_SEC + zero bytes + zero peers — torrent has
+	//     no peers at all. Gated on statsEverSeen so we don't conflate a slow
+	//     SSE stream (cold-start seeder, premium-edge buffering) with absence
+	//     of peers; if no statupdate has arrived we fall through to the slow
+	//     peers branch which measures throughput directly.
+	//   - WARMUP_SLOW_PEERS_TIMEOUT_SEC + bytes < earlyMinBytes — peers serve,
+	//     but the rate is so low (<17 KB/s avg for 1 MB threshold) that probe
+	//     will hang on its own 1-min deadline anyway. Surface CTA now instead
+	//     of waiting.
+	var noPeersReason atomic.Value // string: "dead" | "slow"
+	// The card's "N received" is progress, as the line's percent: by the
+	// verified bytes, "70%" was followed by "0 B received from 5 peers".
+	snapshot := func(reason string) *NoPeersError {
+		received, _ := progress()
+		return &NoPeersError{
+			Reason:   reason,
+			Peers:    int(peerCount.Load()),
+			Seeders:  int(seederCount.Load()),
+			Leechers: int(leecherCount.Load()),
+			Bytes:    received,
+			Elapsed:  time.Since(warmupStart),
+		}
+	}
+	go func() {
+		// One second, not five: the tick also redraws the status line (the
+		// countdown, then the percent), and a countdown that jumps by fives
+		// reads as stuck. The work per tick is a few atomic loads.
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-warmupCtx.Done():
+				return
+			case <-ticker.C:
+				bytes := totalDownloaded()
+				elapsed := time.Since(warmupStart)
+				if elapsed > noPeersAfter && bytes == 0 && peerCount.Load() == 0 && statsEverSeen.Load() {
+					noPeersReason.Store("dead")
+					noPeersFlag.Store(true)
+					warmupCancel()
+					return
+				}
+				if elapsed > slowPeersAfter && bytes < earlyMinBytes {
+					noPeersReason.Store("slow")
+					noPeersFlag.Store(true)
+					warmupCancel()
+					return
+				}
+				if statsEverSeen.Load() || bytes > 0 {
+					updateWarmupLine()
+				}
+			}
+		}
+	}()
+
+	var (
+		wg          sync.WaitGroup
+		headOpenErr atomic.Bool
+	)
+	if limitStart > 0 && su != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ch, werr := s.api.Warmup(warmupCtx, su, 0, int64(limitStart)-1)
+			if werr != nil {
+				// Head SSE open failed (proxy hop, seeder 500, file-not-found
+				// 404, etc). Not fatal — the transcoder/HTTP path will pull
+				// the head cold; the watchdog still surfaces no_peers if the
+				// torrent is actually dead. Just record that we couldn't open
+				// so we don't mis-classify "no events" as a vault/cache hit.
+				log.WithError(werr).Warn("warmup head failed")
+				headOpenErr.Store(true)
+				return
+			}
+			for ev := range ch {
+				headEventsReceived.Store(true)
+				head.take(ev)
+				updateMeasure()
+			}
+		}()
+	}
+	if limitEnd > 0 && su != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ch, werr := s.api.Warmup(warmupCtx, su, int64(size-limitEnd), -1)
+			if werr != nil {
+				// Tail prefetch is best-effort (used for seek warmup); don't fail.
+				log.WithError(werr).Warn("warmup tail failed")
+				return
+			}
+			for ev := range ch {
+				tail.take(ev)
+				updateMeasure()
+			}
+		}()
+	}
+	var (
+		closedAt time.Time
+		cut      error
+	)
+	// One line per warm-up that got as far as its streams, whatever the
+	// verdict: the verified and the chunk-level speeds side by side, the
+	// numbers phase 2b of docs/warmup.md waits for.
+	defer func() {
+		if cached {
+			return // the empty-SSE hit has its own line, and nothing measured
+		}
+		outcome := "done"
+		var npe *NoPeersError
+		switch {
+		case errors.As(err, &npe):
+			outcome = npe.Reason
+		case cut != nil:
+			outcome = "cut" // the hard deadline, or the caller gone
+		}
+		h, sp, _ := haveSpan()
+		data := totalDownloaded()
+		f := log.Fields{
+			"job":            j.ID,
+			"outcome":        outcome,
+			"elapsed":        closedAt.Sub(warmupStart),
+			"target":         warmupTarget,
+			"span":           sp,
+			"data":           data,
+			"have":           h,
+			"data0":          verified.start(),
+			"have0":          have.start(),
+			"speed_verified": verified.speed(data, warmupStart, closedAt),
+			"speed_have":     have.speed(h, warmupStart, closedAt),
+		}
+		// hash_wait: from the moment every covering piece had arrived to
+		// the close, which waits for them to pass the hash check.
+		hf, tf := head.fullNs.Load(), tail.fullNs.Load()
+		if cut == nil && (limitStart <= 0 || hf > 0) && (limitEnd <= 0 || tf > 0) && max(hf, tf) > 0 {
+			f["hash_wait"] = closedAt.Sub(time.Unix(0, max(hf, tf)))
+		}
+		log.WithFields(trace).WithFields(f).Info("warmup measured")
+	}()
+	wg.Wait()
+	closedAt, cut = time.Now(), warmupCtx.Err()
+
+	if noPeersFlag.Load() {
+		reason, _ := noPeersReason.Load().(string)
+		if reason == "" {
+			reason = "dead"
+		}
+		return 0, false, snapshot(reason)
+	}
+
+	// Vault/cache fast-path: the seeder short-circuits ?warmup with a
+	// 200 + empty SSE body when the file is fully available via vault or
+	// local file-cache (see web_seeder.serveWarmup). We detect that as
+	// "head SSE opened cleanly and closed without emitting any data event"
+	// and treat the content as cached — the bandwidth check then routes
+	// through the cap-modal branch (plan-cap vs bitrate) instead of the
+	// BT-slow branch that needs a measured downloadSpeed we never got.
+	// headOpenErr is the discriminator: zero events from an SSE that never
+	// opened is just an upstream failure, not a vault hit.
+	if limitStart > 0 && su != "" && !headEventsReceived.Load() && !headOpenErr.Load() && warmupCtx.Err() == nil {
+		cached = true
+		log.WithField("file_size", size).
+			WithField("head_bytes", limitStart).
+			WithField("tail_bytes", limitEnd).
+			Info("seeder vault/cache hit: empty warmup SSE")
+		return
+	}
+
+	final := totalDownloaded()
+	downloadSpeed = verified.speed(final, warmupStart, closedAt)
+
+	if errors.Is(warmupCtx.Err(), context.DeadlineExceeded) {
+		// Hard warmup timeout. If we didn't even reach the measurement window
+		// (skipBytes), the torrent is effectively dead — probe will hang on
+		// its own deadline too. Surface no_peers immediately. Otherwise pass
+		// the measured speed to probe + bandwidth-check.
+		if final < int64(skipBytes) {
+			log.WithField("elapsed", time.Since(warmupStart)).
+				WithField("bytes", final).
+				Warn("warmup hard timeout, insufficient data — surfacing no_peers")
+			return 0, false, snapshot("timeout")
+		}
+		log.WithField("elapsed", time.Since(warmupStart)).
+			WithField("bytes", final).
+			WithField("speed_bps", downloadSpeed).
+			Warn("warmup hard timeout, continuing with partial measurement")
+	}
+
+	j.Done()
+	return
+}
+
+type ActionScript struct {
+	api           *api.Api
+	c             *web.Context
+	i18n          *i18n.Service
+	userSubtitles *us.Service
+	thumbnail     *thumb.Service
+	enricher      *enrich.Enricher
+	prefs         *streamprefs.Service
+	cacheIndex    CacheIndexer // cache_note.go; nil is fine
+	resourceId    string
+	itemId        string
+	action        string
+	tb            template.Builder[*web.Context]
+	settings      *models.StreamSettings
+	vsud          *models.VideoStreamUserData
+	dsd           *embed.DomainSettingsData
+	warmup        WarmupSettings
+	grace         GraceSettings
+	forceSlow     bool
+	debug         string
+	archiveFormat string
+	selectedPaths []string
+}
+
+// setStatusMarks puts on sc what the transfer status needs to know of the
+// probed file against the viewer's cap (StatusStallSub, StatusFitsCap,
+// StatusOverCap), which the player element carries to the page. The rate
+// compared is what the player pulls (playedBitrate), not the file's own:
+// the audio as the start's declaration has the transcoder make it, of the
+// track the player starts on (sc.VideoStreamUserData).
+func (s *ActionScript) setStatusMarks(sc *StreamContent, c *web.Context, mp *api.MediaProbe, transcoded bool) {
+	s.setRoutedStatusMarks(sc, c, mp, transcoded, false)
+}
+
+// setRoutedStatusMarks is setStatusMarks once the session's route is known:
+// videoCopied for a route that hands the browser the source's video as it
+// is (playedBitrateRouted).
+func (s *ActionScript) setRoutedStatusMarks(sc *StreamContent, c *web.Context, mp *api.MediaProbe, transcoded bool, videoCopied bool) {
+	bps, ceiling := playedBitrateRouted(mp, transcoded, videoCopied, sc.VideoStreamUserData)
+	sc.StatusStallSub = s.statusStallSub(c, bps)
+	// What it pulls not known, a bound on it can still say it fits; never
+	// that it is over, nor what it needs.
+	sc.StatusFitsCap = statusFitsCap(c, bps) || bps == 0 && statusFitsCap(c, ceiling)
+	sc.StatusOverCap = statusOverCap(c, bps)
+}
+
+// statusStallSub is StreamContent.StatusStallSub for the viewer of c: their
+// cap from the claims, worded for whether they pay, and what the played
+// stream needs, bps bits a second (0 unknown; the part the status stream
+// cannot know). The render it lands in is cached per role, language and
+// session (Action), so the wording is theirs.
+func (s *ActionScript) statusStallSub(c *web.Context, bps int64) string {
+	if c == nil || c.ApiClaims == nil || s.i18n == nil {
+		return ""
+	}
+	return statusview.StallSub(s.i18n.Localizer(c.Lang), c.Lang, !isFreeTier(c),
+		statusview.RateMbps(c.ApiClaims.Rate), statusview.BitsToMbps(float64(bps)))
+}
+
+// statusFitsCap is StreamContent.StatusFitsCap for the viewer of c and a
+// played stream of bps bits a second.
+func statusFitsCap(c *web.Context, bps int64) bool {
+	if c == nil || c.ApiClaims == nil {
+		return false
+	}
+	return statusview.FitsCap(statusview.RateMbps(c.ApiClaims.Rate), statusview.BitsToMbps(float64(bps)))
+}
+
+// statusOverCap is StreamContent.StatusOverCap for the viewer of c and a
+// played stream of bps bits a second.
+func statusOverCap(c *web.Context, bps int64) bool {
+	if c == nil || c.ApiClaims == nil {
+		return false
+	}
+	return statusview.OverCap(statusview.RateMbps(c.ApiClaims.Rate), statusview.BitsToMbps(float64(bps)))
+}
+
+func (s *ActionScript) t(key string) string {
+	return i18n.TranslateWithLocalizer(s.i18n.Localizer(s.c.Lang), key)
+}
+
+func (s *ActionScript) tp(key string, data map[string]any) string {
+	return i18n.TranslateWithLocalizerData(s.i18n.Localizer(s.c.Lang), key, data)
+}
+
+func (s *ActionScript) Run(ctx context.Context, j *job.Job) (err error) {
+	switch s.action {
+	case "download":
+		return s.download(ctx, j, s.c, s.resourceId, s.itemId)
+	case "download-dir":
+		return s.download(ctx, j, s.c, s.resourceId, s.itemId)
+	case "preview-image":
+		return s.previewImage(ctx, j, s.c, s.resourceId, s.itemId, s.settings, s.vsud, s.dsd)
+	case "stream-audio":
+		return s.streamAudio(ctx, j, s.c, s.resourceId, s.itemId, s.settings, s.vsud, s.dsd)
+	case "stream-video":
+		return s.streamVideo(ctx, j, s.c, s.resourceId, s.itemId, s.settings, s.vsud, s.dsd)
+	case "file-info":
+		return s.fileInfo(ctx, j, s.c, s.resourceId, s.itemId)
+	}
+	return
+}
+
+type ErrorWrapperScript struct {
+	tb            template.Builder[*web.Context]
+	Script        job.Runnable
+	c             *web.Context
+	action        string
+	resourceId    string
+	itemId        string
+	archiveFormat string
+	selectedPaths []string
+	purge         bool
+}
+
+// actionEndpoint maps the internal action id to the public POST route the
+// "Continue at slow speed" form re-submits to. Kept in the wrapper because it
+// is the layer that knows about HTTP route names; ActionScript itself is
+// transport-agnostic.
+func actionEndpoint(action string) string {
+	switch action {
+	case "stream-video":
+		return "/stream-video"
+	case "stream-audio":
+		return "/stream-audio"
+	case "preview-image":
+		return "/preview-image"
+	case "download":
+		return "/download-file"
+	case "file-info":
+		return "/file-info"
+	}
+	return ""
+}
+
+// resubmitContext fills in what the slow-download modal's "watch as is"
+// form posts back: the endpoint, the file, the archive options, and whether
+// the start asked past the job cache (Purge).
+func (s *ErrorWrapperScript) resubmitContext(d *SlowDownloadData) {
+	d.Action = s.action
+	d.Endpoint = actionEndpoint(s.action)
+	d.ResourceID = s.resourceId
+	d.ItemID = s.itemId
+	d.ArchiveFormat = s.archiveFormat
+	d.SelectedPaths = s.selectedPaths
+	d.Purge = s.purge
+	d.LogTargetID = s.logTargetID()
+}
+
+// logTargetID: the log the start's card rendered into, which its resubmit
+// lands in again. The file card's buttons wire data-async-target to
+// "#log-{ItemID}" (MakeButton: ButtonItem.ID = Item.ID), except a file's
+// Download, which reports into its dialog's "#log-{ItemID}-download"
+// (partials/button.html, file.html): into the card's log, its "Try again"
+// replaced the player playing there. File info reports into its own dialog's
+// "#log-{ItemID}-info" for the same reason. A directory's TAR/ZIP is a
+// download too, always with an archive format, into list.html's
+// "#log-{ItemID}".
+func (s *ErrorWrapperScript) logTargetID() string {
+	if s.action == "download" && s.archiveFormat == "" {
+		return s.itemId + "-download"
+	}
+	if s.action == "file-info" {
+		return s.itemId + "-info"
+	}
+	return s.itemId
+}
+
+func (s *ErrorWrapperScript) Run(ctx context.Context, j *job.Job) (err error) {
+	err = s.Script.Run(ctx, j)
+	if sde, ok := err.(*SlowDownloadError); ok {
+		s.resubmitContext(&sde.Data)
+		tpl := s.tb.Build("action/errors/slow_download").WithLayoutBody(`{{ template "main" . }}`)
+		str, terr := tpl.ToString(s.c.WithData(&sde.Data))
+		if terr != nil {
+			return terr
+		}
+		log.WithError(err).WithField("data", sde.Data).Warn("bandwidth check failed")
+		j.Fail()
+		j.CustomWithData("action/errors/slow_download", strings.TrimSpace(str), &sde.Data)
+		return nil
+	}
+	npe, isNoPeers := err.(*NoPeersError)
+	if isNoPeers || errors.Is(errors.Cause(err), context.DeadlineExceeded) {
+		tpl := s.tb.Build("action/errors/no_peers").WithLayoutBody(`{{ template "main" . }}`)
+		tierName := "free"
+		if s.c.Claims != nil && s.c.Claims.Context != nil && s.c.Claims.Context.Tier != nil && s.c.Claims.Context.Tier.Name != "" {
+			tierName = s.c.Claims.Context.Tier.Name
+		}
+		data := &NoPeersData{
+			TierName:      tierName,
+			Reason:        "timeout",
+			Action:        s.action,
+			Endpoint:      actionEndpoint(s.action),
+			ResourceID:    s.resourceId,
+			ItemID:        s.itemId,
+			LogTargetID:   s.logTargetID(),
+			ArchiveFormat: s.archiveFormat,
+			SelectedPaths: s.selectedPaths,
+		}
+		if isNoPeers {
+			data.Reason = npe.Reason
+			data.Peers = npe.Peers
+			data.Seeders = npe.Seeders
+			data.Leechers = npe.Leechers
+			data.BytesRaw = npe.Bytes
+			data.Bytes = helpers.Bytes(uint64(npe.Bytes))
+			data.ElapsedSec = int(npe.Elapsed.Round(time.Second).Seconds())
+		}
+		str, terr := tpl.ToString(s.c.WithData(data))
+		if terr != nil {
+			return terr
+		}
+		log.WithError(err).WithField("action", s.action).WithField("reason", data.Reason).WithField("peers", data.Peers).WithField("bytes", data.BytesRaw).WithField("elapsed_s", data.ElapsedSec).Warn("no peers / warmup deadline — surfacing CTA")
+		// The card's "Try again" -- and the page's own button -- mean a fresh
+		// warm-up. The run returns nil, so without this its log stayed in
+		// storage for the rest of the job's life: a press later than the 60 s
+		// grace got the same card back at once, with the old peers and
+		// seconds, and nothing was tried.
+		j.DoNotCache()
+		j.Fail()
+		j.CustomWithData("action/errors/no_peers", strings.TrimSpace(str), data)
+		return nil
+	}
+	return err
+}
+
+// actionClock is the clock of the job keys' time bucket (Action, Embed); a
+// test pins it to compare keys with the ones recorded before a change.
+var actionClock = time.Now
+
+// purge is the start's own purge=true (the job queue runs it past the stored
+// job): not part of the id, only carried to the slow-download modal's
+// resubmit (SlowDownloadData.Purge).
+func Action(tb template.Builder[*web.Context], api *api.Api, i18nSvc *i18n.Service, userSubtitles *us.Service, thumbnailSvc *thumb.Service, enricher *enrich.Enricher, prefs *streamprefs.Service, cacheIndex CacheIndexer, c *web.Context, resourceID string, itemID string, action string, settings *models.StreamSettings, dsd *embed.DomainSettingsData, vsud *models.VideoStreamUserData, warmup WarmupSettings, grace GraceSettings, forceSlow bool, purge bool, debug string, archiveFormat string, selectedPaths []string) (r job.Runnable, id string) {
+	vsudID := vsud.AudioID + "/" + vsud.SubtitleID + "/" + vsud.PreferredLang + "/" + fmt.Sprintf("%+v", vsud.AcceptLangTags) + "/" + vsud.Carry.Key()
+	// A render for one declaration must not be served to another: the
+	// transcoder may give the browser that declared HEVC the source as it
+	// is, which a browser without the decoder cannot show. Appended only
+	// when there is one, so a start that declares nothing keeps its id.
+	vsudID += vsud.DecodeRequest.Key()
+	settingsID := fmt.Sprintf("%+v", settings)
+	now := actionClock().UTC()
+	// Cache key includes the authenticated user's id so two users on the
+	// same file don't share each other's rendered template through the
+	// job-queue cache; and the concatenated hashes of their uploaded
+	// subtitles for this file so an upload or delete invalidates the cache
+	// immediately — otherwise the new <track> element would only appear
+	// after the 10-minute cache bucket rolled over.
+	// userKey separates one caller's rendered output from another's.
+	//
+	// It used to be filled in only for signed-in users, which left it empty
+	// for everyone else — so two anonymous visitors opening the same file in
+	// the same ten-minute bucket collapsed onto one job, and the second was
+	// served the first one's rendered player. That HTML embeds a signed
+	// ?token= whose claims carry the first visitor's session identity, IP and
+	// User-Agent, and the job-log endpoint that replays it is unauthenticated
+	// with Access-Control-Allow-Origin: *.
+	//
+	// ApiClaims.SessionID is the right value for both cases: the user hash
+	// when signed in, a hash of the session's store id when not (see
+	// api.GenerateSessionID). Dedup across *repeat visits by the same
+	// visitor* — which is what the cache is for — is preserved; dedup across
+	// different visitors, which was never safe, is not.
+	userKey := ""
+	userSubsKey := ""
+	prefKey := ""
+	if c != nil && c.ApiClaims != nil {
+		userKey = c.ApiClaims.SessionID
+	}
+	if c != nil && c.User != nil && c.User.HasAuth() {
+		userKey = c.User.ID.String()
+		// The preferred content language shapes the subtitle ladder and the
+		// AI item, and it is a profile setting the viewer can change at any
+		// moment; without it in the key a change waited out the ten-minute
+		// bucket (the owner changed it and got the old picker back).
+		prefCtx, prefCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		prefKey = prefs.PreferredContentLang(prefCtx, c.User, pickedLang(vsud), acceptLangTags(vsud), c.Lang)
+		prefCancel()
+		if userSubtitles.Enabled() {
+			// Cache-key lookup intentionally scopes to resource, not
+			// (resource, path): ListItem.ID (itemID) and ListItem.PathStr
+			// are different identifiers and we'd need an extra API call
+			// to resolve Source.PathStr here. Hashing by resource is a
+			// slight over-invalidation (a subtitle upload for file A
+			// also invalidates file B's cached render under the same
+			// torrent) but eliminates any id/path mismatch and keeps
+			// this path synchronous.
+			listCtx, listCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if hashes, err := userSubtitles.ListHashesForResource(listCtx, c.User.ID, resourceID); err == nil {
+				sort.Strings(hashes)
+				userSubsKey = strings.Join(hashes, ",")
+			}
+			listCancel()
+		}
+	}
+	cacheKey := fmt.Sprintf("%s%d", now.Format("2006010215"), now.Minute()/10)
+	forceSlowKey := ""
+	if forceSlow {
+		forceSlowKey = "fs"
+	}
+	debugKey := ""
+	if debug != "" {
+		debugKey = "dbg-" + debug
+	}
+	// NUL join: no path may alias another selection (or the other key parts)
+	// through plain concatenation.
+	selectedPathsKey := strings.Join(selectedPaths, "\x00")
+	id = fmt.Sprintf("%x", sha1.Sum([]byte(resourceID+"/"+itemID+"/"+action+"/"+c.ApiClaims.Role+"/"+settingsID+"/"+vsudID+"/"+cacheKey+"/"+c.Lang+"/"+userKey+"/"+userSubsKey+"/"+prefKey+"/"+forceSlowKey+"/"+debugKey+"/"+archiveFormat+"/"+selectedPathsKey)))
+	return &ErrorWrapperScript{
+		tb:            tb,
+		c:             c,
+		action:        action,
+		resourceId:    resourceID,
+		itemId:        itemID,
+		archiveFormat: archiveFormat,
+		selectedPaths: selectedPaths,
+		purge:         purge,
+		Script: &ActionScript{
+			tb:            tb,
+			api:           api,
+			i18n:          i18nSvc,
+			userSubtitles: userSubtitles,
+			thumbnail:     thumbnailSvc,
+			enricher:      enricher,
+			prefs:         prefs,
+			cacheIndex:    cacheIndex,
+			c:             c,
+			resourceId:    resourceID,
+			itemId:        itemID,
+			action:        action,
+			settings:      settings,
+			vsud:          vsud,
+			dsd:           dsd,
+			warmup:        warmup,
+			grace:         grace,
+			forceSlow:     forceSlow,
+			debug:         debug,
+			archiveFormat: archiveFormat,
+			selectedPaths: selectedPaths,
+		},
+	}, id
+}
+
+// warmStream is one ?warmup stream's last frame. have and span stay 0 from
+// a seeder that does not send them.
+type warmStream struct {
+	verified, have, span atomic.Int64
+	// fullNs is when have first reached span: every covering piece here,
+	// the close waiting only on their hash checks.
+	fullNs atomic.Int64
+}
+
+func (w *warmStream) take(ev api.WarmupEvent) {
+	w.verified.Store(ev.Verified)
+	if ev.Have < 0 || ev.Span <= 0 {
+		return
+	}
+	w.have.Store(ev.Have)
+	w.span.Store(ev.Span)
+	if ev.Have >= ev.Span {
+		w.fullNs.CompareAndSwap(0, time.Now().UnixNano())
+	}
+}
+
+// speedLatch measures a warm-up counter's speed from the moment it first
+// reaches skip bytes, the slow start left out.
+type speedLatch struct {
+	ns, bytes atomic.Int64
+}
+
+func (l *speedLatch) update(total, skip int64) {
+	if l.ns.Load() != 0 || total < skip {
+		return
+	}
+	if l.ns.CompareAndSwap(0, time.Now().UnixNano()) {
+		l.bytes.Store(total)
+	}
+}
+
+// start is the counter where the window opened, -1 while it has not.
+func (l *speedLatch) start() int64 {
+	if l.ns.Load() == 0 {
+		return -1
+	}
+	return l.bytes.Load()
+}
+
+// speed is bytes a second from the latch to now at final. With no latch (a
+// hard deadline before skip bytes arrived) it is the rough average over the
+// whole warm-up, so the bandwidth check has *some* number to classify
+// against.
+func (l *speedLatch) speed(final int64, warmupStart, now time.Time) float64 {
+	from, measured := warmupStart, final
+	if ns := l.ns.Load(); ns != 0 {
+		from, measured = time.Unix(0, ns), final-l.bytes.Load()
+	}
+	if elapsed := now.Sub(from); elapsed > 0 && measured > 0 {
+		return float64(measured) / elapsed.Seconds()
+	}
+	return 0
+}
+
+// formatWarmupLine is the job status line during warm-up: "looking for peers
+// · 43 s left" while nothing has arrived (seconds left before the no-peers
+// verdict, rounded up -- never "0 s left" -- so a silent swarm shows a
+// countdown rather than a frozen spinner), "37%" of target once bytes flow —
+// the same shape as buffering's line. Never over 99%: the warm-up ends with
+// the step, not with its percent -- have reaches span while the last pieces
+// still wait for their hash checks (hash_wait), and "100%" stood on a step
+// that was still running. Past the countdown with nothing yet (peers that
+// hold back until the slow verdict at 120 s): "looking for peers", no
+// deadline -- the last "1 s left" stood for up to a minute. Empty when there
+// is no target: the previous line then stays.
+func formatWarmupLine(tp func(string, map[string]any) string, bytes, target int64, left time.Duration) string {
+	if bytes <= 0 {
+		if left <= 0 {
+			return tp("job.waitingForPeers", nil)
+		}
+		return tp("job.warmupCountdown", map[string]any{"Seconds": int(math.Ceil(left.Seconds()))})
+	}
+	if target <= 0 {
+		return ""
+	}
+	pct := float64(bytes) / float64(target) * 100
+	if pct > 99 {
+		pct = 99 // 99.5 would print "100"
+	}
+	return fmt.Sprintf("%.0f%%", pct)
+}
+
+// acceptLangTags is the browser's Accept-Language as the stream request
+// carried it; nil when there is no request data (an API-started job).
+func acceptLangTags(vsud *models.VideoStreamUserData) []language.Tag {
+	if vsud == nil {
+		return nil
+	}
+	return vsud.AcceptLangTags
+}
+
+// pickedLang is the language a viewer without an account chose in the player.
+func pickedLang(vsud *models.VideoStreamUserData) string {
+	if vsud == nil {
+		return ""
+	}
+	return vsud.PreferredLang
+}

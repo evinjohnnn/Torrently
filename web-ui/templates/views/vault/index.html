@@ -1,0 +1,265 @@
+{{/* The pledges table. The wrapper around it is an async-layout target:
+     vault/progress.js calls this.reload() when the status streams are refused
+     (their tokens live an hour, a vaulting can take longer), which re-fetches
+     /vault with X-Layout = data-async-layout, swaps this table in with fresh
+     tokens and re-inits the script (lib/async.js asyncLayout). Called with the
+     view context ($). */}}
+{{ define "vault/pledges_table" }}
+<div class="bg-base-200/50 rounded-xl overflow-hidden">
+  <table class="table w-full table-fixed text-sm">
+    <colgroup>
+      <col class="w-8">
+      <col>
+      <col class="w-24">
+      {{/* Status: the transfer status's badge (partials/status/badge.html),
+           which says the percent and the swarm too ("Vaulting 64% (9
+           seeders)"). Here its words wrap (style.css #vault-pledges
+           .tx-badge): the column is as wide as the common labels need on a
+           wide screen and no wider than a phone allows, where most states
+           take two to five lines. */}}
+      <col class="w-36 sm:w-60 md:w-72">
+    </colgroup>
+    <thead>
+      <tr class="border-b border-w-line">
+        <th></th>
+        <th class="text-left text-w-muted text-xs font-semibold tracking-wider uppercase">{{ t $.Lang "vault.pledges.name" }}</th>
+        <th class="text-center text-w-muted text-xs font-semibold tracking-wider uppercase">{{ t $.Lang "vault.pledges.vp" }}</th>
+        <th class="text-center text-w-muted text-xs font-semibold tracking-wider uppercase">{{ t $.Lang "vault.pledges.status" }}</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{ range .Data.Pledges }}
+        {{ if .Resource }}
+        <tr class="border-b border-w-line/50 last:border-b-0 hover:bg-base-300/30 transition-colors"{{ if .ShowProgress }} data-vault-progress data-resource-id="{{ .ResourceID }}" data-csrf="{{ $.CSRF }}" data-status-token="{{ statusToken .ResourceID }}" data-vault-saved-label="{{ t $.Lang "vault.pledges.saved" }}"{{ end }}>
+          <td class="text-center">
+            {{/* Select mode (partials/bulk_select.html): the box takes the
+                 icon's place. A frozen pledge cannot be removed yet, so its
+                 box is there but disabled, saying why on hover. */}}
+            <label class="hidden group-data-[bulk-on]/bulk:inline-flex align-middle cursor-pointer"{{ if .IsFrozen }} title="{{ t $.Lang "vault.pledges.frozenDesc" }}"{{ end }}>
+              <input type="checkbox" class="js-bulk-box checkbox checkbox-xs" value="{{ .ResourceID }}" aria-label="{{ .Resource.Name }}"{{ if .IsFrozen }} disabled{{ end }} />
+            </label>
+            <span class="group-data-[bulk-on]/bulk:hidden">
+            {{ if .Resource.Vaulted }}
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="size-4 text-w-pinkL inline-block">
+                <path fill-rule="evenodd" d="M14.615 1.595a.75.75 0 0 1 .359.852L12.982 9.75h7.268a.75.75 0 0 1 .548 1.262l-10.5 11.25a.75.75 0 0 1-1.272-.71l1.992-7.302H3.75a.75.75 0 0 1-.548-1.262l10.5-11.25a.75.75 0 0 1 .913-.143Z" clip-rule="evenodd" />
+              </svg>
+            {{ else if .ShowProgress }}
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="size-4 text-w-pinkL vault-pulse inline-block" data-vault-progress-icon>
+                <path fill-rule="evenodd" d="M14.615 1.595a.75.75 0 0 1 .359.852L12.982 9.75h7.268a.75.75 0 0 1 .548 1.262l-10.5 11.25a.75.75 0 0 1-1.272-.71l1.992-7.302H3.75a.75.75 0 0 1-.548-1.262l10.5-11.25a.75.75 0 0 1 .913-.143Z" clip-rule="evenodd" />
+              </svg>
+            {{ end }}
+            </span>
+          </td>
+          <td class="text-left">
+            <a href="{{ langPath $.Lang (printf "/%s" .ResourceID) }}" class="text-w-pinkL hover:underline truncate block" data-async-target="main">
+              {{ .Resource.Name }}
+            </a>
+          </td>
+          <td class="text-center {{ if .IsFrozen }}text-w-cyan{{ else }}text-w-sub{{ end }}">
+            {{ if .IsFrozen }}
+              <span class="inline-flex items-center gap-1 whitespace-nowrap">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" class="w-3 h-3 shrink-0" aria-label="{{ t $.Lang "vault.pledges.frozen" }}"><path d="M10 4l2 1l2 -1"/><path d="M12 2v6.5l3 1.72"/><path d="M17.928 6.268l.134 2.232l1.866 1.232"/><path d="M20.66 7l-5.629 3.25l.01 3.458"/><path d="M19.928 14.268l-1.866 1.232l-.134 2.232"/><path d="M20.66 17l-5.629 -3.25l-2.99 1.738"/><path d="M14 20l-2 -1l-2 1"/><path d="M12 22v-6.5l-3 -1.72"/><path d="M6.072 17.732l-.134 -2.232l-1.866 -1.232"/><path d="M3.34 17l5.629 -3.25l-.01 -3.458"/><path d="M4.072 9.732l1.866 -1.232l.134 -2.232"/><path d="M3.34 7l5.629 3.25l2.99 -1.738"/></svg>
+                {{ printf "%.2f" .Amount }}
+              </span>
+            {{ else }}
+              {{ printf "%.2f" .Amount }}
+            {{ end }}
+          </td>
+          <td class="text-center">
+            {{- /* Every pill here is the one badge element: the pledge's own
+                 states in its tones, the live row's badge the stream fills
+                 in place (vault/progress.js, lib/statusBadge.js). Until its
+                 first message -- seconds: the stream waits for the seeder's
+                 first answer -- the live row says what statusview says of a
+                 torrent nothing has been asked about yet (Torrent.Pending):
+                 "checking", cyan dots and "Checking activity…", a badge of
+                 the same size as every other (handlers/vault
+                 TestVaultRowsDrawTheStatusBadge holds it to statusview's). */}}
+            {{ if not .Funded }}
+              <div class="flex flex-col items-center gap-0.5">
+                {{- template "status/badge" (statusBadge "pink" "clock" (t $.Lang "vault.pledges.expiring")) }}
+                {{ if .ExpiresIn }}<span class="text-[11px] text-w-sub">{{ .ExpiresIn | duration }}</span>{{ end }}
+              </div>
+            {{ else if .ShowProgress }}
+              {{- template "status/badge" (statusBadge "cyan" "dots" (t $.Lang "resource.status.checking")) }}
+            {{ else }}
+              {{- template "status/badge" (statusBadge "vault" "vault" (t $.Lang "vault.pledges.saved")) }}
+            {{ end }}
+          </td>
+        </tr>
+        {{ end }}
+      {{ end }}
+    </tbody>
+  </table>
+</div>
+{{ "vault/progress.js" | asset }}
+{{ end }}
+{{ define "title" }}{{ t $.Lang "vault.dashboard.title" }}{{ end }}
+{{ define "main" }}
+<section class="min-h-screen pt-24 sm:pt-[120px] pb-20 px-3 sm:px-6">
+  <div class="max-w-[900px] mx-auto">
+    <div class="hidden sm:inline-flex badge badge-lg bg-w-pink/10 border-w-pink/30 text-w-pinkL gap-2 px-4 py-3 mb-5 text-xs font-semibold tracking-widest uppercase">
+      <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+      {{ t $.Lang "vault.dashboard.badge" }}
+    </div>
+
+    <h1 class="text-[clamp(2rem,4vw,2.8rem)] font-extrabold tracking-tight leading-tight mb-4">{{ t $.Lang "vault.dashboard.title" }}</h1>
+    <p class="hidden sm:block text-[1.05rem] text-w-sub leading-relaxed mb-10">{{ t $.Lang "vault.dashboard.subtitle" }}</p>
+
+    {{ if .Data.Stats }}
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
+        <!-- Content stats -->
+        <div class="bg-base-300/50 border border-w-line rounded-2xl p-6">
+          <h2 class="text-[1.05rem] font-bold tracking-tight mb-3">{{ t $.Lang "vault.dashboard.contentSection" }}</h2>
+          <div class="bg-base-200/50 rounded-xl p-4">
+            <table class="table w-full text-sm">
+              <tbody>
+                <tr>
+                  <td class="text-left font-semibold">{{ t $.Lang "vault.dashboard.vaulted" }}</td>
+                  <td class="text-center {{ if gt .Data.Stats.VaultedCount 0 }}text-w-purpleL font-semibold{{ end }}">{{ .Data.Stats.VaultedCount }}</td>
+                </tr>
+                {{ if gt .Data.Stats.LoadingCount 0 }}
+                  <tr>
+                    <td class="text-left font-semibold">{{ t $.Lang "vault.dashboard.loading" }}</td>
+                    <td class="text-center text-w-cyan font-semibold">{{ .Data.Stats.LoadingCount }}</td>
+                  </tr>
+                {{ end }}
+                <tr>
+                  <td class="text-left font-semibold">{{ t $.Lang "vault.dashboard.expiring" }}</td>
+                  <td class="text-center {{ if gt .Data.Stats.ExpiringCount 0 }}text-w-pinkL font-semibold{{ end }}">{{ .Data.Stats.ExpiringCount }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Points stats -->
+        <div class="bg-base-300/50 border border-w-line rounded-2xl p-6">
+          <h2 class="text-[1.05rem] font-bold tracking-tight mb-3">{{ t $.Lang "vault.dashboard.pointsSection" }}</h2>
+          <div class="bg-base-200/50 rounded-xl p-4">
+            <table class="table w-full text-sm">
+              <tbody>
+                <tr>
+                  <td class="text-left font-semibold">{{ t $.Lang "profile.vault.total" }}</td>
+                  <td class="text-center">
+                    {{ if .Data.Stats.Total }}{{ printf "%.2f" (derefFloat64 .Data.Stats.Total) }}{{ else }}<span class="text-xl">&#8734;</span>{{ end }}
+                  </td>
+                </tr>
+                <tr>
+                  <td class="text-left font-semibold">{{ t $.Lang "profile.vault.available" }}</td>
+                  <td class="text-center">
+                    {{ if .Data.Stats.Available }}{{ printf "%.2f" (derefFloat64 .Data.Stats.Available) }}{{ else }}<span class="text-xl">&#8734;</span>{{ end }}
+                  </td>
+                </tr>
+                <tr>
+                  <td class="text-left font-semibold">{{ t $.Lang "profile.vault.funded" }}</td>
+                  <td class="text-center">{{ printf "%.2f" .Data.Stats.Funded }}</td>
+                </tr>
+                <tr>
+                  <td class="text-left font-semibold">{{ t $.Lang "profile.vault.frozen" }}</td>
+                  <td class="text-center">{{ printf "%.2f" .Data.Stats.Frozen }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    {{ end }}
+
+    {{/* The root of "remove selected" (partials/bulk_select.html), offered
+         while at least one pledge is out of its freeze. In select mode the
+         title row sticks, so the buttons stay at hand down a long table. */}}
+    {{ $removable := false }}
+    {{ range .Data.Pledges }}{{ if and .Resource (not .IsFrozen) }}{{ $removable = true }}{{ end }}{{ end }}
+    <div class="group/bulk" data-bulk-confirm="{{ t $.Lang "vault.bulkRemoveConfirm" }}">
+    <div class="flex flex-wrap items-center justify-between gap-2 mb-3 group-data-[bulk-on]/bulk:sticky group-data-[bulk-on]/bulk:top-[72px] group-data-[bulk-on]/bulk:z-10 group-data-[bulk-on]/bulk:py-2 group-data-[bulk-on]/bulk:bg-w-bg/90 group-data-[bulk-on]/bulk:backdrop-blur-lg">
+      <h2 class="text-base font-bold tracking-tight">{{ t $.Lang "vault.dashboard.pledgesTitle" }}</h2>
+      {{ if $removable }}<div class="flex items-center">{{ template "bulk_select/bar" (withContext $ "/vault/remove") }}</div>{{ end }}
+    </div>
+
+    {{ if $.ErrKey }}<p role="alert" class="text-sm text-error mb-3">{{ t $.Lang $.ErrKey }}</p>{{ end }}
+
+    <!-- Pledges Table -->
+    <div class="bg-base-300/50 border border-w-line rounded-2xl p-6 mb-6">
+      {{ if .Data.Pledges }}
+        {{- /* The badge's icons, once for the page: the table's rows and the
+             status guide under it use them. Outside the table, which the
+             async reload swaps. */}}
+        {{- template "status/badge_sprite" }}
+        <div id="vault-pledges" data-async-layout="{{`{{ template "vault/pledges_table" $ }}`}}">
+          {{ template "vault/pledges_table" . }}
+        </div>
+      {{ else if .Data.IsFree }}
+        <div class="bg-base-200/50 rounded-xl p-4 flex items-center gap-4 flex-wrap">
+          <div class="flex items-start gap-3 flex-1 min-w-[240px]">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="size-5 shrink-0 mt-0.5 text-w-pinkL">
+              <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+              <path d="M2 17l10 5 10-5"/>
+              <path d="M2 12l10 5 10-5"/>
+            </svg>
+            <div class="min-w-0">
+              <div class="text-sm font-semibold text-base-content leading-snug">{{ t $.Lang "vault.dashboard.upsellTitle" }}</div>
+              <div class="text-xs text-w-muted mt-0.5">{{ t $.Lang "vault.dashboard.upsellSub" }}</div>
+            </div>
+          </div>
+          <a class="btn btn-sm btn-soft shrink-0" data-umami-event="donate-vault" data-umami-event-tier="free" href="/donate" target="_blank">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="size-4">
+              <path fill-rule="evenodd" d="M14.615 1.595a.75.75 0 0 1 .359.852L12.982 9.75h7.268a.75.75 0 0 1 .548 1.262l-10.5 11.25a.75.75 0 0 1-1.272-.71l1.992-7.302H3.75a.75.75 0 0 1-.548-1.262l10.5-11.25a.75.75 0 0 1 .913-.143Z" clip-rule="evenodd" />
+            </svg>
+            {{ t $.Lang "vault.dashboard.upsellCTA" }}
+          </a>
+        </div>
+      {{ else }}
+        <div class="bg-base-200/50 rounded-xl p-10 text-center">
+          <svg class="w-16 h-16 mx-auto text-w-muted/40 mb-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+            <path d="M2 17l10 5 10-5"/>
+            <path d="M2 12l10 5 10-5"/>
+          </svg>
+          <p class="text-base font-semibold text-w-text mb-2">{{ t $.Lang "vault.dashboard.emptyTitle" }}</p>
+          <p class="text-sm text-w-muted max-w-sm mx-auto leading-relaxed mb-6">{{ tp $.Lang "vault.dashboard.emptyHint" "Action" (t $.Lang "vault.keepAvailable") }}</p>
+          <a class="btn btn-soft btn-sm px-5" href="{{ langPath $.Lang "/" }}" data-async-target="main" data-umami-event="vault-empty-open-torrent">{{ t $.Lang "vault.dashboard.emptyCTA" }}</a>
+        </div>
+      {{ end }}
+    </div>
+    {{ if $removable }}{{ "bulk_select.js" | asset }}{{ end }}
+    </div>
+
+    <!-- Status Guide (collapsible) -->
+    {{ if .Data.Pledges }}
+      <div class="collapse collapse-plus collapse-webtor border border-w-line rounded-2xl mb-6">
+        <input type="checkbox" />
+        <div class="collapse-title text-base font-semibold">{{ t $.Lang "vault.pledges.statusGuide" }}</div>
+        <div class="collapse-content">
+          <dl class="space-y-4 text-sm pt-2">
+            <div class="flex items-start gap-3">
+              <dt class="inline-flex items-center gap-1 text-w-cyan font-medium mt-0.5 shrink-0 whitespace-nowrap">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" class="w-3.5 h-3.5"><path d="M10 4l2 1l2 -1"/><path d="M12 2v6.5l3 1.72"/><path d="M17.928 6.268l.134 2.232l1.866 1.232"/><path d="M20.66 7l-5.629 3.25l.01 3.458"/><path d="M19.928 14.268l-1.866 1.232l-.134 2.232"/><path d="M20.66 17l-5.629 -3.25l-2.99 1.738"/><path d="M14 20l-2 -1l-2 1"/><path d="M12 22v-6.5l-3 -1.72"/><path d="M6.072 17.732l-.134 -2.232l-1.866 -1.232"/><path d="M3.34 17l5.629 -3.25l-.01 -3.458"/><path d="M4.072 9.732l1.866 -1.232l.134 -2.232"/><path d="M3.34 7l5.629 3.25l2.99 -1.738"/></svg>
+                VP
+              </dt>
+              <dd class="text-w-sub">{{ t $.Lang "vault.pledges.frozenDesc" }}</dd>
+            </div>
+            <div class="flex items-start gap-3">
+              <dt class="mt-0.5 shrink-0">{{ template "status/badge" (statusBadge "pink" "clock" (t $.Lang "vault.pledges.expiring")) }}</dt>
+              <dd class="text-w-sub">{{ t $.Lang "vault.pledges.expiringDesc" }}</dd>
+            </div>
+            <div class="flex items-start gap-3">
+              <dt class="mt-0.5 shrink-0">{{ template "status/badge" (statusBadge "vault" "vault" (t $.Lang "vault.pledges.saved")) }}</dt>
+              <dd class="text-w-sub">{{ t $.Lang "vault.pledges.claimableDesc" }}</dd>
+            </div>
+          </dl>
+        </div>
+      </div>
+    {{ end }}
+
+    <!-- Actions -->
+    <div class="flex items-center justify-between">
+      <a href="{{ langPath $.Lang "/instructions/vault" }}" class="text-sm text-w-muted hover:text-w-sub link link-hover" data-umami-event="instruction-vault" target="_blank">{{ t $.Lang "vault.whatIs" }}</a>
+      <a href="{{ langPath $.Lang "/profile" }}" class="btn btn-ghost border border-w-line" data-async-target="main">
+        <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/></svg>
+        {{ t $.Lang "vault.pledges.backToProfile" }}
+      </a>
+    </div>
+  </div>
+</section>
+{{ end }}

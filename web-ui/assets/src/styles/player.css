@@ -1,0 +1,1702 @@
+/* Webtor Custom Player Styles */
+
+.wt-player-mount {
+    position: relative;
+    width: 100%;
+}
+
+/* Spacing above player/preview only on main site, not in embed iframe */
+body:not([data-iframe-height]) .wt-player-mount,
+body:not([data-iframe-height]) .wt-preview-mount {
+    margin-top: 1.5rem;
+}
+
+/* Image preview — same style as video player */
+.wt-preview-mount {
+    position: relative;
+    width: 100%;
+}
+
+.wt-preview-image {
+    width: 100%;
+    display: block;
+    border-radius: var(--rounded-btn, 0.5rem);
+    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -4px rgba(0, 0, 0, 0.1);
+}
+
+/* Main container */
+/* The fullscreen element (Player.jsx initPlayer): it outlives the player it
+   holds. Invisible in the page -- a plain block -- and a black box that
+   centres the player when it is fullscreen. */
+.wt-player-stage:fullscreen {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100vw;
+    height: 100vh;
+    background: #000;
+}
+
+.wt-player-stage:fullscreen .wt-player-mount {
+    width: 100%;
+}
+
+/* Separate rules on purpose: an unknown pseudo-class in a selector LIST
+   throws the whole rule away, and each engine knows only one of these. */
+.wt-player-stage:-webkit-full-screen {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100vw;
+    height: 100vh;
+    background: #000;
+}
+
+.wt-player-stage:-webkit-full-screen .wt-player-mount {
+    width: 100%;
+}
+
+/* A phone on its side: the stage of a video player is the window's size
+   (owner, 2026-10-15) -- edge to edge, and as tall as the window, in the
+   page's flow. Measured on stage: the inline film was taller than the
+   window on every landscape phone, its controls under the fold, and the
+   fixed navbar and status bar over 32-82% of it. The size follows the
+   window -- the browser's own bars included (dvh: no strip of page under
+   the film once they hide) -- and nothing else the scroll does, so the
+   film does not move under the finger; lib/landscapeFocus.js slides the navbar and the status bar away while the
+   stage covers the window ("focus"), and a scroll on leaves it. The query
+   is FOCUS_MEDIA in lib/stickyStatus.js. Both sizes set, so the player's own
+   aspect-ratio (Player.jsx, from the video) stands down and the film is
+   letterboxed by object-fit like in fullscreen; the UA's fullscreen rules
+   override all of this while fullscreen. An audio player keeps its card. */
+@media (orientation: landscape) and (max-height: 500px) and (pointer: coarse) and (min-aspect-ratio: 3/2) {
+    /* And it sticks there (owner, 2026-10-16): a scroll that ends near the
+       stage at the window's top ends exactly there -- the browser's own snap,
+       which catches a fling as it slows, where a script could only pull after
+       it stopped. Proximity: one snap point under mandatory would leave the
+       page nowhere else to rest. Padding 0 over style.css's 72 px and the
+       sticky bar's inline one (lib/stickyStatus.js pad()): those would snap
+       the stage under the navbar, short of focus -- the navbar slides away
+       once the stage has the window. */
+    html:has(body:not([data-iframe-height]) .wt-player-stage .wt-player--video) {
+        scroll-snap-type: y proximity;
+        scroll-padding-top: 0 !important;
+    }
+
+    body:not([data-iframe-height]) .wt-player-stage:has(.wt-player--video) {
+        width: 100vw;
+        height: 100vh;
+        height: 100dvh;
+        margin: 1.5rem calc(50% - 50vw) 0;
+        background: #000;
+        scroll-snap-align: start;
+    }
+
+    /* All of the margin and the width: under 640 px wide the phone rule
+       above stretches the mount 1.25rem past both sides, which here put the
+       controls off the window and panned the page sideways. */
+    body:not([data-iframe-height]) .wt-player-stage:has(.wt-player--video) .wt-player-mount {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+    }
+
+    body:not([data-iframe-height]) .wt-player-stage:has(.wt-player--video) .wt-player--video {
+        width: 100%;
+        height: 100%;
+        border-radius: 0;
+        box-shadow: none;
+    }
+}
+
+.wt-player {
+    position: relative;
+    width: 100%;
+    background: #000;
+    overflow: hidden;
+    font-family: Inter, system-ui, sans-serif;
+    user-select: none;
+    -webkit-user-select: none;
+    border-radius: var(--rounded-btn, 0.5rem);
+    /* Everything inside stacks against the player, not against the page.
+       Without a stacking context here (position:relative with z-index:auto
+       makes none) the overlays below -- controls 20, top overlay 20, catch-up
+       pill 40, offer card 41 -- competed with the navbar (z-navbar 30) and the
+       sticky torrent status (z-sticky 20) and won: the film's title drew over
+       both (owner, 2026-09-20). Native fullscreen is unaffected, the element
+       goes to the top layer. */
+    isolation: isolate;
+}
+
+.wt-player--video {
+    cursor: pointer;
+    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -4px rgba(0, 0, 0, 0.1);
+}
+
+/* Idle pointer follows the controls: once they auto-hide (playing, no
+   mouse activity for 3s — Player.jsx resetHideTimer) the arrow goes too,
+   so a stationary cursor doesn't sit over the picture in fullscreen. Any
+   mousemove re-adds .wt-player--controls-visible and the cursor returns. */
+.wt-player--video:not(.wt-player--controls-visible) {
+    cursor: none;
+}
+
+/* In embed — no border/radius */
+body[data-iframe-height] .wt-player {
+    border-radius: 0;
+}
+
+body[data-iframe-height] .wt-player--video {
+    box-shadow: none;
+}
+
+/* Embed with fixed height — fill the iframe */
+body[data-iframe-height][data-fixed-height] .wt-player--video {
+    aspect-ratio: auto;
+    width: 100%;
+    height: 100vh;
+}
+
+body[data-iframe-height][data-fixed-height] .wt-player-mount {
+    height: 100vh;
+}
+
+.wt-player--video.wt-player--fullscreen {
+    width: 100vw;
+    height: 100vh;
+    border-radius: 0;
+    box-shadow: none;
+}
+
+/* Mobile: larger controls, thicker progress bar */
+@media (max-width: 640px) and (pointer: coarse) {
+    .wt-player-btn {
+        width: 2.5rem;
+        height: 2.5rem;
+        padding: 0.5rem;
+    }
+
+    .wt-player-btn--play {
+        width: 2.75rem;
+        height: 2.75rem;
+    }
+
+    .wt-player-progress-track {
+        height: 5px;
+    }
+
+    .wt-player-progress {
+        padding: 0.625rem 0;
+    }
+
+    .wt-player-progress-thumb {
+        width: 5px;
+        height: 150%;
+    }
+
+    .wt-player-big-play {
+        width: 4rem;
+        height: 4rem;
+    }
+
+    .wt-player-big-play svg {
+        width: 2.5rem;
+        height: 2.5rem;
+    }
+
+    /* Stretch player/preview to near screen edges on mobile */
+    body:not([data-iframe-height]) .wt-player-mount,
+    body:not([data-iframe-height]) .wt-preview-mount {
+        margin-left: -1.25rem;
+        margin-right: -1.25rem;
+        width: calc(100% + 2.5rem);
+    }
+
+    body:not([data-iframe-height]) .wt-player--video {
+        border-radius: 0.25rem;
+        box-shadow: none;
+    }
+}
+
+.wt-player--audio {
+    background: #111827;
+    border-radius: 0.75rem;
+    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -4px rgba(0, 0, 0, 0.1);
+    overflow: visible;
+}
+
+/* Video element */
+.wt-player video,
+.wt-player audio {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+
+.wt-player audio {
+    display: none;
+}
+
+/* Overlays */
+.wt-player-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+    z-index: 10;
+}
+
+.wt-player-overlay--play,
+.wt-resume-prompt {
+    pointer-events: auto;
+}
+
+/* Big play button */
+.wt-player-big-play {
+    width: 5rem;
+    height: 5rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(4px);
+    border-radius: 50%;
+    color: white;
+    border: none;
+    cursor: pointer;
+    transition: transform 0.2s ease, background 0.2s ease;
+}
+
+.wt-player-big-play:hover {
+    transform: scale(1.1);
+    background: rgba(232, 67, 147, 0.4);
+}
+
+.wt-player-big-play svg {
+    margin-left: 4px; /* Visual centering for play triangle */
+}
+
+/* Controls container */
+.wt-player-controls {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    z-index: 20;
+    padding: 0;
+    background: linear-gradient(to top, rgba(0, 0, 0, 0.8) 0%, rgba(0, 0, 0, 0.4) 60%, transparent 100%);
+    opacity: 0;
+    transition: opacity 0.3s ease;
+    cursor: default;
+}
+
+.wt-player--controls-visible .wt-player-controls,
+.wt-player-controls:hover {
+    opacity: 1;
+}
+
+.wt-player--audio .wt-player-controls {
+    position: relative;
+    background: transparent;
+    opacity: 1;
+    padding: 0.625rem 0 0;
+}
+
+/* Top overlay — title (left) + share button (right). Visible
+   immediately, fades in/out with the bottom controls via the
+   .wt-player--controls-visible class on the container. Gradient
+   mirrors the bottom controls so the two overlays read as one
+   coherent treatment. */
+.wt-player-top-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    padding: 0.5rem 0.75rem;
+    background: linear-gradient(to bottom, rgba(0, 0, 0, 0.8) 0%, rgba(0, 0, 0, 0.4) 60%, transparent 100%);
+    opacity: 0;
+    /* visibility rides along with the fade so the hidden overlay's buttons
+       (pointer-events:auto) stop being invisible-but-clickable — without it
+       a tap in the top-right corner after the controls auto-hide landed on
+       the transparent cast/share button instead of toggling play. The 0.3s
+       visibility delay keeps the element hoverable until the fade-out ends. */
+    visibility: hidden;
+    transition: opacity 0.3s ease, visibility 0s linear 0.3s;
+    color: white;
+    /* Click-through gradient — the player container's onClick handles
+       play-toggle, the share button itself flips pointer-events back
+       to auto so its own click handler fires. */
+    pointer-events: none;
+}
+
+.wt-player--controls-visible .wt-player-top-overlay,
+.wt-player-top-overlay:hover {
+    opacity: 1;
+    visibility: visible;
+    transition-delay: 0s;
+}
+
+/* Title fills the remaining space, share button sits at the end.
+   pointer-events re-enabled on interactive children so the gradient
+   itself stays click-through (clicks on the gradient toggle play, same
+   as elsewhere in the player). */
+.wt-player-top-title {
+    flex: 1 1 auto;
+    min-width: 0;
+    /* Padding-right keeps the ellipsis from butting against the action
+       buttons. Single positioning mechanism for layout — the actions
+       group uses margin-left:auto, here we add a small visual gutter. */
+    padding-right: 0.5rem;
+    font-size: 1.15rem;
+    font-weight: 600;
+    line-height: 1.3;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+    pointer-events: none;
+}
+@media (max-width: 640px) {
+    .wt-player-top-title {
+        font-size: 0.875rem;
+    }
+}
+
+/* Right-aligned action group: cast (when available) + share. Keeps the
+   two buttons on one flex mechanism instead of competing absolute
+   positions — that's exactly how cast used to end up painted over
+   share. */
+.wt-player-top-actions {
+    flex: 0 0 auto;
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+/* Compound selector bumps specificity past the .wt-player-btn block
+   that's declared later in the file (CSS source order would otherwise
+   reset our width/height/padding back to the small bottom-bar size). */
+.wt-player-top-overlay .wt-player-top-share {
+    flex: 0 0 auto;
+    pointer-events: auto;
+    width: 3.5rem;
+    height: 3.5rem;
+    /* Padding matches the bottom-bar buttons (.wt-player-btn 0.375rem)
+       so the visible icon's right edge lines up with the right-group
+       icons in the controls row — the two overlays share the same
+       0.75rem container padding, so identical button padding gives
+       identical visual gutters. */
+    padding: 0.375rem;
+    color: white;
+}
+.wt-player-top-overlay .wt-player-top-share svg {
+    width: 100%;
+    height: 100%;
+}
+
+/* Mobile — desktop overlay size is intentionally chunky for desktop
+   click targets, but on phone screens it dominates the top bar. Drop
+   the button ~30 % at narrow viewports while keeping padding
+   proportional so the icon stays visually centred. */
+@media (max-width: 640px) {
+    .wt-player-top-overlay .wt-player-top-share {
+        width: 2.5rem;
+        height: 2.5rem;
+        padding: 0.375rem;
+    }
+}
+
+/* Controls row */
+.wt-player-controls-row {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    padding: 0.125rem 0.75rem 0.5rem;
+    min-height: 2.75rem;
+}
+
+.wt-player--audio .wt-player-controls-row {
+    padding: 0.5rem 0.75rem;
+}
+
+.wt-player-controls-left {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-shrink: 0;
+}
+
+.wt-player-controls-right {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    margin-left: auto;
+    flex-shrink: 0;
+}
+
+/* Buttons */
+.wt-player-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 2rem;
+    height: 2rem;
+    padding: 0.375rem;
+    color: rgba(255, 255, 255, 0.7);
+    background: none;
+    border: none;
+    border-radius: 0.375rem;
+    cursor: pointer;
+    transition: color 0.15s ease, background 0.15s ease;
+    flex-shrink: 0;
+}
+
+.wt-player-btn:hover {
+    color: white;
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.wt-player-btn--play {
+    width: 2.25rem;
+    height: 2.25rem;
+    padding: 0.375rem;
+}
+
+/* Time display */
+.wt-player-time {
+    font-size: 0.75rem;
+    color: rgba(255, 255, 255, 0.7);
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+}
+
+.wt-player-time-sep {
+    color: rgba(255, 255, 255, 0.4);
+    margin: 0 0.125rem;
+}
+
+/* Progress bar */
+.wt-player-progress {
+    position: relative;
+    height: 1.25rem;
+    padding: 0.5rem 0;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    touch-action: none;
+}
+
+.wt-player-progress-track {
+    position: relative;
+    width: 100%;
+    height: 3px;
+    background: rgba(255, 255, 255, 0.2);
+    border-radius: 2px;
+    transition: height 0.15s ease;
+}
+
+.wt-player-progress--active .wt-player-progress-track {
+    height: 5px;
+}
+
+.wt-player-progress--disabled {
+    pointer-events: none;
+}
+
+.wt-player-progress--disabled .wt-player-progress-thumb {
+    width: 5px;
+    height: 150%;
+    background: white;
+    animation: wt-seek-pulse 1s ease-in-out infinite;
+}
+
+@keyframes wt-seek-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+}
+
+.wt-player-progress-buffered {
+    position: absolute;
+    inset: 0;
+    background: rgba(255, 255, 255, 0.15);
+    transform-origin: left;
+    border-radius: 2px;
+}
+
+.wt-player-progress-played {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(to right, #e84393, #6c5ce7);
+    transform-origin: left;
+    border-radius: 2px;
+}
+
+/* Thumb — thin vertical bar at current position */
+.wt-player-progress-thumb {
+    position: absolute;
+    top: 50%;
+    width: 3px;
+    height: 100%;
+    background: rgba(255, 255, 255, 0.8);
+    border-radius: 1px;
+    transform: translate(-50%, -50%);
+    transition: width 0.15s ease, height 0.15s ease, background 0.15s ease;
+    pointer-events: none;
+    z-index: 2;
+}
+
+.wt-player-progress--active .wt-player-progress-thumb,
+.wt-player-progress:hover .wt-player-progress-thumb {
+    width: 5px;
+    height: 150%;
+    background: white;
+}
+
+.wt-player-progress-thumb--ghost {
+    background: rgba(255, 255, 255, 0.35) !important;
+    width: 5px !important;
+    height: 150% !important;
+    z-index: 1 !important;
+}
+
+/* Hover tooltip */
+.wt-player-progress-tooltip {
+    position: absolute;
+    bottom: 100%;
+    transform: translateX(-50%);
+    background: rgba(0, 0, 0, 0.85);
+    color: white;
+    font-size: 0.6875rem;
+    padding: 0.125rem 0.375rem;
+    border-radius: 0.25rem;
+    white-space: nowrap;
+    pointer-events: none;
+    font-variant-numeric: tabular-nums;
+    margin-bottom: 0.25rem;
+}
+
+/* Volume control */
+.wt-player-volume {
+    display: flex;
+    align-items: center;
+    gap: 0;
+}
+
+.wt-player-volume-slider-wrap {
+    width: 0;
+    overflow: hidden;
+    transition: width 0.2s ease;
+}
+
+.wt-player-volume--expanded .wt-player-volume-slider-wrap {
+    width: 4.5rem;
+}
+
+.wt-player-volume-slider {
+    position: relative;
+    width: 4rem;
+    height: 1.5rem;
+    margin-left: 0.25rem;
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+    touch-action: none;
+}
+
+.wt-player-volume-track {
+    position: relative;
+    width: 100%;
+    height: 3px;
+    background: rgba(255, 255, 255, 0.2);
+    border-radius: 2px;
+    transition: height 0.15s ease;
+}
+
+.wt-player-volume:hover .wt-player-volume-track,
+.wt-player-volume-slider--active .wt-player-volume-track {
+    height: 5px;
+}
+
+.wt-player-volume-level {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(to right, #e84393, #6c5ce7);
+    transform-origin: left;
+    border-radius: 2px;
+}
+
+.wt-player-volume-thumb {
+    position: absolute;
+    top: 50%;
+    width: 3px;
+    height: 100%;
+    background: rgba(255, 255, 255, 0.8);
+    border-radius: 1px;
+    transform: translate(-50%, -50%);
+    transition: width 0.15s ease, height 0.15s ease, background 0.15s ease;
+    pointer-events: none;
+    z-index: 2;
+}
+
+.wt-player-volume:hover .wt-player-volume-thumb,
+.wt-player-volume-slider--active .wt-player-volume-thumb {
+    width: 5px;
+    height: 150%;
+    background: white;
+}
+
+.wt-player-volume-thumb--ghost {
+    background: rgba(255, 255, 255, 0.35) !important;
+    width: 5px !important;
+    height: 150% !important;
+    z-index: 1 !important;
+}
+
+/* Cast button — lives in the top-overlay action group next to share,
+   sized to match it so the two icons read as one row. */
+.wt-player-cast-button {
+    flex: 0 0 auto;
+    pointer-events: auto;
+    cursor: pointer;
+    width: 3.5rem;
+    height: 3.5rem;
+    padding: 0.625rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.wt-player-cast-button google-cast-launcher {
+    --connected-color: #e84393;
+    --disconnected-color: rgba(255, 255, 255, 0.7);
+    display: block;
+    width: 100%;
+    height: 100%;
+}
+
+@media (max-width: 640px) {
+    .wt-player-cast-button {
+        width: 2.5rem;
+        height: 2.5rem;
+        padding: 0.5rem;
+    }
+}
+
+/* Legacy floating position for controls-less players that render no top
+   overlay. */
+.wt-player-cast-button--floating {
+    position: absolute;
+    top: 0.5rem;
+    right: 0.5rem;
+    z-index: 30;
+    width: auto;
+    height: auto;
+    padding: 0;
+}
+
+.wt-player-cast-button--floating google-cast-launcher {
+    width: 1.5rem;
+    height: 1.5rem;
+}
+
+/* Subtitle text tracks */
+video::-webkit-media-text-track-display {
+    bottom: 5rem !important;
+    line-height: 1.5 !important;
+    top: auto !important;
+}
+
+video::cue {
+    background: rgba(0, 0, 0, 0.7);
+    border-radius: 4px;
+    padding: 0.125rem 0.375rem;
+}
+
+/* Loading spinner animation */
+@keyframes wt-spin {
+    to { transform: rotate(360deg); }
+}
+
+/* The buffering label (BufferingLabel.jsx; docs/player.md "Buffering
+   label"), where the spinner was and with its visibility: a pill that says
+   "Buffering". At the plan's cap (the transfer status's word, lib/
+   transferStatus.js playerLabel) it is the lock -- a button with the
+   viewer's cap -- that opens the status's own stream plan box (.tx-pbox,
+   style.css, docs/uikit.html §21) in a modal dialog (.wt-cap-dialog below).
+   Owner's mockups, variant A (2026-09-26). */
+.wt-buffering {
+    padding: 8px;
+    box-sizing: border-box;
+}
+/* A control now: over the controls (20), under the catch-up pill (40), the
+   offer card (41) and the resume prompt (50). */
+.wt-buffering--cap {
+    z-index: 35;
+}
+/* Dark in every state, whatever the frame behind it (owner, 2026-09-26: on a
+   white frame the lock's pink hover fill turned the pill into a light-pink
+   blob with the white "Buffering" gone: 1.02:1). On a pure white frame now:
+   the label 12.2:1, the pink cap 6.1:1; hovered or open 9.6:1 and 4.8:1
+   (buffering-label.test.js computes them from this file). No pink fill in
+   any state: the pink is the cap's number and lock alone. */
+.wt-buffering-pill {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    height: 32px;
+    padding: 0 12px;
+    box-sizing: border-box;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 999px;
+    background: rgba(10, 14, 26, 0.9);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    color: #e2e8f0;
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 16px;
+    white-space: nowrap;
+}
+/* The lock takes clicks; the plain pill lets them through to the picture,
+   as the spinner did (the overlay is pointer-events:none). */
+button.wt-buffering-pill {
+    pointer-events: auto;
+    cursor: pointer;
+    transition: background 0.15s ease, border-color 0.15s ease;
+}
+/* Hovered or open: a touch lighter and a brighter edge, as the player's
+   other buttons (.wt-player-btn: a white layer of 0.1) -- a white layer of
+   0.08 over the same dark base, never a colour of its own. */
+button.wt-buffering-pill:hover,
+button.wt-buffering-pill[aria-expanded="true"] {
+    border-color: rgba(255, 255, 255, 0.32);
+    background: linear-gradient(rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.08)), rgba(10, 14, 26, 0.9);
+}
+/* The keyboard's ring, seen on any frame: pink on a dark halo. */
+button.wt-buffering-pill:focus-visible {
+    outline: 2px solid #fd79a8;
+    outline-offset: 2px;
+    box-shadow: 0 0 0 2px rgba(10, 14, 26, 0.9);
+}
+.wt-buffering-spin {
+    flex: none;
+    width: 14px;
+    height: 14px;
+    animation: wt-spin 1s linear infinite;
+}
+.wt-buffering-sep {
+    flex: none;
+    width: 1px;
+    height: 14px;
+    background: rgba(255, 255, 255, 0.2);
+}
+/* The plan's colour: the cap is the pink of the status's chain. */
+.wt-buffering-cap {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: #fd79a8;
+    font-weight: 600;
+}
+.wt-buffering-cap svg {
+    flex: none;
+    width: 13px;
+    height: 13px;
+}
+.wt-buffering-chev {
+    flex: none;
+    width: 12px;
+    height: 12px;
+    margin-left: -3px;
+    color: #fd79a8;
+}
+/* Fullscreen with a mouse: the same pill, larger. */
+@media (pointer: fine) {
+    .wt-player--fullscreen .wt-buffering-pill {
+        height: 40px;
+        padding: 0 16px;
+        gap: 10px;
+        font-size: 15px;
+    }
+    .wt-player--fullscreen .wt-buffering-spin {
+        width: 16px;
+        height: 16px;
+    }
+    .wt-player--fullscreen .wt-buffering-cap svg {
+        width: 15px;
+        height: 15px;
+    }
+    .wt-player--fullscreen .wt-buffering-chev {
+        width: 14px;
+        height: 14px;
+    }
+}
+/* Touch: the lock is a real target, 44 px, the words alone 36 -- a phone
+   turned sideways (fullscreen) included. */
+@media (pointer: coarse) {
+    .wt-buffering-pill {
+        height: 36px;
+        padding: 0 14px;
+    }
+    button.wt-buffering-pill {
+        height: 44px;
+    }
+}
+
+/* The card: a native <dialog class="modal"> opened with showModal()
+   (BufferingLabel.jsx CapCard), like the grace popup and #subtitles -- the
+   top layer, centred on the screen over DaisyUI's dimmed backdrop, never cut
+   by .wt-player's overflow:hidden, over a fullscreen player. It is the
+   page's, not the player's (BufferingLabel.jsx openCapCard: a root of its
+   own on <body>, so the next file's player does not take it away), and
+   inherits the page's font and pointer as the status box does. The dialog
+   is the card's size container: .tx-pbox's own @container rules
+   (style.css) lay the box out by the screen's width -- below 670 px the
+   compact box, the text over a full-width 44 px button. */
+.wt-cap-dialog {
+    container-type: inline-size;
+}
+/* The stream box as the status draws it, on the card's own ground. Over
+   DaisyUI's .modal-box (layered: these win). */
+.wt-cap-card.tx-pbox {
+    position: relative;
+    width: min(640px, calc(100% - 32px));
+    max-width: none;
+    max-height: calc(100% - 32px);
+    overflow-y: auto;
+    box-sizing: border-box;
+    padding: 16px 48px 16px 16px;
+    border: 1px solid rgba(232, 67, 147, 0.32);
+    border-radius: 16px;
+    background: #0c111e;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
+    text-align: left;
+    outline: none;
+}
+.wt-cap-card-text {
+    min-width: 0;
+}
+/* Wraps rather than runs out of the card in a long language. */
+.wt-cap-card .tx-sbtn {
+    justify-content: center;
+    white-space: normal;
+    text-align: center;
+}
+.wt-cap-card-x {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: #94a3b8;
+    cursor: pointer;
+}
+.wt-cap-card-x:hover {
+    color: #f1f5f9;
+    background: rgba(255, 255, 255, 0.06);
+}
+.wt-cap-card-x:focus-visible,
+.wt-cap-card .tx-sbtn:focus-visible {
+    outline: 2px solid #fd79a8;
+    outline-offset: 2px;
+}
+.wt-cap-card-x svg {
+    width: 16px;
+    height: 16px;
+}
+@media (pointer: coarse) {
+    .wt-cap-card-x {
+        top: 2px;
+        right: 2px;
+        width: 44px;
+        height: 44px;
+    }
+}
+/* Narrow: the button full width, under the close button's column as well
+   (the text keeps clear of the close button; the button, below it, need
+   not). */
+@container (max-width: 669px) {
+    .wt-cap-card.tx-pbox {
+        padding: 14px 48px 14px 14px;
+    }
+    .wt-cap-card .tx-pr {
+        width: calc(100% + 34px);
+        margin-right: -34px;
+    }
+}
+@media (prefers-reduced-motion: reduce) {
+    .wt-buffering-spin {
+        animation: none;
+    }
+}
+
+/* Resume prompt buttons */
+.wt-resume-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    font-family: inherit;
+    white-space: nowrap;
+    transition: opacity 0.15s, transform 0.15s;
+}
+.wt-resume-btn:active {
+    transform: scale(0.97);
+}
+.wt-resume-btn--primary {
+    background: rgba(255, 255, 255, 0.12);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    color: #fff;
+    padding: 12px 24px;
+    font-size: 14px;
+    font-weight: 600;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+}
+.wt-resume-btn--primary:hover {
+    background: rgba(255, 255, 255, 0.2);
+}
+.wt-resume-btn--ghost {
+    background: transparent;
+    color: rgba(255, 255, 255, 0.5);
+    padding: 8px 16px;
+    font-size: 13px;
+    font-weight: 400;
+    border: none;
+}
+.wt-resume-btn--ghost:hover {
+    color: rgba(255, 255, 255, 0.8);
+}
+
+/* The stream could not go on and was not restarted by itself
+   (stream-restart.js): one line saying so, one button that restarts it.
+   The resume prompt's vocabulary -- a dim scrim, the glass button -- and a
+   small glass card of the next card's kind around them; no pink (that is
+   "buy" in this design system, not "play"). Above the overlays and the
+   catch-up pill (40), below the resume prompt (50). */
+.wt-recover {
+    pointer-events: auto;
+    z-index: 45;
+    background: rgba(0, 0, 0, 0.55);
+}
+.wt-recover-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    max-width: calc(100% - 32px);
+    padding: 16px 20px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 14px;
+    background: rgba(0, 0, 0, 0.72);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    color: #fff;
+    text-align: center;
+}
+.wt-recover-text {
+    margin: 0;
+    font-size: 14px;
+    line-height: 1.35;
+    color: rgba(255, 255, 255, 0.85);
+}
+/* The audio player is its control bar: the card is one row inside it. */
+.wt-player--audio .wt-recover-card {
+    flex-direction: row;
+    gap: 10px;
+    padding: 4px 10px;
+    border-radius: 10px;
+}
+.wt-player--audio .wt-recover-card .wt-resume-btn--primary {
+    padding: 6px 12px;
+    font-size: 13px;
+}
+@media (max-width: 600px) {
+    .wt-recover-card {
+        gap: 10px;
+        padding: 12px 14px;
+    }
+    .wt-recover-text {
+        font-size: 13px;
+    }
+}
+
+/* The "AI translation is catching up" pill.
+
+   Top-centre and out of the way of both things it could cover: the
+   subtitles it is about (bottom of the picture) and the controls under
+   them. z-index sits above the overlays (10) and below the resume
+   prompt (50), which is modal and must win. */
+.wt-catchup {
+    position: absolute;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 40;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    /* Its own width, not the shrink-to-fit one: with left: 50% an absolute
+       box may only fill the half of the picture right of its left edge, so
+       without this the pill wrapped at half the player's width -- two lines
+       for "Перевести на русский" on a 375px phone -- and max-width below
+       never came into play. */
+    width: max-content;
+    max-width: calc(100% - 24px);
+    padding: 6px 12px;
+    border-radius: 999px;
+    background: rgba(0, 0, 0, 0.72);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    color: #fff;
+    font-size: 13px;
+    line-height: 1.3;
+    /* The container is pointer-events:none only for the overlays; this one
+       is a control and has to be clickable in its own right. */
+    pointer-events: auto;
+}
+
+/* LoadingSpinner is sized for a full-screen overlay (w-12 h-12). */
+.wt-catchup svg {
+    width: 14px;
+    height: 14px;
+    flex: none;
+}
+
+.wt-catchup-text {
+    /* Wraps rather than truncates: on a phone the sentence is the point,
+       and a pill two lines high costs nothing at the top of the frame. */
+    white-space: normal;
+}
+
+/* "Caught up": the same pill, said in the other colour, with a check where
+   the spinner was. */
+.wt-catchup--done {
+    border: 1px solid rgba(0, 206, 201, 0.55);
+    animation: wt-catchup-done-in 0.25s ease-out;
+}
+.wt-catchup--done svg {
+    color: #00cec9;
+}
+@keyframes wt-catchup-done-in {
+    from { opacity: 0; transform: translateX(-50%) scale(0.96); }
+    to { opacity: 1; transform: translateX(-50%) scale(1); }
+}
+
+.wt-catchup-btn {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    padding: 4px 10px;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.12);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    color: #fff;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: background 0.15s, transform 0.15s;
+}
+.wt-catchup-btn:hover {
+    background: rgba(255, 255, 255, 0.2);
+}
+.wt-catchup-btn:active {
+    transform: scale(0.97);
+}
+
+.wt-catchup-close {
+    flex: none;
+    padding: 0 2px;
+    border: none;
+    background: transparent;
+    color: rgba(255, 255, 255, 0.5);
+    font-family: inherit;
+    font-size: 15px;
+    line-height: 1;
+    cursor: pointer;
+}
+.wt-catchup-close:hover {
+    color: rgba(255, 255, 255, 0.8);
+}
+
+/* Phone: one line where it fits, two at most. The count goes, the type and
+   the paddings shrink, and the pill may use the full width. */
+@media (max-width: 600px) {
+    .wt-catchup {
+        top: 8px;
+        gap: 6px;
+        max-width: calc(100% - 16px);
+        padding: 4px 8px;
+        font-size: 12px;
+        line-height: 1.25;
+    }
+    .wt-catchup-btn {
+        padding: 3px 8px;
+        font-size: 11px;
+    }
+}
+
+/* The translation offer: the catch-up pill's slot and shape, but the
+   sentence itself is the button. */
+.wt-offer {
+    gap: 0;
+    padding: 0 6px 0 0;
+    border: 1px solid rgba(232, 67, 147, 0.5);
+    transition: border-color 0.15s ease, background 0.15s ease;
+}
+/* Hover answers on the pill as a whole -- it is one button to the eye. */
+.wt-offer:has(.wt-offer-main:hover) {
+    border-color: rgba(253, 121, 168, 0.9);
+    background: rgba(0, 0, 0, 0.85);
+}
+.wt-offer-main {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 6px 7px 12px;
+    border: none;
+    border-radius: 999px;
+    background: transparent;
+    color: #fff;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+.wt-offer-mark {
+    flex: none;
+    color: #fd79a8;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+}
+.wt-offer svg {
+    color: rgba(255, 255, 255, 0.6);
+}
+/* The × is drawn, not typed: a glyph sits on the text baseline and reads
+   as sunk next to a centred sentence. */
+.wt-offer .wt-catchup-close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border-radius: 999px;
+}
+.wt-offer .wt-catchup-close svg {
+    width: 12px;
+    height: 12px;
+    color: currentColor;
+}
+.wt-offer .wt-catchup-close:hover {
+    background: rgba(255, 255, 255, 0.12);
+}
+/* Touch: the × is the only way out, so it gets a real target. */
+@media (hover: none) {
+    .wt-offer .wt-catchup-close {
+        width: 32px;
+        height: 32px;
+    }
+}
+
+.wt-offer-card {
+    position: absolute;
+    top: 56px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 41;
+    width: min(320px, calc(100% - 24px));
+    padding: 14px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 14px;
+    background: rgba(15, 15, 25, 0.92);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    color: #fff;
+    font-size: 13px;
+    line-height: 1.4;
+}
+.wt-offer-card-text {
+    margin: 0 0 10px;
+}
+.wt-offer-card-cta {
+    display: block;
+    padding: 8px 12px;
+    border-radius: 999px;
+    background: linear-gradient(90deg, #e84393, #6c5ce7);
+    color: #fff;
+    font-weight: 600;
+    text-align: center;
+    text-decoration: none;
+}
+.wt-offer-card-cta:hover {
+    filter: brightness(1.1);
+}
+.wt-offer-card-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    margin-top: 10px;
+}
+.wt-offer-card-link {
+    padding: 4px 0;
+    border: none;
+    background: transparent;
+    color: rgba(255, 255, 255, 0.6);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+}
+.wt-offer-card-link:hover {
+    color: #fff;
+}
+
+/* Logo/download overlay (ads) */
+.wt-player-logo {
+    position: absolute;
+    top: 0.5rem;
+    right: 0.5rem;
+    z-index: 25;
+    opacity: 0;
+    transition: opacity 0.3s ease;
+}
+
+.wt-player-mount:has(.wt-player--controls-visible) .wt-player-logo {
+    opacity: 1;
+}
+
+/* Playback speed (SpeedControl.jsx). The button's face is the rate itself,
+   so it is text-sized rather than icon-sized; it lights up when the film is
+   not at 1x, because a forgotten 1.5x is otherwise invisible. */
+.wt-player-speed {
+    position: relative;
+    display: flex;
+    align-items: center;
+}
+
+.wt-player-btn--speed {
+    width: auto;
+    min-width: 2rem;
+    padding: 0.375rem 0.4rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+}
+
+.wt-player-btn--speed-on {
+    color: #fd79a8;
+}
+
+/* The player's menus (speed, settings). In-flow fallback first (no Popover
+   API): above the button, clipped by the player's frame if the picture is
+   short; shown by the --open class. */
+.wt-player-menu {
+    position: absolute;
+    right: 0;
+    bottom: calc(100% + 0.5rem);
+    z-index: 30;
+    display: none;
+    flex-direction: column;
+    min-width: 13rem;
+    padding: 0.25rem;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 0.625rem;
+    background: rgba(15, 15, 25, 0.92);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    color: #fff;
+}
+
+.wt-player-menu--narrow {
+    min-width: 4.5rem;
+}
+
+.wt-player-menu--open {
+    display: flex;
+}
+
+/* The real thing: a popover lives in the top layer, so neither the player's
+   overflow:hidden nor fullscreen can cut it. useAnchoredPopover sets
+   top/left; the UA's centring (inset:0 + margin:auto) is undone here. */
+.wt-player-menu[popover] {
+    position: fixed;
+    inset: auto;
+    right: auto;
+    bottom: auto;
+    margin: 0;
+    display: none;
+}
+
+.wt-player-menu[popover]:popover-open {
+    display: flex;
+}
+
+/* The three dots are a sliver of a glyph: in the bar's square 2rem button they
+   sat in the middle of a lot of nothing and read as set apart from the row
+   (owner, 2026-09-20). The button is as narrow as the glyph allows; on a touch
+   screen it keeps a finger-sized target, and gives the space back with a
+   negative margin so the dots still sit close to their neighbour. */
+.wt-player-btn--more {
+    width: 1.25rem;
+    padding-left: 0;
+    padding-right: 0;
+}
+
+@media (max-width: 640px) and (pointer: coarse) {
+    .wt-player-btn--more {
+        width: 2rem;
+        margin-left: -0.375rem;
+        margin-right: -0.375rem;
+    }
+}
+
+.wt-player-settings {
+    position: relative;
+    display: flex;
+    align-items: center;
+}
+
+.wt-player-menu-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.5rem 0.625rem;
+    font-size: 0.8125rem;
+    color: rgba(255, 255, 255, 0.85);
+    cursor: pointer;
+}
+
+/* "Compatible mode" (SettingsControl, passthrough streams only): an action,
+   not a switch -- the name, and under it what it does. */
+.wt-player-menu-row--compat {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.125rem;
+    max-width: 16rem;
+    border: none;
+    border-radius: 0.375rem;
+    background: none;
+    text-align: left;
+}
+
+.wt-player-menu-row--compat:hover {
+    background: rgba(255, 255, 255, 0.08);
+    color: #fff;
+}
+
+.wt-player-menu-hint {
+    font-size: 0.6875rem;
+    line-height: 1.3;
+    color: rgba(255, 255, 255, 0.55);
+}
+
+.wt-player-speed-item {
+    padding: 0.375rem 0.625rem;
+    border: none;
+    border-radius: 0.375rem;
+    background: none;
+    color: rgba(255, 255, 255, 0.8);
+    font-size: 0.8125rem;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    cursor: pointer;
+}
+
+.wt-player-speed-item:hover {
+    background: rgba(255, 255, 255, 0.08);
+    color: #fff;
+}
+
+.wt-player-speed-item--active {
+    color: #fd79a8;
+    font-weight: 600;
+}
+
+@media (hover: none) {
+    .wt-player-speed-item {
+        padding: 0.5rem 0.75rem;
+    }
+}
+
+/* Double-tap seek feedback (tap-seek.js): a number on the side that was
+   tapped, gone in well under a second. pointer-events off -- it must never
+   catch the next tap of the streak. */
+.wt-tap-seek {
+    position: absolute;
+    top: 50%;
+    z-index: 15;
+    padding: 0.5rem 0.875rem;
+    border-radius: 999px;
+    background: rgba(0, 0, 0, 0.55);
+    color: #fff;
+    font-size: 1rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    pointer-events: none;
+    transform: translateY(-50%);
+    animation: wt-tap-seek 0.65s ease-out forwards;
+}
+
+.wt-tap-seek--left { left: 12%; }
+.wt-tap-seek--right { right: 12%; }
+
+@keyframes wt-tap-seek {
+    0% { opacity: 0; transform: translateY(-50%) scale(0.85); }
+    20% { opacity: 1; transform: translateY(-50%) scale(1); }
+    100% { opacity: 0; transform: translateY(-50%) scale(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    /* Shown plainly; Player.jsx removes it after 650 ms either way. */
+    .wt-tap-seek { animation: none; }
+}
+
+/* What a key just changed (speed, subtitle delay). Above the controls,
+   centred; pointer-events off so it never takes a tap. */
+.wt-player-toast {
+    position: absolute;
+    left: 50%;
+    bottom: 4.75rem;
+    z-index: 25;
+    padding: 0.375rem 0.75rem;
+    border-radius: 999px;
+    background: rgba(0, 0, 0, 0.72);
+    color: #fff;
+    font-size: 0.8125rem;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    pointer-events: none;
+    transform: translateX(-50%);
+    animation: wt-player-toast 1.2s ease-out forwards;
+}
+
+@keyframes wt-player-toast {
+    0% { opacity: 0; }
+    10% { opacity: 1; }
+    75% { opacity: 1; }
+    100% { opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .wt-player-toast { animation: none; }
+}
+
+/* The Next button: Play's own height, and wider by exactly what the bar adds
+   (the icon's box is 30x24 to Play's 24x24), so the triangle is the same size
+   as the one beside it. */
+.wt-player-btn--next {
+    width: auto;
+    height: 2.25rem;
+    padding: 0.375rem 0.25rem;
+}
+
+.wt-player-btn--next svg {
+    height: 100%;
+    width: auto;
+}
+
+@media (max-width: 640px) and (pointer: coarse) {
+    .wt-player-btn--next {
+        height: 2.75rem;
+        padding: 0.5rem 0.25rem;
+    }
+}
+
+.wt-player-btn-spinner {
+    display: block;
+    width: 1.125rem;
+    height: 1.125rem;
+    margin: 0 0.375rem;
+    border: 2px solid rgba(255, 255, 255, 0.25);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: wt-spin 0.8s linear infinite;
+}
+
+@keyframes wt-spin {
+    to { transform: rotate(360deg); }
+}
+
+/* Between two players the stage is empty (next-item-go.js holds its height):
+   black, with a spinner, so the page neither jumps nor goes blank. */
+.wt-player-stage--switching {
+    position: relative;
+    background: #000;
+    border-radius: var(--rounded-btn, 0.5rem);
+}
+
+/* The player's own spinner (icons.jsx LoadingSpinner), not a look-alike: the
+   first version drew a thinner ring, and it sat on top of the next player's
+   Play button (owner, 2026-09-20). Shown only while the stage is empty. */
+.wt-player-stage--empty::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 3rem;
+    height: 3rem;
+    margin: -1.5rem 0 0 -1.5rem;
+    opacity: 0.7;
+    background: no-repeat center / contain url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24'%3E%3Ccircle opacity='.25' cx='12' cy='12' r='10' stroke='%23fff' stroke-width='4'/%3E%3Cpath opacity='.75' fill='%23fff' d='M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z'/%3E%3C/svg%3E");
+    animation: wt-spin 1s linear infinite;
+}
+
+
+/* Next episode / track (next-item.js). Bottom-right, above the controls and
+   clear of the subtitles' line; small on purpose -- the last seconds of an
+   episode still belong to the episode.
+
+   In the player's own vocabulary, not the site's: the glass buttons of the
+   resume prompt (.wt-resume-btn). The first version had a pink button, which
+   in this design system means a homepage CTA -- "buy", not "play" (owner,
+   2026-09-20). */
+.wt-next-card {
+    position: absolute;
+    right: 0.75rem;
+    bottom: 4.75rem;
+    z-index: 26;
+    width: min(17rem, calc(100% - 1.5rem));
+    padding: 0.75rem;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 0.875rem;
+    background: rgba(0, 0, 0, 0.72);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    color: #fff;
+    cursor: default;
+}
+
+/* In the top layer (useDockedPopover sets top/left from the player's rect):
+   free to stick out of the player's frame, which cut it on a narrow player.
+   The UA's popover defaults (centring, canvas colours, scrollbars) are undone;
+   without the Popover API the rules above keep it inside the frame. */
+.wt-next-card[popover] {
+    position: fixed;
+    inset: auto;
+    right: auto;
+    bottom: auto;
+    margin: 0;
+    overflow: visible;
+    width: min(17rem, calc(100vw - 1.5rem));
+}
+
+.wt-next-card-kicker {
+    font-size: 0.6875rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: rgba(255, 255, 255, 0.55);
+}
+
+.wt-next-card-label {
+    margin-top: 0.25rem;
+    font-size: 0.875rem;
+    font-weight: 600;
+    line-height: 1.3;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+.wt-next-card-progress {
+    margin-top: 0.375rem;
+    font-size: 0.75rem;
+    line-height: 1.35;
+    color: rgba(255, 255, 255, 0.6);
+    font-variant-numeric: tabular-nums;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+.wt-next-card-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-top: 0.625rem;
+}
+
+.wt-next-card-go {
+    padding: 0.4375rem 0.875rem;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.12);
+    color: #fff;
+    font: inherit;
+    font-size: 0.8125rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s;
+}
+
+.wt-next-card-go:hover {
+    background: rgba(255, 255, 255, 0.2);
+}
+
+.wt-next-card-go:disabled {
+    opacity: 0.5;
+    cursor: progress;
+}
+
+.wt-next-card-link {
+    padding: 0.25rem 0;
+    border: none;
+    background: none;
+    color: rgba(255, 255, 255, 0.5);
+    font: inherit;
+    font-size: 0.8125rem;
+    cursor: pointer;
+}
+
+.wt-next-card-link:hover {
+    color: rgba(255, 255, 255, 0.8);
+}
+
+.wt-next-card-auto {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    justify-content: space-between;
+    margin-top: 0.625rem;
+    padding-top: 0.5rem;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    font-size: 0.75rem;
+    color: rgba(255, 255, 255, 0.55);
+    cursor: pointer;
+}
+
+/* The autoplay switch is the design system's own `toggle toggle-soft`
+   (style.css), the same one the subtitles switch in the track dialog is. The
+   first version drew its own, solid pink -- a second component that looked
+   like neither (owner, 2026-09-20). Both places it appears in, the card and
+   the audio controls, exist only on the main site, where that stylesheet is
+   loaded; the embed has no "next". */
+

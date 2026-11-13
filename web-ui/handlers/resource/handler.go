@@ -1,0 +1,128 @@
+package resource
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/anacrolix/torrent/metainfo"
+	"github.com/gin-gonic/gin"
+	"github.com/pkg/errors"
+	"github.com/urfave/cli"
+	cs "github.com/webtor-io/common-services"
+	j "github.com/webtor-io/web-ui/jobs"
+	"github.com/webtor-io/web-ui/services/api"
+	"github.com/webtor-io/web-ui/services/common"
+	"github.com/webtor-io/web-ui/services/enrich"
+	"github.com/webtor-io/web-ui/services/metrics"
+	"github.com/webtor-io/web-ui/services/offer"
+	"github.com/webtor-io/web-ui/services/template"
+	"github.com/webtor-io/web-ui/services/vault"
+	"github.com/webtor-io/web-ui/services/web"
+)
+
+type Handler struct {
+	api   *api.Api
+	jobs  *j.Jobs
+	tb    template.Builder[*web.Context]
+	pg    *cs.PG
+	vault *vault.Vault
+	// statusVault is vault for the status stream, nil without one (a nil
+	// *vault.Vault in the interface would not be nil).
+	statusVault    statusVault
+	enricher       *enrich.Enricher
+	useDirectLinks bool
+	secret         string
+	// offers sells the way out of a plan cap in the status's plan box
+	// (services/statusview); nil-safe — no catalog, nothing sold.
+	offers *offer.Service
+}
+
+func RegisterHandler(c *cli.Context, r *gin.Engine, tm *template.Manager[*web.Context], api *api.Api, jobs *j.Jobs, pg *cs.PG, v *vault.Vault, en *enrich.Enricher, offers *offer.Service) {
+	secret := c.String(common.SessionSecretFlag)
+	helper := NewHelper(secret)
+	h := &Handler{
+		api:            api,
+		jobs:           jobs,
+		tb:             tm.MustRegisterViews("resource/*").WithHelper(helper).WithLayout("main"),
+		pg:             pg,
+		vault:          v,
+		enricher:       en,
+		useDirectLinks: c.BoolT(common.UseDirectLinks),
+		secret:         secret,
+		offers:         offers,
+	}
+	if v != nil {
+		h.statusVault = v
+	}
+	r.POST("/", h.post)
+	r.GET("/share", h.share)
+	r.GET("/:resource_id/status", metrics.Streaming, h.status)
+	r.GET("/:resource_id", func(c *gin.Context) {
+		rid := c.Param("resource_id")
+		if strings.HasPrefix(rid, "magnet") {
+			h.post(c)
+			return
+		}
+		if strings.HasSuffix(rid, ".torrent") {
+			h.downloadTorrent(c)
+			return
+		}
+		h.get(c)
+	})
+}
+
+func (s *Handler) downloadTorrent(c *gin.Context) {
+	resourceID := strings.TrimSuffix(c.Param("resource_id"), ".torrent")
+	claims := api.GetClaimsFromContext(c)
+
+	// The link on the resource page carries a short-lived token bound to
+	// the infohash (torrent_link.go). A missing or stale one — a bookmark,
+	// a link copied onto a torrent index — lands on the resource page,
+	// where a person finds a fresh button and a crawler finds HTML.
+	if s.secret != "" {
+		if err := CheckTorrentFileToken(s.secret, c.Query("token"), resourceID, time.Now()); err != nil {
+			c.Redirect(http.StatusFound, "/"+resourceID)
+			return
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	torrent, err := s.api.GetTorrentCached(ctx, claims, resourceID)
+	if err != nil {
+		// A banned torrent is refused upstream (PermissionDenied); that is
+		// a plain "not available", not a server fault.
+		if strings.Contains(err.Error(), "PermissionDenied") || strings.Contains(err.Error(), "restricted") {
+			c.String(http.StatusNotFound, "not available")
+			return
+		}
+		_ = c.Error(errors.Wrap(err, "failed to get torrent"))
+		c.String(http.StatusInternalServerError, "failed to get torrent")
+		return
+	}
+
+	mi, err := metainfo.Load(bytes.NewReader(torrent))
+	if err != nil {
+		_ = c.Error(errors.Wrap(err, "failed to load torrent metainfo"))
+		c.String(http.StatusInternalServerError, "failed to load torrent")
+		return
+	}
+	info, err := mi.UnmarshalInfo()
+	if err != nil {
+		_ = c.Error(errors.Wrap(err, "failed to unmarshal torrent metainfo"))
+		c.String(http.StatusInternalServerError, "failed to parse torrent")
+		return
+	}
+
+	filename := info.Name + ".torrent"
+	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	c.Header("Content-Length", fmt.Sprintf("%d", len(torrent)))
+	// Signed per page render — never let an edge cache hand it out by URL.
+	c.Header("Cache-Control", "private, no-store")
+	c.Data(http.StatusOK, "application/x-bittorrent", torrent)
+}

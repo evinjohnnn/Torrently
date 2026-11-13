@@ -1,0 +1,11 @@
+{
+  "input": "Bolshaya.dvadcatka.2025.AMZN.WEB-DLRip.AVC.mkv",
+  "want": {
+    "title": "Bolshaya dvadcatka",
+    "year": 2025,
+    "quality": "WEB-DLRip",
+    "studio": "AMZN",
+    "container": "mkv",
+    "avc": true
+  }
+}

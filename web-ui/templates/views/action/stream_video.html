@@ -1,0 +1,507 @@
+{{ define "main" }}
+{{ with .Data }}
+{{/* One ladder run per render, and one result. getSubtitles used to be
+     called twice on the same data -- once for the <track> loop below and
+     once for the picker -- and the two runs could disagree: the browser
+     started on one track while the picker's check sat on another, and $off
+     could contradict <track default>. It also cost two language.NewMatcher
+     builds and ~120 language.Parse calls with a full OpenSubtitles list. */}}
+{{ $subs := getSubtitles .VideoStreamUserData .MediaProbe .ExportTag .OpenSubtitles .ExternalData .UserSubtitles .SubtitleOpts }}
+<div class="relative">
+    <video class="player"
+           crossorigin="anonymous"
+           preload="{{ .ExportTag.Preload }}"
+           data-resource-id="{{ .VideoStreamUserData.ResourceID }}"
+           {{/* The file that follows this one (jobs/scripts/next_item.go): absent =
+                no "next" control, no autoplay. See docs/player.md. */}}
+           {{ if .CreditsAt }}data-credits-at="{{ .CreditsAt }}"{{ end }}
+           {{ if .Next }}data-next-item-id="{{ .Next.ItemID }}" data-next-path="{{ .Next.Path }}" data-next-kind="{{ .Next.Kind }}" data-next-label="{{ .Next.Label }}"{{ end }}
+           data-path="{{ .Item.PathStr }}"
+           {{ if .Title }}data-resource-title="{{ .Title }}"{{ end }}
+           data-share-url="{{ domain }}{{ langPath $.Lang (printf "/%s" .VideoStreamUserData.ResourceID) }}{{ if .Item }}?file={{ .Item.PathStr | urlquery }}{{ end }}"
+           {{ if .ExternalData.Poster }}poster="{{ .ExternalData.Poster }}"
+           {{ else if .ExportTag.Poster }}poster="{{ .ExportTag.Poster }}" {{ end }}
+           {{ if .TranscoderSession }}data-duration="{{ .TranscoderSession.Duration }}"
+           {{ else if .MediaProbe }}data-duration="{{ .MediaProbe | getDurationSec }}" {{ end }}
+           {{/* The source's video codecs, as the job's media probe saw them
+                (a cover picture is one too): read only by the codec-support
+                event (lib/player/codec-support.js). Absent = no probe. */}}
+           {{ if .MediaProbe }}data-video-codecs="{{ range .MediaProbe.Streams }}{{ if eq .CodecType "video" }}{{ .CodecName }} {{ end }}{{ end }}"{{ end }}
+           {{ if .TranscoderSession }}data-session-id="{{ .TranscoderSession.ID }}"{{ end }}
+           {{ if .SessionSeekURL }}data-session-seek-url="{{ .SessionSeekURL }}"{{ end }}
+           {{- /* The transcoder session's route and its reason
+                (content-transcoder POST /session: passthrough, copy,
+                reencode, audio; ok, no_declaration, ...), the declaration
+                the start sent (data-decode) and, for a passthrough, the
+                decoder class its video needs and how long one segment may
+                load (StreamContent.VideoClass, FragLoadMs). Read by the
+                player's passthrough handling and stream-start
+                (docs/player.md). Trimmed and only where known: without
+                them the tag is what it was. */}}
+           {{- with .TranscoderSession }}{{ if .VideoRoute }} data-video-route="{{ .VideoRoute }}"{{ end }}{{ if .RouteReason }} data-route-reason="{{ .RouteReason }}"{{ end }}{{ end }}
+           {{- if .VideoClass }} data-video-class="{{ .VideoClass }}"{{ end }}
+           {{- if .FragLoadMs }} data-frag-load-ms="{{ .FragLoadMs }}"{{ end }}
+           {{- /* What the declaration made of the session's audio, on any
+                route (StreamContent.AudioClass: dolby, aac51): the class a
+                failure of that audio is charged to. Only for a start that
+                declared an audio token and got such audio. */}}
+           {{- if .AudioClass }} data-audio-class="{{ .AudioClass }}"{{ end }}
+           {{- /* The file, for the player's own restart -- a passthrough's
+                fallback, or a multichannel-audio start's: the restart is
+                this file's, even where the page's start form has moved on
+                to another (lib/player/passthrough.js). */}}
+           {{- if .PlayerRestarts }} data-item-id="{{ .VideoStreamUserData.ItemID }}"{{ end }}
+           {{- with .VideoStreamUserData }}{{ if .Decode }} data-decode="{{ .Decode }}"{{ end }}{{ end }}
+           {{ if .GraceDurationSec }}data-grace-duration-sec="{{ .GraceDurationSec }}"{{ end }}
+           {{- /* The resource status's plan-box line while this player buffers
+                under the viewer's cap, with the file's bitrate the status
+                stream cannot know (jobs/scripts StreamContent.StatusStallSub,
+                read by lib/playerActivity.js). Trimmed: without it the tag is
+                byte-for-byte what it was. */}}
+           {{- if .StatusStallSub }} data-status-stall-sub="{{ .StatusStallSub }}"{{ end }}
+           {{- if .StatusFitsCap }} data-status-fits-cap{{ end }}
+           {{- /* The file needs more than the viewer's cap: the status shows
+                the stream box as soon as it is due, not at the first stall
+                (StreamContent.StatusOverCap). */}}
+           {{- if .StatusOverCap }} data-status-over-cap{{ end }}
+           {{- /* The viewer chose "watch as is" on the slow-download modal:
+                an answered offer, like the grace popup's -- the status sells
+                nothing more until the player really stalls
+                (StreamContent.StatusAnswered). */}}
+           {{- if .StatusAnswered }} data-offer-answered="continue-slow"{{ end }}
+           {{- /* The buffering label's lock and its card, drawn by the player
+                itself once the viewer has answered the grace popup (#grace-cta
+                below; lib/player/buffering-label.js answerLabel) -- the
+                transfer status's own label comes 8-15 s later, and is
+                preferred once it does. The status's stream box in its own
+                words: the same keys, the same number (StreamContent.CapCard),
+                the promo plan through the player's own /trial surface and
+                button as the grace popup reads it, only with something faster
+                on sale. Its line with what the file needs is
+                data-status-stall-sub above. Trimmed: absent, the tag is what
+                it was. */}}
+           {{- with .CapCard }}{{ $card := . }}{{ with promoOffer }}{{ if $card.Sells . }}
+           data-cap-card-rate="{{ $card.Rate }}" data-cap-card-sub="{{ $card.Line }}"
+           data-cap-card-title="{{ t $.Lang "resource.status.streamStallTitle" }}"
+           data-cap-card-cta="{{ t $.Lang "offer.watchUncapped" }}"
+           data-cap-card-url="{{ or (trialURL $.Lang "player-label" .) .URL (langPath $.Lang "/donate") }}"
+           data-cap-card-target="{{ if .TrialDays }}trial{{ else if .URL }}checkout{{ else }}donate{{ end }}"
+           {{- if .TrialDays }} data-cap-card-note="{{ tn $.Lang "offer.trialNote" .TrialDays }}"{{ end }}
+           data-cap-card-auth="{{ $card.Auth }}" data-cap-card-tier="{{ $card.Tier }}"
+           {{- end }}{{ end }}{{ end }}
+           {{ if .Settings | hasControls }}controls{{ end }}
+           {{ if .Settings.Width }}width="{{ .Settings.Width }}"{{ end }}
+           {{ if .Settings.Height }}height="{{ .Settings.Height }}"{{ end }}
+           autoplay
+           playsinline
+           data-settings="{{ .Settings | json }}">
+        {{ range .ExportTag.Sources }}
+        <source src="{{ .Src }}" type="{{ .Type }}">
+        {{ end }}
+        {{/* Browsers fetch every <track> element on page load regardless of
+             its mode, and with 40+ OpenSubtitles tracks that burst tripped
+             the proxy's per-session caps (429). Only tracks marked Preload
+             (default, viewer's language, English; see markPreload) are
+             rendered so the native iOS menu still offers them; the rest are
+             created on selection by activateSubtitle in Player.jsx from the
+             list items' data-src/data-label/data-srclang. */}}
+        {{ range $subs }}
+        {{ if .Preload }}
+        <track src="{{ .Src }}" id="{{ .ID }}" srclang="{{ .SrcLang }}" label="{{ .Label }}" kind="{{ .Kind }}" {{ if .Default }}default="default"{{ end }}>
+        {{ end }}
+        {{ end }}
+    </video>
+    {{/* Native <dialog> + showModal(), not a checkbox modal: the player goes
+         fullscreen on its own container, and a fullscreen element only
+         renders its own subtree — a CSS-toggled sibling is invisible until
+         the user leaves fullscreen. A modal dialog lives in the top layer
+         and stacks above the fullscreen element, so the picker opens
+         in-place. Opened from Player.jsx (handleCaptionsClick). */}}
+    {{/* Subtitles are off when the "None" item is the default. That is the
+         one state the switch leading the language row shows, and the chip
+         rows are rendered muted for it (.picker-off) with the
+         chosen track still marked -- the viewer sees what comes back when
+         they switch it on. */}}
+    {{ $off := false }}{{ range $subs }}{{ if and .Default (eq .ID "none") }}{{ $off = true }}{{ end }}{{ end }}
+    <dialog class="modal" id="subtitles" data-resource-id="{{ .VideoStreamUserData.ResourceID }}" data-item-id="{{ .VideoStreamUserData.ItemID }}" data-preferred-lang="{{ .SubtitleOpts.PreferredLang }}" data-subtitles-off="{{ if $off }}true{{ else }}false{{ end }}"{{ if .SubtitlesNotReady }} data-subtitles-not-ready="true"{{ end }}>
+        {{/* Every subtitle item is rendered by the loop below, uploads
+             included: they are UserSubtitle entries of this same
+             GetSubtitles result, and a MY chip is a radio that belongs
+             inside the radiogroup with the rest, grouped by its language.
+             The user_subtitles_view partial below the row contributes only
+             the disclosure button and the uploads panel (and, on the async
+             reload, a fresh set of chips the client moves in) — see
+             .RenderChips there. */}}
+        {{ $withUploads := and (not .DomainSettings) .UserSubtitlesEnabled }}
+        {{ $row := subtitleLangGroups $subs .SubtitleOpts.PreferredLang }}
+        <div class="modal-box w-full sm:w-11/12 max-w-5xl">
+
+            {{/* ===== AUDIO ===== */}}
+            <div class="mb-5">
+                <div class="flex items-baseline justify-between gap-3 mb-2">
+                    <h3 class="font-bold text-lg">{{ t $.Lang "action.stream.audio" }}</h3>
+                </div>
+                <div id="audio-tracks" class="flex flex-wrap gap-1.5" role="radiogroup" aria-label="{{ t $.Lang "action.stream.audio" }}">
+                    {{ range getAudioTracks .VideoStreamUserData .MediaProbe }}
+                    {{ $d := langDisplay .SrcLang }}{{ $sfx := audioSuffix . }}
+                    <button type="button" role="radio" aria-checked="{{ if .Default }}true{{ else }}false{{ end }}"
+                            data-id="{{ .ID }}" data-mp-id="{{ .MPID }}" data-srclang="{{ .SrcLang }}" data-provider="{{ .Provider }}" data-label="{{ .Label }}"
+                            data-lang="{{ $d.Lang }}" data-lang-name="{{ $d.Name }}" data-lang-flag="{{ $d.Flag }}"
+                            {{ if .Default }}data-default="true" {{ end }}
+                            class="audio track-chip{{ if .Default }} track-chip-active{{ end }}">
+                        <svg class="chip-check w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" aria-hidden="true"{{ if not .Default }} hidden{{ end }}><polyline points="20 6 9 17 4 12"/></svg>
+                        {{ if $d.Name }}<span><span class="chip-flag">{{ $d.Flag }}</span> {{ $d.Name }}</span>{{ else }}<span class="font-mono text-xs text-w-muted">{{ $d.Code }}</span>{{ end }}
+                        {{ if $sfx }}<span class="text-w-muted font-normal max-w-[9rem] sm:max-w-[14rem] truncate" title="{{ $sfx }}">{{ if $d.Name }}· {{ end }}{{ $sfx }}</span>{{ end }}
+                    </button>
+                    {{ end }}
+                </div>
+            </div>
+
+            {{/* ===== SUBTITLES ===== */}}
+            {{/* A hairline between the sections, the same one that sets the
+                 footer apart (owner, 2026-09-19): three blocks, three jobs. */}}
+            <div class="pt-5 border-t border-w-line">
+                {{/* The switch sits by the heading it switches (owner,
+                     2026-09-19; it led the language row since 2026-09-16,
+                     where the "Off" chip used to be). Beside three wrapped
+                     rows of chips on a phone it floated mid-height with
+                     nothing to read it against; here it reads as "Subtitles:
+                     on/off". It must stay legible while subtitles are off,
+                     so the dimming still lives on .lang-row and
+                     #subtitle-tracks, never on a box that contains it. The
+                     "None" item itself stays in #subtitle-tracks as a hidden
+                     carrier the player activates by id. */}}
+                <div class="flex items-center gap-3 mb-2">
+                    <h3 class="font-bold text-lg">{{ t $.Lang "action.stream.subtitles" }}</h3>
+                    <label class="flex items-center cursor-pointer shrink-0">
+                        <span class="sr-only">{{ t $.Lang "action.stream.subtitles" }}</span>
+                        <input type="checkbox" id="subtitles-toggle" class="toggle toggle-soft"{{ if not $off }} checked{{ end }}>
+                    </label>
+                    {{/* The viewer's correction for a subtitle file that runs early
+                         or late (docs/player.md, "Subtitle delay"). Markup only:
+                         the player paints the value, enables the buttons and owns
+                         the clicks ([data-sub-delay], Player.jsx) -- the number is
+                         per file and lives in the browser. Pushed to the right of
+                         the header so it costs no row of its own on a phone. */}}
+                    <div id="subtitle-delay" class="ml-auto flex items-center gap-1.5 text-xs text-w-sub"
+                         data-embedded-hint="{{ t $.Lang "action.stream.subtitleDelayEmbedded" }}">
+                        <span class="hidden sm:inline">{{ t $.Lang "action.stream.subtitleDelay" }}</span>
+                        <button type="button" class="btn btn-xs btn-ghost border border-w-line px-2" data-sub-delay="earlier"
+                                aria-label="{{ t $.Lang "action.stream.subtitleDelayEarlier" }}" title="{{ t $.Lang "action.stream.subtitleDelayEarlier" }} (g)">&minus;</button>
+                        <output id="subtitle-delay-value" class="min-w-[4.25rem] text-center tabular-nums text-base-content" aria-live="polite"></output>
+                        <button type="button" class="btn btn-xs btn-ghost border border-w-line px-2" data-sub-delay="later"
+                                aria-label="{{ t $.Lang "action.stream.subtitleDelayLater" }}" title="{{ t $.Lang "action.stream.subtitleDelayLater" }} (h)">+</button>
+                        {{/* Always there, disabled at zero (owner, 2026-09-20). It
+                             used to appear on the first press: the row is
+                             right-aligned, so it pushed the others left and landed
+                             under the finger that had just pressed "+". */}}
+                        <button type="button" class="btn btn-xs btn-ghost px-1.5 text-w-muted" disabled data-sub-delay="reset"
+                                aria-label="{{ t $.Lang "action.stream.subtitleDelayReset" }}" title="{{ t $.Lang "action.stream.subtitleDelayReset" }}">&times;</button>
+                    </div>
+                </div>
+
+                {{/* The language row is a filter, not a choice: pressing a chip
+                     collapses the other languages in the track row below and
+                     changes nothing about playback. Hence role="group" with
+                     aria-pressed buttons rather than a tablist — there are no
+                     tab panels, and the one real choice (which track plays)
+                     lives in the radiogroup underneath. */}}
+                <div id="subtitle-langs" class="flex items-start gap-2 mb-3" role="group" aria-label="{{ t $.Lang "action.stream.subtitleControls" }}">
+                    <div class="lang-row flex flex-wrap items-center gap-1.5{{ if $off }} picker-off{{ end }}">
+                    {{ range $row.Groups }}
+                    <button type="button" class="lang lang-chip{{ if eq .Lang $row.Expanded }} lang-chip-active{{ end }}"
+                            data-lang="{{ .Lang }}" aria-pressed="{{ if eq .Lang $row.Expanded }}true{{ else }}false{{ end }}"{{ if .Overflow }} hidden{{ end }}>
+                        {{ if .Name }}<span class="chip-flag">{{ .Flag }}</span> <span class="lang-name">{{ .Name }}</span>{{ else }}<span class="lang-name font-mono">{{ .Code }}</span>{{ end }}
+                        <span class="lang-count text-w-muted font-normal">{{ .Count }}</span>
+                        <span class="lang-dot w-1.5 h-1.5 rounded-full bg-w-cyan" aria-hidden="true"{{ if not .Active }} hidden{{ end }}></span>
+                    </button>
+                    {{ end }}
+                    {{/* The whole label lives in .more-count: track-picker.js
+                         rewrites that span's text ("+3" collapsed, "×"
+                         expanded), so a literal "+" outside it would survive
+                         the rewrite and read "++3" / "+×". */}}
+                    <button type="button" id="subtitle-lang-more" class="lang-chip text-w-muted"
+                            aria-expanded="false" title="{{ t $.Lang "action.stream.moreLanguages" }}" aria-label="{{ t $.Lang "action.stream.moreLanguages" }}"{{ if not $row.Overflow }} hidden{{ end }}><span class="more-count">+{{ $row.Overflow }}</span></button>
+                    {{/* Cloned by track-picker.js when an upload introduces a
+                         language the server did not render a chip for. Filled
+                         through textContent only — no HTML is built in JS. */}}
+                    <template id="lang-chip-template">
+                        <button type="button" class="lang lang-chip" data-lang="" aria-pressed="false">
+                            <span class="chip-flag"></span> <span class="lang-name"></span>
+                            <span class="lang-count text-w-muted font-normal">0</span>
+                            <span class="lang-dot w-1.5 h-1.5 rounded-full bg-w-cyan" aria-hidden="true" hidden></span>
+                        </button>
+                    </template>
+                    </div>
+                </div>
+
+                {{/* The "None" item has no chip of its own any more — the
+                     toggle above is the control. It still has to exist in the
+                     DOM, because the player activates it by id
+                     (findSubtitleItem, pickDefaultSubtitle, hasSavedDefault,
+                     dropDeletedTracks), so it is rendered here as a hidden
+                     state carrier: first child of the row, hidden and
+                     aria-hidden, never unhidden by the language filter. One
+                     element for the state, one control for the act. */}}
+                {{/* The tracks and the uploads button share a line from `sm`
+                     up (owner, 2026-09-19): the button is one more way to
+                     get a track, not a section of its own, and a line to
+                     itself under a single AI chip read as one. On a phone
+                     they stack as before -- the chips need the width. The
+                     radiogroup keeps its own box (it carries picker-off, and
+                     an opacity on display:contents paints nothing);
+                     #my-subtitles is the one that dissolves, so its button
+                     follows the last chip -- next to it, not pushed to the
+                     far edge, where it read as unrelated -- and its panel,
+                     basis-full, opens under both. A row of chips that wraps
+                     fills the line, and the button starts the next one. */}}
+                <div class="flex flex-col sm:flex-row sm:flex-wrap sm:items-start gap-x-1.5 gap-y-3 mb-3">
+                <div id="subtitle-tracks" class="flex flex-wrap gap-1.5 sm:min-w-0 sm:max-w-full{{ if $off }} picker-off{{ end }}" role="radiogroup" aria-label="{{ t $.Lang "action.stream.subtitles" }}">
+                    {{ range $subs }}{{ if eq .ID "none" }}
+                    <button type="button" id="subtitle-none" class="subtitle" hidden aria-hidden="true" tabindex="-1"
+                            data-id="none" data-provider="{{ .Provider }}" data-srclang="" data-kind="{{ .Kind }}" data-rank="{{ .Rank }}" data-lang="und"
+                            {{ if .Default }}data-default="true" {{ end }}{{ if .Saved }}data-saved="true" {{ end }}></button>
+                    {{ end }}{{ end }}
+                    {{ range $subs }}{{ if ne .ID "none" }}
+                    {{ $d := langDisplay .SrcLang }}{{ $dl := langDisplayIn $.Lang .SrcLang }}{{ $oc := originCode . }}
+                    {{/* Two different questions, two different fields:
+                         .Suggested is what the switch brings back (drawn as
+                         the muted "this is what comes back" check and fill),
+                         .Offered is the translation the viewer may start
+                         (drawn as an action with an accent outline). One
+                         list often carries both, on two different chips. */}}
+                    {{ $ai := eq .Provider "Translated" }}
+                    {{ $marked := or .Default (and $off .Suggested) }}
+                    {{/* aria-checked follows the look: while the block is
+                         muted the suggested chip wears the check and the
+                         fill, so a reader must hear it as the chosen one
+                         too — the switch, not this radiogroup, is what says
+                         subtitles are off. */}}
+                    <button type="button" role="radio" aria-checked="{{ if $marked }}true{{ else }}false{{ end }}"
+                            data-id="{{ .ID }}" data-mp-id="{{ .MPID }}" data-srclang="{{ .SrcLang }}" data-provider="{{ .Provider }}" data-src="{{ .Src }}" data-label="{{ .Label }}" data-kind="{{ .Kind }}" data-badge="{{ .Badge }}" data-source="{{ .Source }}" data-rank="{{ .Rank }}"
+                            data-lang="{{ $d.Lang }}" data-lang-name="{{ $d.Name }}" data-lang-flag="{{ $d.Flag }}"
+                            {{ if .SourceBadge }}data-source-badge="{{ .SourceBadge }}" {{ end }}{{ if .LangGuessed }}data-lang-guessed="true" {{ end }}{{ if .Forced }}data-forced="true" {{ end }}{{ if .Locked }}data-locked="true" {{ end }}{{ if or .Locked $off }}aria-disabled="true" {{ end }}{{ if .Default }}data-default="true" {{ end }}{{ if .Saved }}data-saved="true" {{ end }}{{ if .Suggested }}data-suggested="true" {{ end }}{{ if .Offered }}data-offered="true" {{ end }}{{ if .Upsell }}data-upsell="true" {{ end }}{{ if or .Offered .Upsell }}data-offer-label="{{ tp $.Lang "action.stream.translate.action" "Language" $dl.Localized }}" {{ end }}
+                            {{ if ne $d.Lang $row.Expanded }}hidden{{ end }}
+                            {{/* While subtitles are off the chip the toggle
+                                 would restore keeps the active look: the
+                                 block is muted, not emptied. .Suggested is
+                                 the server's answer to "what comes back"
+                                 (helper.go markSuggested); the client
+                                 remembers a within-session choice in
+                                 data-last-subtitle instead. */}}
+                            class="subtitle track-chip{{ if $marked }} track-chip-active{{ else if .Locked }} chip-locked{{ end }}{{ if .Offered }} chip-offered{{ end }}">
+                        <svg class="chip-check w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" aria-hidden="true"{{ if not $marked }} hidden{{ end }}><polyline points="20 6 9 17 4 12"/></svg>
+                        {{/* Two states, two spans, no innerHTML: an OFFERED
+                             translation is a verb ("✦ AI Translate to
+                             Portuguese"), anything else — playing, or locked
+                             for a free viewer who can only be sold it —
+                             reads like a track ("Portuguese · from EM" plus
+                             the progress). setChipActive flips
+                             .ai-action / .ai-label. The verb spans are not
+                             rendered at all unless the item is Offered, so a
+                             locked chip (an upsell, not an action) keeps
+                             exactly the markup it always had. */}}
+                        {{ if .Offered }}<span class="ai-action" aria-hidden="true">✦</span>{{ end }}
+                        {{/* The origin badge carries both halves of "where did
+                             this come from". Its title names the origin and, for
+                             an OpenSubtitles track matched by title rather than
+                             by this file's moviehash, says what that means ("may
+                             be out of sync"). The visible half is a muted "~"
+                             inside the badge: the badge never truncates (the
+                             label span is what does), and a code plus a tilde
+                             costs no width and needs no translation — where the
+                             raw "hash"/"imdb" enum this replaced was English in
+                             every locale. */}}
+                        {{ if $oc }}<span class="chip-origin badge badge-xs font-mono font-semibold tracking-wider {{ if eq $oc "MY" }}bg-w-purple/10 border-w-purple/30 text-w-purpleL{{ else if eq $oc "AI" }}bg-w-pink/10 border-w-pink/30 text-w-pinkL{{ else }}bg-base-300/80 border-w-line/50 text-w-sub{{ end }}" title="{{ t $.Lang (originKey .) }}{{ with originHintKey . }} — {{ t $.Lang . }}{{ end }}">{{ $oc }}{{ if originHintKey . }}<span class="text-w-muted font-normal" aria-hidden="true">~</span>{{ end }}</span>{{ end }}
+                        {{ if .Offered }}<span class="ai-action max-w-[9rem] sm:max-w-[14rem] truncate" title="{{ tp $.Lang "action.stream.translate.action" "Language" $dl.Localized }}">{{ tp $.Lang "action.stream.translate.action" "Language" $dl.Localized }}</span>{{ end }}
+                        <span class="{{ if $ai }}ai-label {{ end }}max-w-[9rem] sm:max-w-[14rem] truncate"{{ if and $ai .Offered }} hidden{{ end }} title="{{ .Label }}">{{ .Label }}</span>
+                        {{ range propertyTags . }}<span class="badge badge-xs border-w-line/50 text-w-muted uppercase tracking-wider" title="{{ t $.Lang (printf "action.stream.badge.%s" .) }}">{{ . }}</span>{{ end }}
+                        {{ if .SourceBadge }}<span class="{{ if $ai }}ai-label {{ end }}text-w-muted font-normal"{{ if and $ai .Offered }} hidden{{ end }}>· {{ t $.Lang "action.stream.translate.from" }} {{ originCodeForBadge .SourceBadge }}</span>{{ end }}
+                        {{ if eq .Provider "Translated" }}<span class="tr-progress text-w-muted font-normal" hidden></span><span class="tr-spinner loading loading-spinner loading-xs text-w-pinkL" aria-hidden="true" hidden></span>{{ end }}
+                        {{ if .Locked }}<svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg><span class="sr-only">{{ t $.Lang "action.stream.locked.aria" }}</span>{{ end }}
+                    </button>
+                    {{ end }}{{ end }}
+                </div>
+
+                {{/* The uploads block is a SIBLING of the radiogroup, not a
+                     child of it (a11y, ruling R8): a role="radiogroup"
+                     contains radios and nothing else, and this block holds a
+                     disclosure button and — when open — a heading, a close
+                     control, an upload form and one delete form per file.
+
+                     #my-subtitles is still the single element the async swap
+                     replaces (data-async-layout, and every form inside posts
+                     with data-async-target="#my-subtitles"), so an upload or
+                     a delete re-renders exactly one container, as before. The
+                     MY chips that come back in that response do not belong
+                     here: adoptUploadChips (track-picker.js) moves them into
+                     #subtitle-tracks and drops the stale chip of the same
+                     data-id. On this render the partial emits no chips at all
+                     (RenderChips is false) — the loop above already did, in
+                     the right place, which is what keeps a no-JS page
+                     correct. */}}
+                {{ if $withUploads }}
+                {{ $usv := userSubtitleView .VideoStreamUserData.ResourceID .Item.PathStr .EIURL .UserSubtitles $subs $row.Expanded }}
+                <div id="my-subtitles" class="flex flex-wrap items-start gap-1.5 sm:contents" data-async-layout='{{`{{ template "user_subtitles_view" (withContext $ .Data) }}`}}'>
+                    {{ template "user_subtitles_view" withContext $ $usv }}
+                </div>
+                {{ end }}
+                </div>
+
+                {{/* What the offer above means, in words: this language has
+                     no subtitles yet and the translation is there to be
+                     started. All three conditions, because the sentence has
+                     to be true: an item is .Offered, it is not the track
+                     already playing, and its language holds nothing else the
+                     viewer could turn on — one forced sidecar in that
+                     language and "no subtitles yet" is simply false. The
+                     client reads the same three off the chips
+                     (offerNeedsHint in track-picker.js) and re-applies them
+                     on every refresh. */}}
+                {{ $offerPending := false }}
+                {{ range $offer := $subs }}{{ if and $offer.Offered (not $offer.Default) }}
+                    {{ $rival := false }}
+                    {{ range $subs }}{{ if and (ne .ID $offer.ID) (ne .ID "none") (not .Locked) (eq (langDisplay .SrcLang).Lang (langDisplay $offer.SrcLang).Lang) }}{{ $rival = true }}{{ end }}{{ end }}
+                    {{ if not $rival }}{{ $offerPending = true }}{{ end }}
+                {{ end }}{{ end }}
+                {{ $pd := langDisplayIn $.Lang .SubtitleOpts.PreferredLang }}
+                <p id="subtitle-hint" class="text-xs text-w-muted mb-3"{{ if not $offerPending }} hidden{{ end }}>{{ tp $.Lang "action.stream.translate.hint" "Language" $pd.Localized }}</p>
+
+                <div id="translate-cta" class="mb-3 p-3 rounded-xl bg-base-200/60 border border-w-line max-w-md" hidden>
+                    <div class="text-sm">{{ t $.Lang "action.stream.translate.locked" }}</div>
+                    <a href="{{ langPath $.Lang "/donate" }}" target="_blank" class="btn btn-sm btn-soft mt-2" data-umami-event="donate-subtitle-translate" data-umami-event-tier="{{ if $.User | hasAuth }}free{{ else }}anon{{ end }}">{{ t $.Lang "action.stream.translate.cta" }}</a>
+                </div>
+
+                <p class="text-[0.7rem] text-w-muted">
+                    <span class="font-mono">EM</span> {{ t $.Lang "action.stream.origin.em" }} ·
+                    <span class="font-mono">IN</span> {{ t $.Lang "action.stream.origin.in" }} ·
+                    <span class="font-mono">OS</span> {{ t $.Lang "action.stream.origin.os" }} ·
+                    <span class="font-mono">MY</span> {{ t $.Lang "action.stream.origin.my" }} ·
+                    <span class="font-mono">AI</span> {{ t $.Lang "action.stream.origin.ai" }}
+                </p>
+            </div>
+
+            {{/* The viewer's preferred language, said out loud and changeable
+                 in place (owner, 2026-09-19). A setting of the viewer, not of
+                 the subtitles section, so it sits in the dialog's footer,
+                 beside Close, the way the embed dialog keeps its note there:
+                 it decides which track the ladder turns on and whether a
+                 translation is offered, and until now the only way to learn
+                 it was to guess from the result. It is the profile's
+                 preferred language itself, not a player setting of its own;
+                 a viewer without an account keeps it in the session. Absent
+                 in an embed and with the feature off -- PreferredLang is ""
+                 there, and the footer is Close alone. A hairline sets the
+                 footer apart from the tracks above it: what is in it is
+                 about the viewer, not about this file. On a phone the two
+                 stack: the select, then the button. */}}
+            <div class="modal-action flex-col items-stretch gap-3 sm:flex-row sm:items-center mt-5 pt-4 border-t border-w-line">
+                {{ if .SubtitleOpts.PreferredLang }}
+                {{/* Bound here: inside the range the dot is a language, and
+                     `$` is the page wrapper, not this view's data. */}}
+                {{ $preferred := .SubtitleOpts.PreferredLang }}
+                <label class="flex-grow flex items-center gap-2 min-w-0 text-sm text-w-sub" title="{{ t $.Lang "action.stream.preferredLangHint" }}">
+                    <span class="whitespace-nowrap">{{ t $.Lang "profile.settings.preferredLanguage" }}</span>
+                    <select id="preferred-lang" data-current="{{ $preferred }}" aria-describedby="preferred-lang-hint"
+                            class="select select-sm bg-base-300 border-w-line focus:border-w-cyan focus:outline-none min-w-0 flex-1 sm:flex-none sm:w-auto sm:min-w-[11rem]">
+                        {{ range stremioLanguages }}
+                        <option value="{{ .Code }}"{{ if eq $preferred .Code }} selected{{ end }}>{{ .Flag }} {{ .Name }}</option>
+                        {{ end }}
+                    </select>
+                    <span id="preferred-lang-busy" class="loading loading-spinner loading-xs text-w-cyan shrink-0" aria-hidden="true" hidden></span>
+                    <span id="preferred-lang-hint" class="sr-only">{{ t $.Lang "action.stream.preferredLangHint" }}</span>
+                </label>
+                {{ end }}
+                <form method="dialog" class="w-full sm:w-auto sm:ml-auto"><button class="btn btn-ghost border border-w-line text-w-sub hover:border-w-pink hover:text-base-content w-full sm:w-auto">{{ t $.Lang "action.stream.close" }}</button></form>
+            </div>
+        </div>
+        {{/* Click outside the box closes the dialog (owner, 2026-09-15).
+             DaisyUI's backdrop: a form stretched across the same grid cell
+             as the .modal-box but behind it (z-index -1), whose submit
+             button closes the dialog through method="dialog" — type="button"
+             would not submit and the click would do nothing. Last child, so
+             the box's own controls stay above it. The label is literal and
+             untranslated, like every other modal in this codebase
+             (templates/partials/onboarding_checklist.html): the button is
+             visually hidden but focusable, and a translated one makes a
+             screen reader announce "Close" twice. */}}
+        <form method="dialog" class="modal-backdrop"><button tabindex="-1" aria-hidden="true">close</button></form>
+    </dialog>
+    {{/* Same reasoning as #subtitles above — must show over the fullscreen player.
+         Only on an instance that serves embeds: the player shows its Embed
+         button when this dialog exists (Player.jsx parseFeatures). The
+         snippet carries this instance's address -- the SDK otherwise points
+         at webtor.io. */}}
+    {{ if embedEnabled }}
+    <dialog class="modal" id="embed">
+        <div class="modal-box w-full sm:w-11/12 max-w-5xl">
+            <div class="flex">
+                <textarea name="description" class="textarea textarea-bordered w-full" readonly><video controls src="{{ .Resource.MagnetURI }}" data-path="{{ .Item.PathStr }}" data-config='{"baseUrl":"{{ domain }}"}'></video><script src="https://cdn.jsdelivr.net/npm/@webtor/embed-sdk-js/dist/index.min.js" charset="utf-8" async></script></textarea>
+            </div>
+            <div class="modal-action">
+                <div class="flex-grow text-sm flex items-center">
+                    <p>{{ tpHTML $.Lang "action.stream.embedHelp" "Link" (printf "<a class=\"link\" href=\"https://github.com/webtor-io/embed-sdk-js\">%s</a>" (t $.Lang "action.stream.embedLinkText")) }}</p>
+                </div>
+                <button type="button" class="btn btn-soft-cyan copy">{{ t $.Lang "action.stream.copy" }}</button>
+                <form method="dialog"><button class="btn btn-ghost border border-w-line text-w-sub hover:border-w-pink hover:text-base-content">{{ t $.Lang "action.stream.close" }}</button></form>
+            </div>
+        </div>
+        {{/* Same backdrop as #subtitles above. */}}
+        <form method="dialog" class="modal-backdrop"><button tabindex="-1" aria-hidden="true">close</button></form>
+    </dialog>
+    {{ end }}
+    {{ if .GraceDurationSec }}
+    {{/* data-upsell-surface: one offer on screen at a time -- the resource
+         status keeps its plan box's button down while this is up
+         (lib/transferStatus.js upsellElsewhere). */}}
+    {{/* A decision over the paused film (lib/player/grace-hold.js), made the
+         way the player's other popups are: a native <dialog> opened with
+         showModal() (Player.jsx), like #subtitles and #embed above. It joins
+         the top layer, so nothing clips it -- the player's rounded
+         overflow:hidden frame and the page's cards cut the old absolutely
+         placed card (owner, 2026-09-26) -- it is centred on the screen with
+         the page dimmed behind it, and it shows over a fullscreen player
+         without taking the viewer out of fullscreen. Esc is the close
+         (Player.jsx maps `cancel` to the answer "dismiss"); focus starts on
+         the card itself (no ring on a button the viewer did not reach by
+         keyboard; Tab reaches both answers). No backdrop
+         form: a click beside it is not an answer. */}}
+    <dialog class="modal" id="grace-cta" data-upsell-surface="grace" aria-labelledby="grace-cta-title">
+        <div class="modal-box relative w-[calc(100%-2rem)] max-w-[27rem] rounded-2xl border border-w-line/60 bg-w-card shadow-2xl px-4 py-5 sm:px-6 sm:py-6 text-center outline-none" tabindex="-1" autofocus>
+            <button type="button" class="grace-cta-close absolute top-1.5 right-1.5 w-9 h-9 inline-flex items-center justify-center rounded-lg text-w-muted hover:text-base-content hover:bg-white/5" aria-label="{{ t $.Lang "action.grace.dismiss" }}">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="w-4 h-4" aria-hidden="true">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" />
+                </svg>
+            </button>
+            <h4 id="grace-cta-title" class="font-semibold text-base sm:text-lg leading-snug text-base-content px-7">{{ t $.Lang "action.grace.title" }}</h4>
+            <p class="mt-1.5 text-sm leading-relaxed text-w-sub">{{ t $.Lang "action.grace.body" }}</p>
+            {{- /* Owner, 2026-09-26: "continue at N Mbps" first, the offer
+                 under it, its trial note last -- the note closes the card
+                 and sits with the button it qualifies. */}}
+            <div class="mt-5 flex flex-col items-stretch gap-2">
+                <button type="button" class="grace-cta-continue btn btn-ghost w-full h-auto min-h-11 py-2 px-3 text-[13px] sm:text-sm leading-snug border border-w-line text-w-sub hover:text-base-content hover:border-w-line"
+                        data-umami-event="grace-continue-slow" data-umami-event-tier="{{ if $.User | hasAuth }}free{{ else }}anon{{ end }}">
+                    {{ if .GraceFreeRateMbps }}{{ tp $.Lang "action.grace.continueWithRate" "Rate" .GraceFreeRateMbps }}{{ else }}{{ t $.Lang "action.grace.continue" }}{{ end }}
+                </button>
+                {{- with promoOffer }}
+                <a class="btn btn-soft w-full h-auto min-h-11 py-2 px-3 text-[13px] sm:text-sm leading-snug" href="{{ or (trialURL $.Lang "grace" .) .URL (langPath $.Lang "/donate") }}" target="_blank" rel="noopener"
+                   data-umami-event="donate-grace" data-umami-event-tier="{{ if $.User | hasAuth }}free{{ else }}anon{{ end }}"
+                   data-umami-event-target="{{ if .TrialDays }}trial{{ else if .URL }}checkout{{ else }}donate{{ end }}">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="size-4" aria-hidden="true">
+                        <path fill-rule="evenodd" d="M14.615 1.595a.75.75 0 0 1 .359.852L12.982 9.75h7.268a.75.75 0 0 1 .548 1.262l-10.5 11.25a.75.75 0 0 1-1.272-.71l1.992-7.302H3.75a.75.75 0 0 1-.548-1.262l10.5-11.25a.75.75 0 0 1 .913-.143Z" clip-rule="evenodd" />
+                    </svg>
+                    <span class="text-balance">{{ t $.Lang "offer.keepFullSpeed" }}</span>
+                </a>
+                {{- if .TrialDays }}
+                <span class="-mt-0.5 text-[11px] leading-tight text-w-sub">{{ tn $.Lang "offer.trialNote" .TrialDays }}</span>
+                {{- end }}
+                {{- end }}
+            </div>
+        </div>
+    </dialog>
+    {{ end }}
+</div>
+{{ end }}
+{{ "player.css" | asset }}
+{{ "action/stream.js" | asset }}
+{{ end }}

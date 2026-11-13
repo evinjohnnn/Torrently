@@ -1,0 +1,66 @@
+{
+  "name": "web-ui",
+  "version": "1.0.0",
+  "description": "Web UI v2",
+  "private": true,
+  "scripts": {
+    "test": "node --import ./assets/src/js/test/register.mjs --test 'assets/src/js/**/*.test.js' 'frontend/src/**/*.test.js'",
+    "build": "webpack --mode=production && vite build --config frontend/vite.config.ts",
+    "start": "npm run webpack-dev-server",
+    "webpack-dev-server": "webpack-dev-server --mode=development",
+    "build:app": "vite build --config frontend/vite.config.ts",
+    "watch:app": "vite build --watch --mode development --config frontend/vite.config.ts",
+    "typecheck:app": "tsc -p frontend/tsconfig.json"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@babel/core": "^7.29.7",
+    "@babel/preset-env": "^7.29.7",
+    "@open-iframe-resizer/core": "^2.1.0",
+    "@tailwindcss/postcss": "^4.3.3",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "babel-loader": "^10.0.0",
+    "copy-webpack-plugin": "^14.0.0",
+    "css-loader": "^7.1.2",
+    "daisyui": "^5.4.3",
+    "debug": "4.4.3",
+    "favicons": "^7.3.1",
+    "favicons-webpack-plugin": "^6.0.1",
+    "hls.js": "^1.6.14",
+    "jsdom": "27.0.1",
+    "mini-css-extract-plugin": "^2.9.4",
+    "postcss": "^8.5.6",
+    "postcss-loader": "^8.2.0",
+    "semver": "^7.7.3",
+    "sha1": "^1.1.1",
+    "style-loader": "^4.0.0",
+    "stylelint": "^16.25.0",
+    "stylelint-config-standard": "^39.0.1",
+    "supertokens-web-js": "^0.16.0",
+    "tailwindcss": "^4.3.3",
+    "terser-webpack-plugin": "^5.6.1",
+    "typescript": "7.0.2",
+    "vite": "8.3.5",
+    "webpack": "^5.111.1",
+    "webpack-cli": "^6.0.1",
+    "webpack-dev-server": "^5.2.6"
+  },
+  "dependencies": {
+    "@babel/preset-react": "^7.29.7",
+    "@fontsource/doto": "5.3.0",
+    "@fontsource/space-grotesk": "5.3.0",
+    "@fontsource/space-mono": "5.3.0",
+    "preact": "^10.28.4",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "overrides": {
+    "sockjs": {
+      "uuid": "^11.1.1"
+    }
+  }
+}

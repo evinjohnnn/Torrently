@@ -1,0 +1,11 @@
+{
+  "input": "Ben Hur 2016 TELESYNC x264 AC3 MAXPRO",
+  "want": {
+    "title": "Ben Hur",
+    "year": 2016,
+    "quality": "TS",
+    "codec": "x264",
+    "audio": "AC3",
+    "extra": "MAXPRO"
+  }
+}

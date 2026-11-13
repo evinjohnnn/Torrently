@@ -1,0 +1,11 @@
+{
+  "input": "Hercules (2014) 1080p BrRip H264 - YIFY",
+  "want": {
+    "title": "Hercules",
+    "year": 2014,
+    "resolution": "1080p",
+    "quality": "BRRip",
+    "codec": "x264",
+    "group": "YIFY"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "input": "South Park S18E05 HDTV x264-KILLERS [eztv]",
+  "want": {
+    "title": "South Park",
+    "season": 18,
+    "episode": 5,
+    "quality": "HDTV",
+    "codec": "x264",
+    "group": "KILLERS [eztv]"
+  }
+}

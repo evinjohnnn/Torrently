@@ -1,0 +1,9 @@
+{
+  "input": "Zeta.Gundam.-.ep.03.-.Inside.the.Capsule.mkv",
+  "want": {
+    "title": "Zeta Gundam",
+    "episode": 3,
+    "container": "mkv",
+    "extra": "Inside the Capsule"
+  }
+}

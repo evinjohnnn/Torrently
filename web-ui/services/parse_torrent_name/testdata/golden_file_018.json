@@ -1,0 +1,10 @@
+{
+  "input": "Lets.Be.Cops.2014.BRRip.XViD-juggs[ETRG]",
+  "want": {
+    "title": "Lets Be Cops",
+    "year": 2014,
+    "quality": "BRRip",
+    "codec": "xvid",
+    "group": "juggs[ETRG]"
+  }
+}

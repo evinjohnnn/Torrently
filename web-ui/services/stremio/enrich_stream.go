@@ -1,0 +1,265 @@
+package stremio
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/pkg/errors"
+	uuid "github.com/satori/go.uuid"
+	log "github.com/sirupsen/logrus"
+	"github.com/webtor-io/web-ui/models"
+	"github.com/webtor-io/web-ui/services/auth"
+	"github.com/webtor-io/web-ui/services/claims"
+	sv "github.com/webtor-io/web-ui/services/common"
+	"github.com/webtor-io/web-ui/services/link_resolver/common"
+)
+
+// EnrichStream wraps another StreamsService to enrich streams with URLs.
+//
+// Enrichment is intentionally lightweight: per stream we issue a single
+// hash-only availability check (Postgres) and emit a redirect URL whose
+// JWT carries the file's filename (or fileIdx). The expensive bits — making
+// sure rest-api knows the magnet, listing its contents, picking the path —
+// are deferred to /stremio/resolve, which only runs when the user actually
+// clicks the stream. This keeps /stream's tail latency dominated by the
+// inner addon HTTP fan-out rather than per-stream rest-api round-trips.
+// availabilityChecker is the slice of LinkResolver this layer uses. Kept as
+// an interface so the labelling rules — which of ⚡, WT and P2P a stream gets
+// — are testable without a database behind them.
+type availabilityChecker interface {
+	CheckAvailability(ctx context.Context, id uuid.UUID, cla *claims.Data, hash string, fileIdx int, requiresPayment bool) (*common.CheckAvailabilityResult, error)
+	CheckTorrentAvailability(ctx context.Context, cla *claims.Data, hash string, requiresPayment bool) (*common.CheckAvailabilityResult, error)
+}
+
+type EnrichStream struct {
+	inner        StreamsService
+	linkResolver availabilityChecker
+	u            *auth.User
+	cla          *claims.Data
+	domain       string
+	token        string
+	secret       string
+}
+
+// NewEnrichStream creates a new EnrichStream service
+func NewEnrichStream(inner StreamsService, lr availabilityChecker, u *auth.User, cla *claims.Data, domain, token, secret string) *EnrichStream {
+	return &EnrichStream{
+		inner:        inner,
+		linkResolver: lr,
+		u:            u,
+		cla:          cla,
+		domain:       domain,
+		token:        token,
+		secret:       secret,
+	}
+}
+
+// GetName returns the name of the inner service with "Enrich" prefix
+func (s *EnrichStream) GetName() string {
+	return "Enrich" + s.inner.GetName()
+}
+
+// GetStreams gets streams from the inner service and enriches them with URLs
+func (s *EnrichStream) GetStreams(ctx context.Context, contentType, contentID string) (*StreamsResponse, error) {
+	response, err := s.inner.GetStreams(ctx, contentType, contentID)
+	if err != nil {
+		return nil, err
+	}
+
+	if response == nil || len(response.Streams) == 0 {
+		return response, nil
+	}
+
+	enrichedStreams := make([]*StreamItem, len(response.Streams))
+	var wg sync.WaitGroup
+
+	eCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	for i, stream := range response.Streams {
+		wg.Add(1)
+		go func(index int, si *StreamItem) {
+			defer wg.Done()
+
+			streamCopy := *si
+			enriched, err := s.enrichStream(eCtx, &streamCopy, contentID)
+			if err != nil {
+				log.WithError(err).
+					WithField("infohash", streamCopy.InfoHash).
+					Warn("failed to enrich stream")
+				return
+			}
+			if enriched == nil {
+				return
+			}
+			enrichedStreams[index] = enriched
+		}(i, &stream)
+	}
+
+	wg.Wait()
+
+	var finalStreams []StreamItem
+	for _, stream := range enrichedStreams {
+		if stream != nil {
+			finalStreams = append(finalStreams, *stream)
+		}
+	}
+
+	// Within each resolution bucket put cached (⚡) entries first so users
+	// see Vault hits at the top without disturbing the global resolution
+	// order set by PreferredStream.
+	sortVaultFirstByResolution(finalStreams)
+
+	return &StreamsResponse{Streams: finalStreams}, nil
+}
+
+// sortVaultFirstByResolution stable-sorts each resolution group so library
+// streams come first, then cached (⚡) items, preserving every other relative
+// order.
+//
+// The library-first tier matters because PreferredStream already pinned
+// library streams to the front, but it groups by resolution: when the last
+// library stream shares a resolution with the following addon group they land
+// in one contiguous bucket here. Sorting that bucket on Cached alone let a
+// cached addon overtake a *non-cached* library stream — re-inverting the
+// priority PreferredStream established. Library origin is the primary key so
+// the user's own torrents stay on top regardless of cache state.
+func sortVaultFirstByResolution(streams []StreamItem) {
+	if len(streams) < 2 {
+		return
+	}
+	resolutionOf := ResolutionBucket
+	start := 0
+	currentRes := resolutionOf(streams[0].Name)
+	for i := 1; i <= len(streams); i++ {
+		var res string
+		if i < len(streams) {
+			res = resolutionOf(streams[i].Name)
+		}
+		if i == len(streams) || res != currentRes {
+			if i-start > 1 {
+				bucket := streams[start:i]
+				sort.SliceStable(bucket, func(a, b int) bool {
+					al, bl := isLibraryStream(&bucket[a]), isLibraryStream(&bucket[b])
+					if al != bl {
+						return al // library streams always above addon streams
+					}
+					return bucket[a].Cached && !bucket[b].Cached
+				})
+			}
+			start = i
+			currentRes = res
+		}
+	}
+}
+
+// enrichStream sets the redirect URL and ⚡ marker for a single stream.
+func (s *EnrichStream) enrichStream(ctx context.Context, stream *StreamItem, contentID string) (*StreamItem, error) {
+	if stream.Url != "" {
+		return stream, nil
+	}
+	if stream.InfoHash == "" {
+		return nil, errors.New("stream has no InfoHash")
+	}
+
+	// Two different questions. When the source named a file, ask about that
+	// file. When it did not, ask about the torrent — the per-file cache
+	// index would answer for a file we have not picked, but the result
+	// still has to be non-nil, because a nil one means "no backend serves
+	// this" and shows the stream as P2P.
+	var (
+		availability *common.CheckAvailabilityResult
+		err          error
+	)
+	if stream.FileIdxUnknown {
+		availability, err = s.linkResolver.CheckTorrentAvailability(ctx, s.cla, stream.InfoHash, true)
+	} else {
+		availability, err = s.linkResolver.CheckAvailability(ctx, s.u.ID, s.cla, stream.InfoHash, stream.FileIdx, true)
+	}
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to check availability")
+	}
+	stream.Name = s.updateStreamName(stream.Name, availability)
+	// Mark the user's own library entries with a ⭐ so they're unmistakable
+	// next to addon results. Library streams are the ones carrying the
+	// webtorio| bingeGroup; addon P2P streams reach this path too (they also
+	// arrive without a Url), so the marker is keyed on origin, not Url.
+	if isLibraryStream(stream) {
+		stream.Name = "⭐ " + stream.Name
+	}
+	if availability != nil && availability.Cached {
+		stream.Cached = true
+	}
+
+	stream.Url = s.generateRedirectURL(stream, contentID)
+	return stream, nil
+}
+
+// generateRedirectURL builds the /stremio/resolve URL. The JWT carries
+// only the minimum needed to identify the file at click time: the
+// torrent's infohash and the file index inside it. /resolve resolves the
+// idx to a full path against rest-api lazily.
+func (s *EnrichStream) generateRedirectURL(stream *StreamItem, contentID string) string {
+	// Stremio persists the selected stream (URL included) across app
+	// sessions and probes it on resume and before binge-playing the next
+	// episode. With an episode-per-evening viewing pattern those probes
+	// arrive >24h after the URL was minted, so a 12h expiry made every
+	// next-day resume 401 and drop the user to the source-selection
+	// screen. 72h covers a weekend gap; the token still only grants
+	// access to a single file and rides behind the user's addon token.
+	clms := jwt.MapClaims{
+		"hash": stream.InfoHash,
+		"exp":  time.Now().Add(72 * time.Hour).Unix(),
+	}
+	// No idx claim when the source never named a file: /stremio/resolve
+	// picks one at click time. Sending 0 would be indistinguishable from a
+	// deliberate "play the first file".
+	if !stream.FileIdxUnknown {
+		clms["idx"] = stream.FileIdx
+	} else if season, episode, ok := episodeFromContentID(contentID); ok {
+		// Which episode was asked for. Indexers answer an episode query
+		// with season packs as often as not — on RU trackers that is the
+		// normal shape — so the resolver needs to know what to look for
+		// inside the torrent, not just "the biggest video".
+		clms["s"] = season
+		clms["e"] = episode
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, clms)
+	tokenString, _ := token.SignedString([]byte(s.secret))
+	return fmt.Sprintf("%s/%s/%s/stremio/resolve/%s", s.domain, sv.AccessTokenParamName, s.token, tokenString)
+}
+
+// episodeFromContentID reads the season and episode out of Stremio's
+// "tt0903747:1:5". Movies carry no episode and yield ok=false.
+func episodeFromContentID(contentID string) (int, int, bool) {
+	_, season, episode := parseContentID(contentID)
+	if season == nil || episode == nil {
+		return 0, 0, false
+	}
+	return *season, *episode, true
+}
+
+func (s *EnrichStream) updateStreamName(name string, availability *common.CheckAvailabilityResult) string {
+	var prefix string
+	if availability != nil {
+		if availability.Cached {
+			prefix = "⚡"
+		}
+		if pn, ok := servicesNames[availability.ServiceType]; ok {
+			prefix += pn
+		}
+	} else {
+		prefix = "P2P"
+	}
+	return fmt.Sprintf("[%s]\n%s", prefix, name)
+}
+
+var servicesNames = map[models.StreamingBackendType]string{
+	models.StreamingBackendTypeWebtor:     "TL",
+	models.StreamingBackendTypeRealDebrid: "RD",
+	models.StreamingBackendTypeTorbox:     "TB",
+}

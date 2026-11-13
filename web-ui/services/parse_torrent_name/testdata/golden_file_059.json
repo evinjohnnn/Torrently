@@ -1,0 +1,12 @@
+{
+  "input": "breaking.bad.s01e01.720p.bluray.x264-reward",
+  "want": {
+    "title": "breaking bad",
+    "season": 1,
+    "episode": 1,
+    "resolution": "720p",
+    "quality": "BluRay",
+    "codec": "x264",
+    "group": "reward"
+  }
+}

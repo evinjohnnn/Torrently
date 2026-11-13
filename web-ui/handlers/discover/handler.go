@@ -1,0 +1,232 @@
+package discover
+
+import (
+	"context"
+	"github.com/webtor-io/web-ui/services/cache_index"
+	"net/http"
+	"net/url"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/go-pg/pg/v10"
+	"github.com/pkg/errors"
+	cs "github.com/webtor-io/common-services"
+	"github.com/webtor-io/web-ui/models"
+	"github.com/webtor-io/web-ui/services/auth"
+	"github.com/webtor-io/web-ui/services/enrich"
+	"github.com/webtor-io/web-ui/services/i18n"
+	"github.com/webtor-io/web-ui/services/stremio"
+	"github.com/webtor-io/web-ui/services/template"
+	"github.com/webtor-io/web-ui/services/transcodercaps"
+	"github.com/webtor-io/web-ui/services/web"
+)
+
+// addonView is the per-addon shape we serialize into the page bootstrap
+// (window._addons). Carries the manifest snapshot we captured at add
+// time so the JS client can render names + capabilities in the
+// AddonHealthChip and CatalogSelector before manifests are fetched. The
+// JS client lazily refreshes the snapshot via /stremio/addon-url/:id/
+// refresh-snapshot when it sees a fresh manifest from an addon whose
+// snapshot is missing or older than 7 days.
+type addonView struct {
+	ID         string     `json:"id"`
+	URL        string     `json:"url"`
+	Name       string     `json:"name,omitempty"`
+	Logo       string     `json:"logo,omitempty"`
+	ManifestID string     `json:"manifestId,omitempty"`
+	Version    string     `json:"version,omitempty"`
+	Resources  []string   `json:"resources,omitempty"`
+	Types      []string   `json:"types,omitempty"`
+	FetchedAt  *time.Time `json:"fetchedAt,omitempty"`
+}
+
+// indexerView is the per-indexer bootstrap. Only what the stream modal
+// needs to label results and to decide whether asking the server for
+// indexer streams is worth a round-trip at all.
+type indexerView struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+type indexData struct {
+	Addons   []addonView
+	Indexers []indexerView
+	// AIEnabled says whether the recommendations service exists at all
+	// (ANTHROPIC_API_KEY set and the feature on). The section cannot work
+	// this out for itself: its chips arrive over an EventSource, and an
+	// EventSource cannot see an HTTP status -- an unregistered route reaches
+	// it as a closed connection, indistinguishable from a network blip, so
+	// the section drew itself and then reported a failure. Answering here,
+	// from configuration, is the same shape every other capability uses.
+	AIEnabled bool
+	// Prefs are the account's stream settings. The page needs them to say
+	// "nothing here matches what you asked for" — Discover shows every
+	// stream and lets the chips do the filtering, so without them it cannot
+	// tell an unwanted result from a missing one.
+	Prefs streamPrefsView
+	// Passthrough is what the transcoder last said about handing HEVC to
+	// the player as it is (window._passthrough). "unknown" is not "off":
+	// it is the time before this process heard an answer. The stream
+	// modal's 4K switch reads it (lib/discover/playback.js), to promise 4K
+	// HEVC only where it can play.
+	Passthrough passthroughView
+}
+
+// IndexData names the page's data outside this package: the React page
+// (handlers/spa/discover.go) reshapes it into its own JSON. The fields stay
+// what the template reads.
+type IndexData = indexData
+
+type passthroughView struct {
+	HEVC string `json:"hevc"`
+}
+
+// capabilityReader is the one question Discover asks of the transcoder
+// (transcodercaps.Service; nil answers Unknown).
+type capabilityReader interface {
+	HEVCPassthrough() transcodercaps.Answer
+}
+
+func passthroughFor(c capabilityReader) passthroughView {
+	if c == nil {
+		return passthroughView{HEVC: string(transcodercaps.Unknown)}
+	}
+	return passthroughView{HEVC: string(c.HEVCPassthrough())}
+}
+
+type streamPrefsView struct {
+	// Resolutions lists the enabled buckets in the profile's vocabulary
+	// (4k / 1080p / 720p / other). Empty means no preference.
+	Resolutions []string `json:"resolutions"`
+	Language    string   `json:"language"`
+}
+
+// enricher is the slice of enrich.Enricher the localize endpoint needs.
+// Kept as an interface so the Level 2 batch worker is testable without a
+// real mapper chain.
+type enricher interface {
+	HasMappers() bool
+	LocalizeByID(ctx context.Context, videoID string, ct models.ContentType, lang string) (string, string, error)
+}
+
+type Handler struct {
+	tb template.Builder[*web.Context]
+	pg *cs.PG
+	en *enrich.Enricher
+	// sb builds the Torznab half of the stream pipeline — see torznab.go
+	// for why that half cannot run in the browser.
+	sb *stremio.Builder
+	// aiEnabled mirrors whether serve.go registered the recommendations
+	// routes at all; see indexData.AIEnabled for why the page has to be told.
+	aiEnabled bool
+	// ci answers which streams are already cached -- see availability.go.
+	ci availabilityLookup
+	// caps answers whether the transcoder passes HEVC through; see
+	// indexData.Passthrough.
+	caps capabilityReader
+}
+
+func RegisterHandler(r *gin.Engine, tm *template.Manager[*web.Context], pg *cs.PG, en *enrich.Enricher, sb *stremio.Builder, aiEnabled bool, index *cache_index.CacheIndex, caps *transcodercaps.Service) {
+	h := &Handler{
+		tb:        tm.MustRegisterViews("discover/*").WithLayout("main"),
+		pg:        pg,
+		en:        en,
+		sb:        sb,
+		aiEnabled: aiEnabled,
+	}
+	if index != nil {
+		h.ci = index
+	}
+	if caps != nil {
+		h.caps = caps
+	}
+	r.GET("/discover", h.index)
+	r.POST("/discover/localize", auth.HasAuth, h.localize)
+	r.POST("/discover/reviews", auth.HasAuth, h.reviews)
+	r.POST("/discover/torznab/streams", auth.HasAuth, h.torznabStreams)
+	r.POST("/discover/availability", auth.HasAuth, h.availability)
+}
+
+func (h *Handler) index(c *gin.Context) {
+	u := auth.GetUserFromContext(c)
+	if !u.HasAuth() {
+		// Preserve the deep-link query (?id=ttXXXX&type=movie) and lang prefix
+		// so a guest landing on /ru/discover?id=… ends up back on the same
+		// title in the same language after signing in. The login page renders
+		// a contextual info card driven by from=discover.
+		lang := i18n.GetLang(c)
+		returnURL := i18n.LangPath(lang, "/discover")
+		if rq := c.Request.URL.RawQuery; rq != "" {
+			returnURL += "?" + rq
+		}
+		v := url.Values{
+			"from":       []string{"discover"},
+			"return-url": []string{returnURL},
+		}
+		c.Redirect(http.StatusFound, i18n.LangPath(lang, "/login")+"?"+v.Encode())
+		return
+	}
+
+	db := h.pg.Get()
+	if db == nil {
+		_ = c.AbortWithError(http.StatusInternalServerError, errors.New("no db"))
+		return
+	}
+
+	addons, err := models.GetUserStremioAddonUrls(c.Request.Context(), db, u.ID)
+	if err != nil {
+		_ = c.AbortWithError(http.StatusInternalServerError, errors.Wrap(err, "failed to get addon urls"))
+		return
+	}
+
+	views := make([]addonView, len(addons))
+	for i, a := range addons {
+		views[i] = addonView{
+			ID:         a.ID.String(),
+			URL:        a.Url,
+			Name:       derefStr(a.Name),
+			Logo:       derefStr(a.ManifestLogo),
+			ManifestID: derefStr(a.ManifestID),
+			Version:    derefStr(a.ManifestVersion),
+			Resources:  a.ManifestResources,
+			Types:      a.ManifestTypes,
+			FetchedAt:  a.ManifestFetchedAt,
+		}
+	}
+
+	h.tb.Build("discover/index").HTML(http.StatusOK, web.NewContext(c).WithData(&indexData{
+		Addons:      views,
+		Indexers:    indexerViews(c.Request.Context(), db, u),
+		Prefs:       streamPrefs(c.Request.Context(), db, u),
+		AIEnabled:   h.aiEnabled,
+		Passthrough: passthroughFor(h.caps),
+	}))
+}
+
+// streamPrefs reads the account's stream settings for the page. A failure
+// yields no preferences, which reads as "everything is fine" — the note
+// this feeds is an extra hint, never a reason to break the page.
+func streamPrefs(ctx context.Context, db *pg.DB, u *auth.User) streamPrefsView {
+	settings, err := models.GetUserStremioSettingsData(ctx, db, u.ID)
+	if err != nil || settings == nil {
+		return streamPrefsView{}
+	}
+	out := streamPrefsView{Language: settings.PreferredLanguage}
+	for _, r := range settings.PreferredResolutions {
+		if r.Enabled {
+			out.Resolutions = append(out.Resolutions, r.Resolution)
+		}
+	}
+	// Everything enabled is the same as no preference.
+	if len(out.Resolutions) == len(settings.PreferredResolutions) {
+		out.Resolutions = nil
+	}
+	return out
+}
+
+func derefStr(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}

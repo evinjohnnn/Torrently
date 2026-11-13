@@ -24,9 +24,17 @@ import {
   type TorrentFile,
 } from "./api";
 import { Icon, type IconName } from "./icons";
+import { AppBackdrop } from "./AppBackdrop";
+import { LiquidGlass } from "./LiquidGlass";
 const Player = lazy(() =>
   import("./Player").then((module) => ({ default: module.Player })),
 );
+import "@fontsource/doto/latin-900.css";
+import "@fontsource/space-grotesk/latin-400.css";
+import "@fontsource/space-grotesk/latin-500.css";
+import "@fontsource/space-grotesk/latin-600.css";
+import "@fontsource/space-mono/latin-400.css";
+import "@fontsource/space-mono/latin-700.css";
 import "./style.css";
 
 type Page =
@@ -50,21 +58,32 @@ function message(error: unknown) {
 function Logo() {
   return (
     <div className="brand">
-      <span className="brand-mark" aria-hidden="true">
-        <svg viewBox="0 0 28 28">
-          <path d="M4 5h20v5h-7v13h-6V10H4Z" fill="currentColor" />
-          <path
-            d="m20 15 4 4-4 4"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2.5"
-          />
-        </svg>
-      </span>
-      <span>
-        Torrently<span className="brand-dot">.</span>
-      </span>
+      <span className="brand-word">Torrently</span>
     </div>
+  );
+}
+function Clock() {
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(new Date()), 10000);
+    return () => clearInterval(timer);
+  }, []);
+  const [hours, minutes] = [now.getHours(), now.getMinutes()].map((part) =>
+    String(part).padStart(2, "0"),
+  );
+  return (
+    <time
+      className="clock"
+      dateTime={now.toISOString()}
+      aria-label={now.toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      })}
+    >
+      {hours}
+      <span className="clock-colon">:</span>
+      {minutes}
+    </time>
   );
 }
 function App() {
@@ -332,6 +351,7 @@ function App() {
         <Logo />
         <div className="workspace-label">YOUR WORKSPACE</div>
         <nav aria-label="Main navigation">
+          <LiquidGlass className="dock-glass" bezel={14} refraction={14} />
           {sections.map((item) => (
             <button
               key={item.id}
@@ -396,6 +416,7 @@ function App() {
       </aside>
       <div className="main-shell">
         <header className="topbar">
+          <LiquidGlass />
           <span className="breadcrumb">
             Workspace <span>/</span>{" "}
             {page === "resource"
@@ -404,9 +425,12 @@ function App() {
                 ? "Open torrent"
                 : page[0].toUpperCase() + page.slice(1)}
           </span>
-          <span className="private-label">
-            <span className="private-lock" />
-            Private instance
+          <span className="topbar-right">
+            <Clock />
+            <span className="private-label">
+              <span className="private-lock" />
+              Private instance
+            </span>
           </span>
         </header>
         <main id="main-content">
@@ -785,6 +809,7 @@ function Login({
   return (
     <div className="login-layout">
       <div className="login-top">
+        <LiquidGlass />
         <Logo />
         <span className="private-label">Private instance</span>
       </div>
@@ -1347,6 +1372,7 @@ function FileBrowser({
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
+    <AppBackdrop />
     <App />
   </StrictMode>,
 );

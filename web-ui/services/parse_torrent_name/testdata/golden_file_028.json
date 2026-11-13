@@ -1,0 +1,8 @@
+{
+  "input": "Teenage Mutant Ninja Turtles (HdRip / 2014)",
+  "want": {
+    "title": "Teenage Mutant Ninja Turtles",
+    "year": 2014,
+    "quality": "HDRip"
+  }
+}

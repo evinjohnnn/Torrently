@@ -1,0 +1,142 @@
+.speed-pane {
+  max-width: 640px;
+  padding: 32px;
+  border-radius: var(--r-xl);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.speed-start {
+  width: 100%;
+}
+.speed-meter {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.speed-phase {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink-2);
+}
+.speed-phase.premium,
+.speed-pair .premium dt {
+  color: var(--olive-ink);
+}
+.speed-figure {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+  margin: 0;
+}
+.speed-figure .mono {
+  font-size: clamp(48px, 9vw, 72px);
+  font-weight: 400;
+  letter-spacing: -0.04em;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.speed-unit {
+  font-size: 17px;
+  color: var(--ink-2);
+}
+.speed-status {
+  font-size: 14px;
+  color: var(--ink-3);
+}
+.speed-status.failed {
+  color: var(--brick);
+}
+.speed-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px 24px;
+  margin: 0;
+}
+.speed-pair div + div {
+  padding-left: 24px;
+  border-left: 1px solid var(--hairline);
+}
+.speed-pair dt {
+  margin-bottom: 8px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink-2);
+}
+.speed-pair .mono {
+  font-size: clamp(30px, 8vw, 56px);
+}
+.speed-boost {
+  align-self: flex-start;
+}
+
+.speed-section {
+  max-width: 640px;
+  margin-top: 48px;
+}
+.speed-section h2 {
+  margin-bottom: 14px;
+  font-size: var(--step-2);
+  letter-spacing: -0.03em;
+}
+.speed-rows {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border-top: 1px solid var(--hairline);
+}
+.speed-rows li {
+  display: grid;
+  grid-template-columns: 28px 1fr auto auto;
+  align-items: center;
+  gap: 12px;
+  min-height: 56px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--hairline);
+}
+.speed-rows li.off .speed-row-name,
+.speed-rows li.off .speed-row-note {
+  color: var(--ink-3);
+}
+.speed-rows li.current {
+  margin: 0 -12px;
+  padding: 8px 12px;
+  border-radius: var(--r-sm);
+  background: var(--olive-wash);
+}
+.speed-row-name {
+  font-weight: 500;
+}
+.speed-row-note {
+  font-size: 14px;
+  color: var(--ink-2);
+  text-align: right;
+}
+.speed-mark {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--hover);
+  color: var(--ink-3);
+}
+.speed-mark.ok {
+  background: var(--olive-wash);
+  color: var(--olive-ink);
+}
+.speed-rows li:not(:has(> :nth-child(4))) {
+  grid-template-columns: 28px 1fr auto;
+}
+@media (max-width: 640px) {
+  .speed-pane {
+    padding: 22px;
+  }
+  .speed-pair {
+    gap: 16px;
+  }
+  .speed-pair div + div {
+    padding-left: 16px;
+  }
+}

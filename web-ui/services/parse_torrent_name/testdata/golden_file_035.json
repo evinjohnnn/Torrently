@@ -1,0 +1,12 @@
+{
+  "input": "Dawn.Of.The.Planet.of.The.Apes.2014.1080p.WEB-DL.DD51.H264-RARBG",
+  "want": {
+    "title": "Dawn Of The Planet of The Apes",
+    "year": 2014,
+    "resolution": "1080p",
+    "quality": "WEB-DL",
+    "codec": "x264",
+    "audio": "DD51",
+    "group": "RARBG"
+  }
+}

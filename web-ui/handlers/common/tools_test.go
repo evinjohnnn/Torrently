@@ -1,0 +1,224 @@
+package common
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// repoRoot is two levels up from handlers/common.
+const repoRoot = "../.."
+
+func locales(t *testing.T) map[string]map[string]string {
+	t.Helper()
+	paths, err := filepath.Glob(filepath.Join(repoRoot, "locales/??.json"))
+	if err != nil || len(paths) == 0 {
+		t.Fatalf("no locales found: %v", err)
+	}
+	out := map[string]map[string]string{}
+	for _, p := range paths {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("read %s: %v", p, err)
+		}
+		// Plain strings only: pluralised keys are objects of CLDR forms and
+		// belong to the i18n parity test, not to the copy checks here.
+		var raw map[string]any
+		if err := json.Unmarshal(b, &raw); err != nil {
+			t.Fatalf("parse %s: %v", p, err)
+		}
+		d := make(map[string]string, len(raw))
+		for k, v := range raw {
+			if s, ok := v.(string); ok {
+				d[k] = s
+			}
+		}
+		out[strings.TrimSuffix(filepath.Base(p), ".json")] = d
+	}
+	return out
+}
+
+// TestEveryToolDeclaresItsBody guards the failure mode that shipped once: a
+// tool registered here without a body renders a URL with nothing between the
+// hero and the footer. It used to be possible because the body was a partial
+// looked up by name at render time; now it is this list, and an empty one is
+// the same blank page.
+func TestEveryToolDeclaresItsBody(t *testing.T) {
+	for _, tool := range Tools {
+		if len(tool.Sections) == 0 {
+			t.Errorf("/%s declares no sections — that page renders blank", tool.Url)
+			continue
+		}
+		if tool.Sections[0].Kind != AboutSteps {
+			t.Errorf("/%s opens with %q — every tool page opens with the steps section, which carries the #how anchor", tool.Url, tool.Sections[0].Kind)
+		}
+		for _, s := range tool.Sections {
+			if s.Prefix != tool.AboutKey() {
+				t.Errorf("/%s: section %q has prefix %q, want %q — the init stamp did not run", tool.Url, s.Key, s.Prefix, tool.AboutKey())
+			}
+			switch s.Kind {
+			case AboutCompare:
+				if len(s.Cols) != 2 {
+					t.Errorf("/%s: comparison %q has %d columns, want 2", tool.Url, s.Key, len(s.Cols))
+				}
+			case AboutChecklist:
+				if s.Items == 0 {
+					t.Errorf("/%s: checklist %q lists no items", tool.Url, s.Key)
+				}
+			case AboutProse:
+				if len(s.Paras) == 0 {
+					t.Errorf("/%s: prose section %q has no paragraphs", tool.Url, s.Key)
+				}
+			}
+		}
+	}
+}
+
+// TestEveryToolHasItsCopyInEveryLocale covers the tool's own labels — the
+// footer link, the tools grid, the meta description — and its FAQ pairs,
+// which FaqSchema silently drops when a translation is missing. The page
+// body's keys are checked against the rendered markup in services/template,
+// which is exact rather than a guess at what the template asks for.
+func TestEveryToolHasItsCopyInEveryLocale(t *testing.T) {
+	locs := locales(t)
+	for _, tool := range Tools {
+		keys := []string{tool.Title, tool.Benefit, tool.Description}
+		for _, p := range tool.FaqPairs() {
+			keys = append(keys, p[0], p[1])
+		}
+		for lang, d := range locs {
+			for _, k := range keys {
+				if strings.TrimSpace(d[k]) == "" {
+					t.Errorf("/%s: %s missing in locales/%s.json", tool.Url, k, lang)
+				}
+			}
+		}
+	}
+}
+
+// TestAboutKeyFollowsTheURL pins the kebab-URL/camel-key convention every
+// locale key on these pages is built from.
+func TestAboutKeyFollowsTheURL(t *testing.T) {
+	for _, tool := range Tools {
+		want := "tool." + camelName(tool.Url) + ".about"
+		if got := tool.AboutKey(); got != want {
+			t.Errorf("/%s: AboutKey() = %q, want %q", tool.Url, got, want)
+		}
+		// The title key is written out by hand; if it disagrees with the
+		// derived prefix, the page body reads another tool's copy.
+		if !strings.HasPrefix(tool.Title, "tool."+camelName(tool.Url)+".") {
+			t.Errorf("/%s: title key %q does not match the URL", tool.Url, tool.Title)
+		}
+	}
+}
+
+// camelName mirrors the i18n key prefix: torrent-to-mp4 → torrentToMp4.
+func camelName(url string) string {
+	parts := strings.Split(url, "-")
+	out := parts[0]
+	for _, p := range parts[1:] {
+		if p == "" {
+			continue
+		}
+		out += strings.ToUpper(p[:1]) + p[1:]
+	}
+	return out
+}
+
+// TestToolByURL: every registered page resolves to itself, and nothing else
+// resolves at all — the lookup is the whitelist for request values that name
+// a tool, so near-misses (a leading slash, other case, a path) must not pass.
+func TestToolByURL(t *testing.T) {
+	for _, tool := range Tools {
+		got := ToolByURL(tool.Url)
+		if got == nil || got.Url != tool.Url {
+			t.Errorf("ToolByURL(%q) = %v, want the /%s entry", tool.Url, got, tool.Url)
+		}
+	}
+	for _, v := range []string{"", "/magnet-to-torrent", "Magnet-To-Torrent", "magnet-to-torrent/", "magnet-to-torrent?x=1", "../magnet-to-torrent", "home"} {
+		if got := ToolByURL(v); got != nil {
+			t.Errorf("ToolByURL(%q) = /%s, want nil", v, got.Url)
+		}
+	}
+}
+
+// The Stremio addon landing must not read as free: streams through Webtor's
+// servers need a paid plan (handlers/stremio, requiresPayment), and "no
+// debrid subscription is needed" said the opposite. The description (meta,
+// og and the lead under the H1) and the benefit line say so in every locale;
+// by the owner's decision no key of the page names a debrid service.
+func TestStremioAddonLandingSaysThePlanIsPaid(t *testing.T) {
+	paid := map[string]string{
+		"en": "paid", "ru": "платн", "es": "de pago", "de": "bezahlt", "fr": "payante", "pt": "pago",
+		"it": "a pagamento", "pl": "płatn", "tr": "ücretli", "nl": "betaald", "cs": "placen",
+	}
+	for lang, d := range locales(t) {
+		stem, ok := paid[lang]
+		if !ok {
+			t.Errorf("%s: no word for \"paid\" in this test", lang)
+			continue
+		}
+		for _, k := range []string{"tool.torrentlyStremioAddon.description", "tool.torrentlyStremioAddon.about.benefits.item3"} {
+			if !strings.Contains(strings.ToLower(d[k]), stem) {
+				t.Errorf("%s: %s does not say the plan is paid: %q", lang, k, d[k])
+			}
+		}
+		for k, v := range d {
+			if !strings.HasPrefix(k, "tool.torrentlyStremioAddon.") {
+				continue
+			}
+			for _, banned := range []string{"debrid", "torbox"} {
+				if strings.Contains(strings.ToLower(v), banned) {
+					t.Errorf("%s: %s names %q: %q", lang, k, banned, v)
+				}
+			}
+		}
+	}
+}
+
+// /watch-torrents-ios says only what its sources say. Safari's compact layout
+// hides Share behind ••• (Apple Support, 2026-09), so every locale names both
+// taps. uTorrent Lite's own page lists iPadOS, not iPhone, among the
+// platforms it supports; the comparison quotes that list instead of offering
+// Lite as an iPhone app.
+func TestIOSGuideKeepsToItsSources(t *testing.T) {
+	const p = "tool.watchTorrentsIos.about."
+	for lang, d := range locales(t) {
+		if v := d[p+"explained.p3"]; !strings.Contains(v, "•••") {
+			t.Errorf("%s: explained.p3 does not mention the ••• button: %q", lang, v)
+		}
+		if v := d[p+"utorrent.subtitle"]; !strings.Contains(v, "iPadOS") || !strings.Contains(v, "Edge") {
+			t.Errorf("%s: utorrent.subtitle does not quote Lite's platform list: %q", lang, v)
+		}
+	}
+}
+
+// Every tool lands in a footer column: a guide in Guides, anything else in
+// one of ToolGroups. A tool with no known group would silently drop out of
+// the footer, and with it the site-wide link to its page.
+func TestToolGroups(t *testing.T) {
+	known := map[string]bool{}
+	for _, g := range ToolGroups {
+		known[g] = true
+	}
+	for _, tool := range Tools {
+		if tool.Guide {
+			if tool.Group != "" {
+				t.Errorf("%s: a guide has no group, got %q", tool.Url, tool.Group)
+			}
+			continue
+		}
+		if !known[tool.Group] {
+			t.Errorf("%s: group %q is not one of %v", tool.Url, tool.Group, ToolGroups)
+		}
+	}
+	for lang, keys := range locales(t) {
+		for _, g := range ToolGroups {
+			if keys["footer."+g] == "" {
+				t.Errorf("%s: missing footer.%s", lang, g)
+			}
+		}
+	}
+}

@@ -1,0 +1,8 @@
+{
+  "input": "start-397.mkv",
+  "want": {
+    "title": "start-397",
+    "container": "mkv",
+    "adult": true
+  }
+}

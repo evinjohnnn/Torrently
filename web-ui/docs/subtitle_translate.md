@@ -1,0 +1,1682 @@
+# Subtitle translation (auto subtitles, phase 2)
+
+AI-translated subtitle tracks in the stream player. Phase 1 (parent spec
+`docs/superpowers/specs/2026-09-12-auto-subtitles-design.md`) picked the best *existing* subtitle
+for a viewer; phase 2 adds a machine-translated track when no human one exists in the viewer's
+preferred language, produced by a separate service (`subtitle-translate`) reached through
+torrent-http-proxy as a URL mod.
+
+Design spec: `docs/superpowers/specs/2026-09-13-subtitle-translate-design.md` (decisions 1–13,
+amended 2026-09-14). Plans: `docs/superpowers/plans/2026-09-13-subtitle-translate-webui.md` (this
+repo), `docs/superpowers/plans/2026-09-13-subtitle-translate-service.md` (the service). Service
+contract: `subtitle-translate/README.md`.
+
+## The ladder
+
+`handlers/action/helper.go` ranks every subtitle candidate with `ladderRank`; the player never
+reimplements the order, it only reads `data-rank`.
+
+| Rank | Provider (Go)           | Badge (`data-badge`) | i18n key                   |
+|------|--------------------------|-----------------------|-----------------------------|
+| 0    | `UserSubtitle`           | `user`                | `action.stream.badge.user`     |
+| 1    | `MediaProbe` (embedded)  | `embedded`            | `action.stream.badge.embedded` |
+| 2    | `ExportTag` / `External` | `sidecar`             | `action.stream.badge.sidecar`  |
+| 3    | `OpenSubtitles`, hash match | `os`               | `action.stream.badge.os`       |
+| 4    | `OpenSubtitles`, imdb match | `os` + hint        | `action.stream.badge.os`       |
+
+The imdb hint sent to video-info (`jobs/scripts/subtitle_hints.go`) prefers the **persisted video
+ref** — `models.ResolveVideoFromResourcePath`, the same episode row watch history keys on: the
+show's tt id with the stored season/episode for exactly this file — and falls back to the
+enrichment metadata row plus a fresh parse of the file path. The embed/API `imdbId` still wins
+over both. The series row for a path is picked path-aware (`pickSeriesRow`, mirroring the movie
+side): the show owning an episode at that path, else the lone show, else nothing — a multi-series
+pack must not name the wrong show. Since 2026-09-18 the name parser also reads the word-form
+season folder (`Season 1/`, `Сезон 1/`), the layout that used to lose the season and with it the
+whole hint. The word forms are anchored to the start of the path segment — mid-name "Season 2"
+is as often a title (`Open Season 2 (2008)`).
+An **adult resource sends no derived hint at all** — the same `resource_metadata.is_adult` bit
+that hides the AI track and blurs the poster also stops the stream page from naming the title to
+OpenSubtitles (the ref lookup is skipped and the md/path fallbacks return empty); only an
+explicit embed/API `imdbId` — the caller's own declaration — still passes through. The bit is read
+for every stream, embeds included (the derived hint is built there too), through
+`streamprefs.AdultResource`, which keeps "not adult" apart from "could not find out": a DB error
+or the 3 s timeout **withholds** the hint, while the AI track keeps reading the same failure as
+not-adult.
+| 5    | `Translated` (AI)        | `ai`                  | `action.stream.badge.ai`       |
+| 6–8  | reserved (phase 3 whisper takes 6) | —           | —                            |
+| 9    | anything else / "None"   | —                     | —                            |
+
+**When the OpenSubtitles fetch fails, the page still renders** — without those rungs.
+`api.GetOpenSubtitles` checks the HTTP status before it decodes: a non-200 is a typed
+`api.StatusError` naming the status, and the job log shows that instead of the decoder's
+"unexpected end of JSON input", which is what an error page, an empty 502 or a 429 used to
+surface as. A `Retry-After` on a non-200 rides along in that error and is **reported, never
+obeyed** — no retry loop, no sleeping out somebody else's back-off inside a job step a viewer is
+watching. A 200 with an empty body is an empty list: the file has no subtitles.
+
+**A 200 that carries a `Retry-After` is the one answer that is neither.** video-info sends it
+while one of its search legs is still waiting on the seeder — the body is an empty list, but the
+lookup never finished. Reading it as "no subtitles" is worse than the 404 it replaced: the stream
+job's rendered result is cached for ten minutes, so one early answer takes OpenSubtitles away
+from every viewer of that file for the rest of the bucket, with the job step marked done.
+`GetOpenSubtitles` answers `api.SubtitlesNotReadyError` (sentinel `api.ErrSubtitlesNotReady`,
+carrying the seconds; a non-delta-seconds header means "not ready, no usable hint" and zero), and
+`fetchOpenSubtitles` (`jobs/scripts/opensubtitles.go`) retries **once** after the `Retry-After`,
+capped at 5 s — and 5 s when the header is absent or unreadable, since the service did say it
+needed time — never past the step's own deadline.
+
+Still not ready, and the page renders without those tracks. Two things then happen. The run calls
+`job.Job.DoNotCache()`, which retires the result instead of leaving it in storage for every later
+request with the same id: the job queue is also a ten-minute cache, and serving this one page to
+the rest of the bucket would hand the gap to viewers who would have got the tracks. (Retiring is
+the same path a failed run already takes, 60 s after the run ends, so a viewer still replaying the
+log is unaffected.) And the render says so: a `Warn` in the log, `data-subtitles-not-ready` on the
+picker, `notReady` on `subtitle-resolved` — without which a level of `'none'` counts a file nobody
+looked at as a file with nothing to find.
+
+A track marked **forced** (signs-only) always gets badge `forced` regardless of provider
+(`badgeFor`, `action.stream.badge.forced` = "signs only") — the origin is less useful to the
+viewer than the fact that it's forced. Forced tracks are listed in any language (spec amended
+2026-09-14: no language filter) but are never a candidate for auto-selection, and never the source
+of a translation (`isHumanFull`, `pickTranslationSource`).
+
+## Default-track rules
+
+Order of evaluation in `applyLadder` (only runs when `SubtitleOpts.PreferredLang != ""`, i.e. the
+feature is on and this is not an embed — see *Gating and flags*):
+
+1. **Saved choice wins.** `VideoStreamUserData.SubtitleID` is honored as-is, *unless* it points at
+   a `Locked` item (an AI track saved while paid, now lapsed, or a stale link) — a locked default
+   would show "on" with nothing rendered, so it's ignored and the ladder decides fresh.
+2. **Explicit caller default.** An embed that pre-selected a track (`ExternalData`) keeps it.
+3. **Audio-language rule.** If the base language of the *active* audio track (the `Default` item of
+   `GetAudioTracks`, i.e. the Accept-Language match — not the probe's first stream) equals the
+   preferred language, full subtitles are **not** turned on and no translation starts; only a
+   forced track in the preferred language turns on by default (labeled "signs only"), else "None".
+   Unknown audio language counts as "needed".
+4. **Ladder for the preferred language.** Otherwise, the best human track (ranks 0–4) in the
+   preferred language wins. Failing that, the `Translated` item is the ladder's answer — but
+   **it is never turned on for the viewer** (owner, 2026-09-16: a run spends tokens, so it takes
+   an explicit click). An unlocked item is marked `Offered`, and **the best full human English
+   track by ladder rank plays beside the offer** (`offeredDefault`; owner, 2026-09-28: "show the
+   main subtitles and offer to translate them"). With no English track, subtitles stay off.
+   Only a track that **declares** English counts: an embedded stream without a language tag
+   (what ffprobe reports for a Matroska track marked `und`; `GetSubtitles` labels it English for
+   display, `ListItem.LangGuessed` / `data-lang-guessed`) and an `und` tag do not — 7.8% of the
+   files with text subtitles in the 2026-09-14 probe sample had one, titled "Español", "Chinese",
+   "rus full", and at rank 1 it beat a real English track of rank 3.
+   History: until 2026-09-18 the phase-1 selection decided here, and a viewer who had set Serbian
+   got the Russian track their browser implied, which read as the setting being ignored; from
+   2026-09-18 an offer left subtitles off, so an English film with no subtitles in the viewer's
+   language played with nothing on screen until they clicked. What the 2026-09-18 rule protected
+   still holds: **`Accept-Language` is not consulted beside an offer** — English is the one
+   fallback language every viewer gets (`fallbackLang`, i.e. `ud.FallbackLangTag`, the language
+   the phase-1 fallback ends on too), not a guess about this viewer. The offer itself is
+   unchanged: the chip, `#subtitle-hint` and the on-screen pill all still offer the translation,
+   since the English track is not in the offer's language (`offerNeedsHint`'s rival rule). A
+   preferred language of English never reaches this: an English track would have won above.
+   **A saved track withdraws the offer, this English one included** (rule 1: the viewer has dealt
+   with subtitles; `TestSavedEnglishWithdrawsTheOffer`). **The next episode is not a saved choice:**
+   the player carries only what the viewer *chose* (`readCarry` in `next-item.js` reads
+   `data-saved`, which `markTrack` moves on every persisted pick), never what the ladder turned
+   on, so the next file's ladder decides again — its own Portuguese track if it has one, else its
+   English track beside the offer. Until the 2026-09-28 review the player carried what was
+   *playing*, a carry arrives as a saved choice, and a saved choice outranks the ladder: the
+   first version of this rule excepted "the ladder's own English track" from rule 1 so that the
+   offer survived episode 1, and that pinned the carried English over the next episode's
+   Portuguese track. The same carry used to drop a free viewer's `Upsell` from episode 2 on; it no
+   longer does. A locked item is marked `Upsell` (see *The on-screen offer*) and rule 5 applies.
+5. **Phase-1 fallback when the preferred language cannot be served at all.** Not when a
+   translation is `Offered` (rule 4). If the preferred language yields nothing activatable
+   (NSFW, free viewer facing a locked item, or the language is outside
+   `stremio.LanguageByCode`), `applyLadder` falls back to the old phase-1 selection
+   (`selectListItem`/`matchLang`: Accept-Language, then English) instead of "None" — the ladder
+   must never take away subtitles phase 1 would have turned on. Exception (owner, 2026-09-28):
+   a free viewer facing a locked item — an **upsell** — gets rule 4's English track too, beside
+   the upsell, exactly as a paying viewer does beside the offer (`TestFreeViewerGetsEnglishBesideTheUpsell`);
+   phase 1 decides only when the file has no English track. NSFW and a language outside
+   `stremio.LanguageByCode` have no translation item at all and keep phase 1 (Accept-Language,
+   then English).
+
+Switching audio tracks in the modal re-runs the same rule client-side (`pickDefaultSubtitle` in
+`subtitle-rules.js`), reading `data-rank`/`data-srclang`/`data-forced`/`data-locked` instead of
+recomputing anything. Rule 4's English track is part of it: with no human track in the preferred
+language and a `Translated` item on the list (unlocked, or locked as an upsell), the client picks the best English track by
+`data-rank` (`FALLBACK_LANG`, kept equal to the server's by
+`TestFallbackLangIsMirroredInSubtitleRules`). It tests for the item, not for `data-offered`: the
+server does not mark the offer when it rendered for audio already in the viewer's language, and an
+audio switch is exactly how the viewer leaves that state. Difference from the server: on a miss —
+no English track beside an offer, or no offer at all — the client keeps the current default
+instead of answering "None" or recomputing an Accept-Language match (no such matcher client-side);
+the server's phase-1 fallback only applies at page render.
+
+**No preferred language means no re-pick.** `data-preferred-lang` is empty in two live
+configurations — every embed, and any deployment with `SUBTITLE_TRANSLATE_ENABLED` off
+(`subtitleOptsFor`, `jobs/scripts/translate_opts.go`, returns the zero `SubtitleOpts` for both) —
+and there the rule has nothing to decide *for*, so it keeps the current selection rather than
+answering `none`. It used to answer `none`, which switched subtitles off behind a first-time viewer
+who touched the audio menu, with `persist:false` so nothing recorded why (fixed 2026-09-16; wiring
+test in `Player.wiring.test.js`).
+
+**The language table is a superset of the service's — and identity is not detection.**
+`applyLadder` offers a translation only when `stremio.LanguageByCode(lang) != nil` (an item
+leading to a rejected request is worse than no item), so `stremio.Languages` has to contain every
+code `subtitle-translate` accepts. Twelve did not (`sk lt lv et fa bn ta kk ka hy az ca`) and were
+appended 2026-09-16; `TestLanguagesCoverTheTranslateService`
+(`services/stremio/lang_superset_test.go`) embeds the service's list and says what is missing,
+with the refresh procedure in the comment above it.
+
+**Nobody was locked out before that, though** (review I1): `PreferredLang` comes from
+`stremio_settings.preferred_language`, which the settings handler validates against this very
+table before storing, or from `c.Lang`, one of the eleven shipped UI locales — all of which were
+already here. The twelve rows do not recover a cohort that was being refused; they create the
+possibility of one, starting with twelve new entries in the Stremio settings dropdown. Worth
+knowing before the list grows again.
+
+**The table answers four questions and only two of them wanted the new rows.** *What is this
+language called* (display) and *will the translate service accept it* (the ladder gate) do.
+*What tokens in a title mean it* (detection) does not, and that is where the first version did
+damage: `KAT` is KickassTorrents branding, `EST` is the Electronic-Sell-Through tag, and
+`Фильм 2019 [KAT] 1080p` came back **Georgian** instead of Russian — `ExtractLanguages` runs its
+Cyrillic fallback only when nothing else matched, so a false positive *pre-empts* the right
+answer, and `LangFilterStream` is exclusive, so that release left a Russian viewer's Stremio list
+without a word.
+
+So `Language.TitleAliases` is now the detection half, separate from `Code`/`Name`/`Flag`, and
+`langMap`/`ExtractLanguages` are built from it alone — flag included, since a flag is just
+another token. All twelve appended rows carry **none**: nameable, choosable, never detected, until
+someone measures tokens against real release vocabulary.
+`TestAppendedLanguagesAreNotDetectedFromTitles` is the review's measured table, including the
+Cyrillic row.
+
+Two consumers had to learn the same rule, because filtering *by* an undetectable language keeps
+nothing and reads to the viewer as "there is nothing for this film":
+`filterStreamsByLanguage` (`lang_filter_stream.go`) and `matchesPreferences`
+(`services/release_subscription/poller.go`) both treat "resolvable but not detectable" exactly as
+they already treated "unknown code" — not a filter. The client needs no such guard:
+`matchesPrefs` (`streamPrefs.js`) already keys on a name it could not resolve and answers "not a
+filter", and Discover's chips are built from what the streams themselves advertise.
+
+The table is mirrored in `assets/src/js/lib/discover/lang.js`, and since 2026-09-16 that mirror is
+**enforced**: `TestLangJSMirrorsTheGoTable` parses the JS file and compares `code`, `name`, `flag`
+and `titleAliases` row by row. Excluded: `extraFlags` (client-only) and the single code-less row,
+`Latino`, which is a release-title tag rather than a language anyone can choose — the test asserts
+it is the *only* one. That row also shares Spain's flag, which used to shadow Spanish in
+`LANG_MAP`; registration there is first-wins now, so a bare 🇪🇸 resolves to Spanish and 🇲🇽/🇦🇷
+still reach Latino.
+
+## Preferred language
+
+`streamprefs.Service.PreferredContentLang(ctx, user, picked, accept, uiLang)`, first match wins:
+
+1. **The profile.** Signed-in user with `stremio_settings.preferred_language` set to a language
+   `stremio.LanguageByCode` recognizes. For a viewer without an account, `picked` — what they
+   chose in the player, kept in the session (`models.PreferredLangSessionKey`) — stands in its
+   place.
+2. **The browser.** The first `Accept-Language` tag, reduced to its base, when the platform knows
+   the language.
+3. The UI language (`c.Lang`), only when the browser sent nothing usable (an API-started job).
+
+The browser outranks the UI language since 2026-09-19 (owner). Measured over 523 streaming
+sessions (Umami, 18–19.09): in 46 % the two differ, almost always an English UI — the default an
+unprefixed URL gets — under a zh/pt/es/fr/ru browser. The ladder then found an English track,
+called the viewer served and never offered a translation: 7 offers against 531 streaming sessions,
+with 11 sessions (2 %) addressable at all. The same data put ~11 % of sessions in "needs subtitles,
+has a source track, browser ≠ UI".
+
+**One language for audio and subtitles** (owner, 2026-09-19). The job writes the resolved language
+to `vsud.ResolvedLang`, and `wantedLangs` (`handlers/action/helper.go`) puts it in front of the
+`Accept-Language` list wherever a list is matched by language: the default audio track
+(`GetAudioTracks` → `selectListItem` → `matchLang`) and the subtitle fallback. A saved audio choice
+still wins; with no track in the preferred language the browser's list decides, then English, then
+the first track. Where the job resolves no language (an embed, the feature off) `ResolvedLang` is ""
+and `Accept-Language` alone decides, as before. For most viewers nothing changes — the preferred
+language already is the browser's first tag — and for the rest it removes the split where Kazakh
+subtitles were offered over audio chosen for a Russian browser.
+
+**Shown and changeable in the picker.** The dialog's footer, beside Close, carries a select with
+the language in force — it is the viewer's setting, not the subtitles section's, so it does not sit
+under that heading (`#preferred-lang`, `stream_video.html`; absent in an embed and with the feature
+off, where `PreferredLang` is ""). It is the profile's setting itself, not a player setting of its
+own — the one the Stremio addon and the release subscriptions read — so changing it here changes it
+there. `PUT /stream-video/preferred-lang {lang}` (`handlers/action`): an account →
+`streamprefs.SetPreferredLang` → `models.SetUserPreferredLanguage`, which rewrites that one field of
+the JSONB document (the profile form replaces the whole document and would reset the resolution
+order); no account → the session. Unknown codes are refused (400); "" clears.
+
+The ladder and the AI chip are rendered by the server with the player, so after the PUT a new
+render is needed — but only the dialog's, not the film's (owner, 2026-09-19: the first version
+re-rendered the whole player, and a second of nothing is long in the middle of a film).
+
+- **The quiet path** (`background-render.js`, `swapSubtitlesDialog` in `Player.jsx`). The stream
+  action is started again *off the page*: the form's POST by `fetch`, then the job log's SSE until
+  its `rendertemplate` message, whose body is parsed and never inserted. From it only `#subtitles`
+  is taken: the live dialog element stays (it is open, and every listener is delegated to it — the
+  switch, the audio chips and this select were moved to delegation for that), its `data-*`
+  attributes and its `.modal-box` are replaced, the `<track>`s of chips that are gone are dropped,
+  and the server's new defaults are applied the way a mount applies them — the subtitle through
+  `activateSubtitle(persist: false)` and `trackHooks.onDialogSwapped` (the translation poll follows
+  it, "manual" is what the new render says was saved, the on-screen offer is decided again for the
+  new language), the audio default by setting `hls.audioTrack` when it differs. `<video>` is never
+  touched.
+- **Turnstile.** An anonymous start needs a token, the token is taken on a real `submit`, and tokens
+  are single-use — the one the page got for its first start cannot be sent again. `silentToken()`
+  (`turnstileAction.js`) takes a fresh one from the warm widget, silent path only (~1 s); a signed-in
+  viewer and a deployment with no widget need none.
+- **The visible restart** is what is left when the quiet path cannot be had: Cloudflare wants a
+  click, or the job answered with something that is not a player (an error card, the cap modal).
+  `requestSubmit()` on the form that posts to `/stream-video` (`findStreamForm` — by endpoint: the
+  form's class is the button's action name, `stream`, and a lookup by `form.stream-video` found
+  nothing and fell back to a reload that closed the player) — **not** the async library's
+  `form.reload()`, which skips the `submit` event Turnstile listens to. The job key carries the
+  language (`prefKey` for an account, `vsud.PreferredLang` in `vsudID` otherwise), and the player
+  that comes back continues without the "continue from" prompt: `trackHooks.beforeRestart`
+  force-saves the position and leaves a one-shot, one-minute note in `sessionStorage`
+  (`wt-auto-resume`) that the next player of the same file spends (`takeAutoResume`).
+
+`background-render.js` is deliberately not about languages: starting a stream action off the page
+and taking what is needed from its render is what switching to the next episode will need too.
+Telemetry: `subtitle-preferred-lang {from, to}`.
+
+The same function backs audio-track defaulting (above); the Stremio addon (phase 5) is not
+implemented yet.
+
+## Gating and flags
+
+| Flag | Env var | Effect |
+|---|---|---|
+| `subtitle-translate-enabled` | `SUBTITLE_TRANSLATE_ENABLED` | `TranslateEnabled()`; off by default. Master switch for offering the AI item at all. |
+| `subtitle-translate-free` | `SUBTITLE_TRANSLATE_FREE` | `FreeForAll()`; when set, every viewer may activate the AI track (for deployments without `claims-provider`). |
+
+**Preview as a free viewer.** Append `&debug=tier:free` to the resource hash
+(`#action=stream&debug=tier:free`): `previewAsFree` (`jobs/scripts/translate_opts.go`) clears
+`Paid` on the computed options, so a paid account sees the AI track locked with the CTA. The value
+only ever downgrades, which is why `handlers/action/handler.go` lets it through under
+`GIN_MODE=release` while every other `debug` value stays dev-only; it is part of the job cache
+key, so the preview never contaminates the paid render.
+
+**The flag is a master switch, not an AI-item gate.** `subtitleOptsFor`
+(`jobs/scripts/translate_opts.go`) returns the zero `SubtitleOpts` — `PreferredLang == ""` — when
+the feature is off *or* the request comes from the embed widget, and `GetSubtitles` reads an empty
+`PreferredLang` as "take the phase-1 path": `selectListItem`/`matchLang` only, `applyLadder` never
+runs. So with the flag off a deployment keeps phase-1 selection unchanged, and embeds always use
+phase-1 selection. Two things are *not* gated, because they are not part of the selection rule:
+**forced tracks stay visible** in any language with the `forced` badge (`badgeFor` runs for every
+item), and `matchLang` keeps skipping forced tracks. `jobs/scripts/action.go` also skips the reads
+that only feed the ladder in that case — preferred language, `resource_metadata`, TMDB credits —
+so the flag costs nothing when off.
+
+`buildSubtitleOpts` (`jobs/scripts/translate_opts.go`) is then reached only with the feature on and
+outside an embed; it keeps its own `adult`/`embed` gates as defence in depth and combines the flags
+with two more gates:
+
+- **Tier.** `Paid = FreeForAll() || isPaidForTranslate(c)`, where the latter is true iff
+  `c.Claims.Context.Tier.Id != 0`. A non-paid viewer still gets the list item (so it's visible as
+  an upsell) but `Locked=true` and no `Src` — the URL itself is the entitlement, so a free viewer
+  must never receive it, not even hidden in markup.
+- **NSFW.** `Translate = enabled && !adult && !embed`. `adult` comes from
+  `streamprefs.IsAdultResource` (`resource_metadata.is_adult`; unknown resource or a DB error reads
+  as not-adult, matching the existing adult-classification convention — the flag only ever removes
+  a capability, never grants one). When adult, there is no AI item at all: no ladder entry, no
+  lock, no CTA.
+- **Embed widget.** `embed` is `dsd != nil` (an embed `DomainSettingsData` is present). Embeds never
+  get the `Translated` item in phase 2 — a third-party page has no `/donate` to send a locked
+  viewer to, and the cost would be charged to a viewer web-ui cannot identify.
+
+Enabling the flag with neither `ANTHROPIC_API_KEY` nor `OPENAI_API_KEY` on the
+`subtitle-translate` service is not silent:
+the service answers `501 translation is not configured` and the player surfaces it through
+`subtitle-translate-error`.
+
+The service chooses Anthropic when its key is configured, otherwise OpenAI.
+When both keys exist Anthropic wins; API errors do not change providers.
+`SUBTITLE_TRANSLATE_MODEL` is configured on that service (defaults: Claude Haiku
+4.5 for Anthropic, GPT-4.1 Mini for OpenAI), independently of web-ui models.
+See `subtitle-translate/README.md`, “AI provider selection”.
+
+## The Translated item
+
+Built in `applyLadder` when the ladder misses and a source is available (`pickTranslationSource`):
+
+| Field | Value |
+|---|---|
+| `ID` | `"tr-" + lang` |
+| `Label` | `"<LanguageName> · AI"` (e.g. "Portuguese · AI") |
+| `SrcLang` | the preferred language code |
+| `Provider` | `"Translated"` |
+| `Badge` | `"ai"` |
+| `SourceBadge` | the source track's badge (`user\|embedded\|sidecar\|os`) — rendered as a muted "from &lt;origin&gt;" suffix, i18n key `action.stream.translate.from` |
+| `SourceID` | the source track's `ListItem.ID` — diagnostics only, never rendered or reported |
+| `Src` | `api.TranslateURL(src.Src, lang, opts.Names)` when `Paid`, else `""` |
+| `Locked` | `true` when not `Paid` |
+| `Rank` | 5 |
+
+`TranslateURL` (`services/api/translate_url.go`) appends `~tr:<lang>/<name>.vtt` to whatever
+subtitle URL web-ui already built for the source track (sidecar `~vtt`, OpenSubtitles `~vi`,
+user-upload `/ext/…~vtt`) and adds `?names=<csv>` when a glossary is present — the proxy resolves
+the inner chain itself.
+
+**The source URL must be absolute.** The output is built as `scheme://host` + path, so a relative
+or scheme-less source would come out as `://…` or `https:///…` — a string that looks like a URL
+and is not one. `TranslateURL` returns `""` for those, and `applyLadder` then **drops the
+Translated item entirely** rather than offering an unlocked track with no `Src` (subtitles
+"selected" with nothing on screen). Every subtitle URL web-ui actually builds is absolute, so this
+is a guard, not a routine path.
+
+This leaves a deliberate asymmetry: the drop is keyed on `Src == ""` *and* `!Locked`, so a **free**
+viewer still sees the locked AI item for a source that could never have produced a URL. That is
+correct rather than an oversight — the locked item is an upsell, not a track; it never carried a
+`Src` and never will, and hiding it would make the CTA's presence depend on a property of a source
+the viewer cannot see. The cost is that such a viewer could upgrade and then find no AI item at
+all, which is the same outcome every unsupported source already gives (see *Known limitations*).
+
+**Translation source selection** (`pickTranslationSource`): the **language** of the source decides
+first — the active audio's language (transcribing what's said rather than translating a
+translation), then English, then any. **Within one language tier** a **file** source — the
+viewer's own upload, an `ExportTag` sidecar, an OpenSubtitles track — beats an **embedded** one
+(`MediaProbe`, the live playlist) (owner ruling, 2026-09-16, narrowed 2026-09-18). The full order
+is: file/audio, embedded/audio, file/English, embedded/English, file/any, embedded/any.
+
+Until 2026-09-18 the bucket was picked before the language — any file beat every embedded track,
+"not per language". What that cost showed up on a release with thirty-seven embedded tracks,
+English among them, and three hash-matched OpenSubtitles files in Croatian, Czech and Romanian:
+the Georgian translation was made from the Croatian. A translation of a translation, through a
+pair the model is weak in, with the original sitting in the file. The cost argument below still
+decides wherever it costs nothing in quality (the same tier), and the live playlist is now paid
+for only when no file is in the audio language or in English. How many stream starts that is
+has **not been measured**; `subtitle-resolved` by source language is where to count it.
+
+The cost of the two is not comparable, which is what the ruling is about. A file is one fetch of
+seconds-to-minutes and leaves a final artifact cached under `ArtifactKey` for every later viewer.
+The live source runs at transcode speed, holds one of the service's `--live-max-jobs` slots for
+the length of the film, stops when the viewer leaves, and caches a final only for a contiguous run
+from offset 0. Until the 2026-09-16 ruling the winner fell out of the order `GetSubtitles` appends in
+(`MediaProbe` first, then `ExportTag`, `OpenSubtitles`, `External`, `UserSubtitle`), so a
+transcoded file translated its own live playlist even when the viewer's own upload sat in the same
+language — while the display ladder ranks that upload *above* embedded. The two orders disagreeing
+was a bug, not a policy.
+
+**Among file sources of the same language** (`translationSourceRank`): the viewer's own upload,
+then the sidecar, then a **hash-matched** OpenSubtitles track, then an **imdb-matched** one.
+Still deliberately **not** `ladderRank` — the ladder answers "which track does the viewer want to
+read", this order answers "which text will the machine translate correctly" — but the sidecar
+sits above the hash match (owner ruling 2026-09-17, reversing 2026-09-16): a hash match fits the
+*timing* to this very file and says nothing about the *text*, and community uploads routinely
+carry injected ad cues — the demo film's hash-matched English track turned out to be mostly ads, and the
+machine dutifully translated the ads. A sidecar's timing can belong to another cut, but its text
+is the film's, and a wrongly-timed line is a smaller failure for a translation source than a
+correctly-timed advertisement. Equal ranks keep list order, which is the only stable tie-break
+the embedded bucket has.
+
+Embedded (`MediaProbe`) tracks are a source when the stream plays through the transcoder:
+`GetSubtitles` gives each visible embedded track `Src = <HLSSessionBase>/s<MPID>.m3u8` (the same
+variant hls.js plays; `SubtitleOpts.HLSSessionBase` is set in `streamContent` once the session
+exists), and `TranslateURL` appends `~tr:<lang>/s<MPID>.vtt` to it. The service then follows the
+live playlist (service README, «Live HLS source»): the translation arrives along with the
+transcode, `X-Subtitle-Live: 1` marks it as still growing, and a final artifact is cached only
+for a contiguous run from the start. A native MP4 played without a session has no base and no
+embedded source, as before — and a list with neither a file source nor a session offers no
+translation at all.
+
+**Glossary.** `streamprefs.CastNames(ctx, imdbID, 30)` reads up to 30 cast names from TMDB credits
+stored by enrichment, passed as `names=` to the service.
+
+**Key stability.** The service's cache key is `sha256(InfoHash + Path + lang + model +
+promptVersion)` — it does **not** include `names` or any per-viewer query parameter. The artifact
+is shared by every viewer of that track/language, so **the first requester's glossary is baked
+into the cached translation for everyone else too** (service README, "What survives the round
+trip" / cache-key section).
+
+## Client behaviour (`Player.jsx`, `subtitle-rules.js`, `subtitle-progress.js`, `cue-offset.js`, `subtitle-apply.js`)
+
+- **One selection, one writer (`subtitle-apply.js`).** Two renderers can draw subtitles on the same
+  element: hls.js, from the transcoder's HLS manifest (embedded tracks, no `<track>` element,
+  `data-mp-id`), and the media element's own `<track>`s (everything side-loaded — uploads,
+  OpenSubtitles, sidecars, the AI translation). The chip carrying `data-default="true"` is the only
+  thing that says which, and `applySubtitleSelection(video, hls, selection)` is the only thing that
+  writes that answer into both. (One exception, and it is bounded: `restoreTrackState`
+  (`cue-offset.js`) writes element modes too, from the snapshot a seek took — which is why the seek
+  applies the chip again right after it, see below.) A side-loaded or `none` selection means
+  `hls.subtitleTrack = -1`, `hls.subtitleDisplay = false`, the chosen `<track>` `'showing'` and
+  **every other text track — element-backed and hls.js-managed alike — `'disabled'`**.
+  `activateSubtitle`, `initDefaultTracks` (`hls-manager.js`) and the session seek all go through it.
+- **Why `'disabled'` and not `'hidden'` for hls.js's tracks.** hls.js is not a passive renderer. Its
+  `SubtitleTrackController` listens to the media element's `textTracks` `change` event
+  (`onTextTracksChanged`), scans every labeled subtitle track and adopts one — the *last* in
+  `'hidden'` mode, or the *first* in `'showing'` — then maps it back to a manifest index and calls
+  `setSubtitleTrack`. A manifest track left `'hidden'` is therefore not "off": it is a standing
+  invitation, and our own mode writes are the `change` events that cash it in. Measured on stage
+  2026-09-16: after switching from an embedded Russian track to the AI one, `hls.subtitleTrack` read
+  `-1` and `hls.subtitleDisplay` `false` while the embedded "Full (rus)" TextTrack sat at
+  `'showing'` with 25 cues under the Catalan ones. (Element tracks go to `'disabled'` for a second,
+  older reason: a `'hidden'` `<track>` is still fetched, and 40+ OpenSubtitles tracks per page meant
+  a burst of downloads on every selection.)
+- **Re-asserted, not written once.** The traffic goes both ways: hls.js's `toggleTrackModes` (it
+  runs on every `setSubtitleTrack`, `-1` included, and on a `subtitleDisplay` change while a track is
+  selected) sets every labeled subtitle track that is not its own current one to `'disabled'` — our
+  `<track>`s included. So the player subscribes to `SUBTITLE_TRACK_SWITCH` and
+  `SUBTITLE_TRACKS_UPDATED` and re-applies the selection whenever what hls.js is doing disagrees
+  with the chip (`selectionHolds`). Only side-loaded and `none` selections are guarded — an embedded
+  one is self-healing: it leaves hls.js's own track `'showing'`, so `onTextTracksChanged` re-adopts
+  the same index and nothing changes. The only transition that loses it is `loadSource`, which the
+  seeker re-applies. Listeners come off on unmount.
+- **Why `applySubtitleSelection` refuses to be re-entered.** `hls.subtitleTrack = -1` is not a value
+  assignment: `setSubtitleTrack` has no "already -1" exit, so every write runs `toggleTrackModes`
+  (disabling the very `<track>` the same call is about to show) and then triggers
+  `SUBTITLE_TRACK_SWITCH` **synchronously** — `Hls.trigger` is eventemitter3 wrapped in a
+  `try/catch` that turns a thrown error into a non-fatal `ERROR` event. The re-assert listener
+  therefore runs *nested inside* the apply, at the one moment the selection is guaranteed not to
+  hold, and applies again. Without a guard that is unbounded recursion: against a line-faithful
+  model of hls.js 1.6.14, 812 frames and a `RangeError` per selection, swallowed by hls.js as ~40
+  `INTERNAL_EXCEPTION` errors and a screenful of `HLS non-fatal error` warnings. A module-level
+  `applying` flag in `subtitle-apply.js` refuses the nested call; the outer apply then finishes
+  writing the element modes, and hls.js's *asynchronous* `onTextTracksChanged` sees the finished
+  state. The flag lives in the writer, not in the listener, because the seeker re-enters through
+  that same listener rather than through its own code. The disagreement check (`selectionHolds`)
+  is what stops the *asynchronous* round trip: an apply writes modes, the modes wake hls.js, hls.js
+  calls back, and the second pass finds nothing to fix.
+- **The mount race.** `activateSubtitle` can run before `window.hlsPlayer` exists — the mount-time
+  restore of a saved translation does exactly that — so only the element modes land there.
+  `initDefaultTracks`, on the first `canplay`, applies the same selection again with the instance in
+  hand. It used to read `data-mp-id` and do nothing when there was none, which left a side-loaded
+  default running with hls.js's own default of `subtitleDisplay = true` and no track selected: one
+  `change` event away from the overlap above.
+- **The session seek re-reads the chip.** The subtitles dialog stays open and clickable while a seek
+  is in flight, so `session-seek.js` no longer restores the hls.js selection from the snapshot it
+  took at seek start (that snapshot could name the track the viewer has just switched away from, and
+  put hls.js back on it). On `SUBTITLE_TRACKS_UPDATED` after `loadSource` it applies whatever the
+  picker says now, and does so once more after `restoreTrackState` on `playing` — the element
+  snapshot is there for the *cues* hls.js drops, and its modes are as stale as the hls.js selection
+  was. Known cost on native HLS (iOS): a subtitle picked in the fullscreen menu rather than in the
+  picker is switched off at the next session seek, because the chip is the only truth the re-apply
+  reads — accepted, not a bug to refile. A seek also kicks the running translation poll
+  (`onSeekOffsetChange` → `pollStopRef.current.kick()`): an immediate HEAD instead of waiting out
+  the 3 s interval, and a one-time bypass of `TRACK_RELOAD_INTERVAL_MS` on the reload the next
+  changed count brings, so the new position's cues do not queue up behind both delays on top of
+  the service's own translation lag. The mark is spent only on a *count* change: after a seek the
+  frontier (`X-Subtitle-Pending-From`) moves before any new cue lands, and that is a change
+  `onProgress` reports but not one that changes the track revision, so spending the mark on it
+  would hand the seek's first real cues back to the throttle.
+- **Audio switch re-pick.** `onAudioSelect` calls `pickDefaultSubtitle(readTracks(modal), audioLang,
+  preferredLang)` and activates the result, unless the viewer already made a manual subtitle choice
+  this session (`manualSubtitleRef`) — re-picking over an explicit choice would read as the player
+  fighting the viewer. `manualSubtitleRef` is also seeded on mount from a `data-saved` default
+  (`ListItem.Saved`, set where `ud.SubtitleID` wins): a choice the viewer saved in an earlier
+  session is as explicit as one made in this one. (`markTrack` moves `data-saved` onto every
+  persisted pick after that, so the chips keep telling a choice from a rule's pick for `readCarry`;
+  the seed itself only ever reads a freshly rendered dialog.) The seed reads `readAllTracks`, not `readTracks`:
+  a saved **"None"** is a choice too, and `readTracks` drops the `none` entry — missing it turned
+  subtitles back on over an explicit off. *(Spec says the audio element carries `data-audio-lang`; the shipped code
+  instead reuses the existing `data-srclang` attribute on `.audio` items — see ledger.)*
+- **Only deliberate activations are persisted.** `activateSubtitle(container, item, {persist})`
+  passes `persist` through to `markTrack`, which is what issues the `PUT /stream-video/subtitle`
+  that becomes `ud.SubtitleID`. Clicking a list item and uploading a file persist; the
+  audio-switch re-pick does not. `Saved` therefore means
+  exactly "the viewer chose it", and a rule the player applied on the viewer's behalf never comes
+  back next page load as a choice that switches the rule off.
+- **Lock → CTA.** Clicking a `Locked` item never activates it (no `Src` to activate); it reveals
+  `#translate-cta` (the `/donate` link, event `donate-subtitle-translate`) and fires
+  `subtitle-translate-lock-click {lang}`.
+- **Progress polling.** `pollProgress` issues a `HEAD` on the track's `src` every 3 s (`HEAD` never
+  starts a job). `X-Subtitle-Progress: done/total`; `0/0` means "not registered yet, keep polling"
+  (never final). Done ⇔ `total > 0 && done >= total`. A non-200 response calls `onError` once and
+  **stops the poll** — it does not retry.
+- **`X-Subtitle-Live` (embedded sources).** `parseProgress(header, live)` also reads
+  `X-Subtitle-Live: 1` off the same `HEAD` response: while it is set, `total` is a snapshot of the
+  live source playlist, not a ceiling, so `final` is forced `false` even when `done >= total` — only
+  the header's disappearance (the underlying transcoder session ended or went idle) lets the normal
+  `total > 0 && done >= total` rule apply again, and the poll keeps running instead of stopping
+  early. The chip reflects this: `Player.jsx`'s `onProgress` shows a bare count (`· <done>`, no
+  denominator worth a percentage) with `title = tf('player.subtitleTranslatingLive')` while live,
+  instead of the usual `· <pct>%` / `player.subtitleTranslating`.
+- **`X-Subtitle-Status` (the service's verdict).** The same `HEAD` response can carry
+  `X-Subtitle-Status: done` or `stopped`, and it outranks the counts because it knows two things
+  they cannot say. `done` means the live source ended and everything in it was translated — a
+  live run can finish with no final artifact to cache (a seeked session caches nothing), and
+  without the header that is indistinguishable from a playlist that simply has not grown in the
+  last three seconds, so the run polled on to the 15-minute cap. `parseProgress(header, live,
+  status)` therefore forces `final: true` on `done` **regardless of `live`**. `stopped` means the
+  run ended incomplete (`source_gone`, `too_large`), which on the counts alone looks exactly like
+  a job that is merely behind: `pollProgress` calls `onError('stopped')` once and stops, after
+  reporting that response's counts — they are the last ones there will be, and those cues are on
+  screen. The player then **keeps the chip's count** and hides only the spinner, with
+  `title = player.subtitleTranslationStopped` ("Translation stopped — reload to retry"), and emits
+  `subtitle-translate-error {code:'stopped'}`. Every other failure clears the count, because a
+  frozen percentage reads as a translation still running. A response without the header behaves
+  exactly as before, which is what every batch run and every pre-2026-09-16 service sends.
+- **The poll sleeps with the video.** On the `<video>`'s `pause` event and on
+  `visibilitychange` → hidden, `Player.jsx` suspends the running poll (`stop.suspend()` on
+  `pollProgress`'s controller); `play`, and a `visibilitychange` back to visible on a video that is
+  not paused, resume it (`stop.resume()`). The HEAD every 3 s is what tells the service somebody is
+  watching (`--live-idle` 90 s), and for a live source it is also what keeps the transcoder session
+  and its FFmpeg run alive — a paused or hidden viewer would otherwise pay for a whole film nobody
+  is watching. **Suspending is not stopping:** no `onError`, no telemetry, no second
+  `subtitle-translate-start` on the way back (the item stays `'running'`, so `translationAction`
+  still answers `'resume'`), and the chip keeps its count and its spinner — unlike
+  `stopTranslationProgress`, which hides both. Time spent asleep does not count against
+  `POLL_TIMEOUT_MS` either: the deadline moves forward by the length of the sleep, so an hour on
+  pause does not come back as a timeout. Resuming is cheap on the service side too — partial
+  progress is held 24 h and re-aligned by cue identity. The listeners are removed on unmount
+  (the effect's cleanup, reached through `destroyPlayer`).
+  **The initial state is read too**, but on the *first response*, not before it: a run begun on a
+  video that has never played (autoplay blocked, or the mount-time restore of a saved AI track) or
+  in a tab that was already in the background gets no `pause` and no `visibilitychange` to sleep
+  on, so `suspendIfNobodyIsWatching` in the first `onProgress` puts it to sleep. It fires **only
+  for a live source** (`X-Subtitle-Live`), which is the only one that costs anything to keep
+  awake — a transcoder session and its FFmpeg run. The first HEAD is what reveals that, which is
+  why the check waits for it: before 2026-09-16 it ran at once and also froze a cached
+  OpenSubtitles run — seconds of work, no session behind it — at `· 0%` with a spinner that did
+  not move until the viewer pressed play, and pausing the film to open the picker is exactly when
+  people start one. A live run clicked while paused now shows the count its first answer brought
+  and polls nothing more until play.
+- **`X-Subtitle-Pending-From` (where the run is in the film).** The fourth header on the same
+  `HEAD`/`GET` response, and the only one about the *film* rather than about the job:
+  `X-Subtitle-Pending-From: <seconds>` (decimal, movie time) is the start of the earliest
+  untranslated cue the viewer can still meet in the current run. The counts cannot answer that
+  question — a run 200 cues from the end may be an hour ahead of the playhead or ten seconds
+  behind it. **Absent** when nothing is pending ahead, when the source is not live, and on every
+  service that predates it; `parseProgress(header, live, status, pendingFrom)` reads absence,
+  garbage and a negative alike as `pendingFrom: null`, and the client treats `null` as *no banner*
+  and as *caught up* — never as "behind". It is part of `pollProgress`'s change test, not a
+  passenger on it: after a seek the frontier moves while the counts stand still.
+- **Catching-up banner (`subtitle-catchup.js`, `.wt-catchup`).** A translation can trail the
+  playhead: a live one runs alongside the transcode, and a file one (an OpenSubtitles track, an
+  upload) translates at the viewer's position but needs time to get ahead of it. Both speak the
+  same protocol — every poll carries the playhead (`pos=<seconds>`, whole seconds, movie time;
+  `pollProgress`'s `position` option), the file job orders its batches by it with the same rule
+  the live loop uses, and both answer `X-Subtitle-Pending-From`; the client is gated on that
+  header's *presence*, never on `X-Subtitle-Live`, so everything below applies to both kinds.
+  A direct seek (no transcoder session) opens the same hold window a session seek does, settled
+  immediately since there is no transcoder round-trip to wait for; its poll kick is rationed to
+  one per `DIRECT_SEEK_KICK_MS` (500 ms) — a held arrow key seeks once per key-repeat, and a
+  session seek is naturally rationed by its POST. During a session seek no `pos` is sent at all:
+  the offset is already the new run's while `currentTime` still belongs to the old one, and no
+  position beats a wrong one. The playhead is floored, not rounded — claiming half a second the
+  viewer has not reached would sort the very next cue into the backlog. **The first `<track>`
+  request carries `pos` too** (`firstTrackSrc`, `Translated` chips only): that GET is what starts
+  the job, a HEAD never does, and the service orders its first batch by the position it has on
+  record — which is kept per file and language (`tr:pos:<artifact key>@<run offset>`, 30 min), not
+  per viewer. Without `pos` on the GET the first batch was ordered by whatever an earlier viewing
+  had left there (measured 2026-09-18: a film opened at 0:00 got its first ~50 cues from the
+  sixth minute). Movie time = `currentTime` + the run offset the component mirrors onto
+  `video.dataset.runOffset`. Known gap: a saved translation restored at mount in a session that
+  resumed mid-film asks before the run offset is known, sends a position below it, and the
+  service ignores that — the old behaviour, for that one case. Differences that remain:
+  the banner on a file source shows no cue count (`player.subtitleCatchUpShort` /
+  `player.subtitleCatchUpWaitingShort`) — its `total` is the whole film, so `total − done` would
+  overstate the wait by orders of magnitude. A throttled poll (429/503) is a missed
+  tick, not the end of the run: burst limiters sit in front of these polls, and one throttled
+  HEAD used to clear the chip and kill the translation. When the translation trails,
+  a top-centre pill says
+  `player.subtitleCatchUpShort` ("AI translation is catching up…" — no cue count, see "No cue
+  count on the pill" below) and offers **Wait for it**, with a × to dismiss. It is placed at the
+  top because the two things it must not cover are the subtitles it is about (bottom of the
+  picture) and the controls under them.
+  - **The comparison.** Playhead is `video.currentTime + seekOffset` (movie time — a transcoder
+    session that started mid-film exposes a media timeline beginning at zero; the same arithmetic
+    `applyCueOffset` does to cues). `seekOffset` is what the transcoder answers — the seek POST and
+    the session's offset GET return the run's *real* start, the keyframe a copy-mode seek actually
+    landed on — with the local `floor(t/30)*30` only as the fallback for a transcoder from before
+    it said (`session-seek.js`); the quantized guess ran ahead of the real start by up to a GOP,
+    which was exactly the sync error every side-loaded cue carried after a seek. Mirrored into
+    `seekOffsetRef` so the poll callbacks read the
+    current offset rather than the one the run started with. `trailing(prev, pendingFrom,
+    playhead)` is true at `pendingFrom <= playhead + 2`, false at `pendingFrom >= playhead + 5`,
+    and **keeps the previous answer in between**. The hysteresis is not politeness: a healthy live
+    run hovers a few seconds ahead of the playhead, and a single threshold would show and hide the
+    banner every 3 s. Neither margin can go below 2 s, because the offset a transcoder run reports
+    is the segment boundary it actually started on and shifts by up to ~1.7 s between runs — a
+    tighter threshold would flip on arithmetic rather than on anything that happened. A playhead
+    that is not a finite number (a `<video>` with no timeline yet) reads as *not trailing* and as
+    *caught up*: a film that has not started must never pause itself. Two more gates sit in
+    front of the comparison: the frontier is read only while the run is live (`p.live`; a batch
+    source has no playhead relationship and the header is not meant to come with one), and a
+    **paused** film is never reported as trailing — the one tick that reaches the banner paused
+    is a run started before the first play, where t=0 against a fresh frontier read as "behind"
+    over a film that had not started. The wait branch is the exception: a waiting viewer *is*
+    paused, and their tick is what ends the wait.
+  - **Evaluated on every tick, not on every change.** `pollProgress` gained `onTick(p)`, called on
+    every successful 200 after the change and queue blocks and before the terminal ones.
+    `onProgress` keeps its only-on-change contract (the chip has nothing to redraw when nothing
+    moved); the banner cannot use it, because the playhead moves while the counts stand still —
+    a translation that stopped producing during a film that keeps playing is exactly the case the
+    banner is there to catch. `setCatchUp` is behind a value comparison so the 3 s tick does not
+    re-render the player for saying the same thing again.
+  - **Wait keeps the poll awake.** `Wait for it` pauses the film and sets `waitingRef`, and
+    `sleep()` — the `pause`/hidden-tab handler that normally suspends the run — returns early
+    while it is set. That inversion is the whole feature: the HEAD every 3 s is what the viewer is
+    waiting *on*, and for a live source it is what keeps the transcoder session and the
+    translation reading it alive. It also calls `resume()` (a no-op unless suspended), which
+    covers the viewer who paused first and pressed Wait afterwards. The banner then reads
+    `player.subtitleCatchUpWaitingShort`, and the button becomes **Keep watching**.
+  - **What ends a wait.** `caughtUp(pendingFrom, playhead)` — `pendingFrom` null, or
+    `>= playhead + 5` — resumes playback by itself and clears the banner (null included, so a
+    service that stops sending the header can never strand a waiting viewer). So does pressing
+    play (the `play` listener clears `waitingRef`), **Keep watching**, and ×. A run that *dies*
+    while the viewer waits (`onError`, `onDone`, `stopTranslationProgress`) clears the banner and
+    the wait but deliberately does **not** play: the film stays paused with the big play button,
+    and the chip's own title says what happened.
+  - **A seek waits for its subtitles, briefly.** A seek into film the live run has not translated
+    used to play its first lines bare. `kickTranslationPoll` records whether the film was playing
+    when the viewer seeked (`seekHoldPendingRef`); when the seek settles (`onSessionSeekingChange`
+    with `false`, i.e. the new run is `playing`) the poll is kicked again, and the first answer
+    after that decides: if the film is still playing and `caughtUp(pendingFrom, playhead)` is
+    false, the same wait as the button starts (`beginWait(true, …)`), with the banner in its
+    waiting sentence. It has **no cap** (it had one until 2026-09-18, 10 s and then 20 s: one
+    upstream model call is 10–15 s and a cold start stacks several, so every cap that was tried
+    gave up on real starts and played the film bare — the one outcome the hold exists to
+    prevent). What ends it is the run getting ahead, the run dying, or the viewer. No hold when the film was paused at the seek or
+    paused before the answer came back (`sleep()` drops the pending decision on any pause outside
+    a seek, so a later play is never held), when the source is not live, or when the service sends
+    no `X-Subtitle-Pending-From` (`caughtUp(null)` is true). Once per seek.
+    **A window, not the first answer.** For `catchUpTiming.seekWatchMs` (8 s) after the seek settles
+    every answer may start the hold, and the poll is kicked every `seekWatchEveryMs` (1 s) until one
+    does or the window ends. The first answers can predate the new run's cues: the transcoder cuts
+    subtitles with ffmpeg's segment muxer, which closes a segment only on the next cue, and the
+    service reads it a moment later — so "nothing pending" there means "nothing read yet". A silent
+    stretch never shows anything pending and is never held. (Reporting the end of the ingested part
+    of the run as the frontier was considered and rejected for the same muxer behaviour: during a
+    long silence that end stands still while the film plays, and every quiet scene would read as
+    "behind".) No hold in a hidden tab, and a tab hidden even mid-seek drops the decision.
+    **Only an answer about the new run decides.** Measured on a real session: the transcoder lists
+    the new run ~200 ms after the seek POST, the first poll after a seek lands ~100 ms after it,
+    and the service re-read its playlist only once per poll interval (6 s) — so the answer after a
+    seek described the old run, with nothing pending, and read as "caught up". Every live poll now
+    carries `sof=<seekOffset>` (`pollProgress`'s `sessionOffset` option; sent once an answer said
+    the source is live), the service re-reads the playlist at once when it disagrees, and each
+    answer carries `X-Subtitle-Session-Offset`. An answer whose offset is not the player's own
+    (±1 s) neither decides the hold (the decision is put off, re-kicked every
+    `SEEK_HOLD_RETRY_MS` = 600 ms, at most `SEEK_HOLD_RETRIES` = 5 times) nor ends a wait nor
+    moves the banner. A service without the header is taken at its word, and so is one that has
+    disagreed for `catchUpTiming.runMismatchLimit` (5) consecutive answers outside a seek's window —
+    two sessions on one artifact key, or a failed offset read at mount, would otherwise silence the
+    banner, strand a pressed Wait and force a playlist read per poll for the rest of the film; past
+    the limit the player also stops sending `sof`. A seek whose POST is refused changes nothing:
+    no offset change, no reload (`session-seek.js`).
+    **Ending a hold.** A hold is a pause the viewer never made, so every path that ends it for a
+    reason that is not the viewer's plays the film: the run dying (`fail`, `onDone`, another track
+    via `stopTranslationProgress`), ×, and a new seek (the hls.js seek path waits for `playing` and
+    never plays a paused element). `clearWait()` reports whether the wait was a hold for exactly
+    this. The one exception is the player unmounting (`stopTranslationProgress({ resumeHold:
+    false })`). A hold that ends while the tab is hidden (`resumeAfterHold`) does not start
+    playback there: the poll is suspended — an awake poll behind a paused film keeps the transcode
+    and the translation running for nobody — and the film plays when the tab becomes visible
+    again (`resumeOnVisibleRef` in the visibility handler; any play, seek or unmount clears it). The service half is what
+    makes 10 s meaningful: a new run wakes the live job at once and its first cues skip the batch
+    window (subtitle-translate `LiveConfig.FreshRun`); before that the first line at a new
+    position took a poll tick, then up to `--live-batch-wait`, then the upstream call.
+    `clearWait` is the one way a wait is dropped (stop, error, done, play, **Keep watching**, ×),
+    so the hold's timer cannot outlive its wait.
+  - **The ×** is per run and per stretch of film. It is cleared when the run catches up, on a
+    session seek (`kickTranslationPoll`) and when a new run starts — all three mean the thing
+    that was dismissed is over. Dismissing while waiting also cancels the wait; after the Wait
+    button it does not resume playback, after a seek's hold it does.
+  - **No tier gate, and none wanted.** A viewer without the entitlement never has a translation
+    running: the AI chip is rendered `Locked` with no `Src` upstream, so there is nothing here to
+    gate. The gate is the dependency (a running translation), not a flag.
+- **`rev` reload (throttled).** A reload rewrites the `<track>` `src` via `withRev`
+  (adds/replaces `?rev=<done>`, every other query param — including the signed token — passes
+  through untouched), forcing a refetch. The browser drops the cue list while it reparses, so the
+  track is briefly empty on every swap: reloads are therefore throttled to at most one per
+  `TRACK_RELOAD_INTERVAL_MS` (15 s, `Player.jsx`) and always happen on the final progress, while
+  the `.tr-progress` percentage still updates on every 3 s poll. No reload happens while
+  `total === 0` (nothing to fetch yet). `reloadSubtitleTrack` (`subtitle-track-reload.js` — its own
+  module so the listener lifetime is testable; `node --test` cannot parse `Player.jsx`) returns
+  whether it actually swapped the `src`, and **only a real swap stamps the throttle** — a no-op
+  must not hold off the next real reload for another 15 s.
+  `captureTrackState`/`restoreTrackState` (`cue-offset.js`) snapshot and restore cues/mode around
+  the swap, and the same snapshot is restored if the new revision fails to load (`error` on the
+  `<track>` → `subtitle-translate-error {code:'track'}`, once per run); session cue-offset
+  (mid-movie resume) reapplies via the existing `load` listener. There is **one `load`/`error`
+  listener pair per `<track>` at a time**: the pending pair is removed before the next revision's
+  goes on, so a failure restores the *latest* snapshot rather than one from several revisions ago.
+  `onTrackError` additionally checks the run identity (`runSeqRef`): a `<track>` whose `src` a
+  stopped run set can still fail afterwards, and that event must not kill the current run.
+- **Waiting for a slot.** `0/0` means "the job has not counted the cues yet", which covers both a
+  run that has just started and one queued behind every other translation on the service. After
+  `QUEUE_HINT_MS` (30 s) of nothing but `0/0`, `pollProgress` reports once more with
+  `queued: true` and the chip reads `· …` with `title = player.subtitleTranslationQueued`
+  ("Waiting for a translation slot…") instead of `· 0%`, which reads as a translation stalled at
+  the start. It is a display rule and nothing else: the poll keeps running, the timeout deadline
+  is untouched, and the first real count clears it — including a `total` appearing while `done` is
+  still 0, which is why the report now fires on either number moving rather than on `done` alone.
+  Time the poll spends suspended does not count toward the 30 s, the same way it does not count
+  toward the timeout: a run asleep is not a run queued. The three things the chip can say (queued,
+  live, counting — in that order of precedence) are one pure function, `progressText`
+  (`subtitle-progress.js`), so the player holds no chip vocabulary of its own.
+- **Progress text.** The AI chip's `.tr-progress` span shows the bare percentage — `· 0%` on
+  start, then `· N%` on every 3 s poll. The localized sentence
+  `player.subtitleTranslating` = `"Translating… %v%"` is **not** the span's text any more: it is
+  written into the span's `title` (same value, refreshed with each percentage), so the chip stays
+  the width of a chip while the sentence is still available on hover and to assistive tech. The
+  design reason is in `docs/uikit.html` §19 — a chip row cannot carry a sentence per chip.
+- **Progress spinner.** A `.tr-spinner` (`loading loading-spinner loading-xs`) sits beside the span
+  on the same chip. Both are `hidden` in the markup and are unhidden together when a run starts or
+  resumes, and hidden again on done, on error, and whenever the poll is stopped
+  (`stopTranslationProgress` holds them in `progressSpanRef`/`progressSpinnerRef` and clears both
+  refs). Either one left visible freezes at the last percent and reads as a translation stuck
+  forever, so they are always toggled as a pair; `setChipActive` never rebuilds a chip's
+  `innerHTML`, so neither element is lost when the viewer switches tracks mid-run.
+- **No auto-start** (owner, 2026-09-16). Nothing the player does on its own begins a translation:
+  there is no page-load start, and the `stream-start` engagement gate it used to piggyback on
+  (`state.currentTime >= 5`) no longer touches the AI item — that effect is telemetry only. A run
+  begins on a click of the chip, on the switch restoring `data-last-subtitle`, or on the
+  mount-time restore of a translation saved in an earlier session. See "Picker behaviour". The
+  spec's old "starts 5 seconds into viewing" is superseded by decision 14.
+
+## The on-screen offer (`subtitle-offer.js`)
+
+The picker's offer brought to the picture: a pill in the catch-up pill's slot (top centre,
+`.wt-catchup.wt-offer`), so a viewer who never opens the subtitles dialog still learns that the
+film can be translated. Owner's request of 2026-09-18.
+
+- **The server decides whether there is an offer; the pill only reads it.** `pickOffer(readChips())`
+  returns `start` for a chip marked `Offered`, `upsell` for a `Locked` chip marked `Upsell`. Both
+  go through `offerNeedsHint`'s rival rule (nothing else activatable in that language). Every
+  existing gate is inherited through those two marks: the audio-language rule, NSFW, embeds
+  (no preferred language, no ladder), a language the service does not know, the master flag,
+  `SUBTITLE_TRANSLATE_FREE`. No tier is read on the client.
+- **`Upsell` (helper.go) is `Offered` seen from a free account.** `Locked` alone is not enough:
+  the locked item is appended whenever the preferred language has no human track, including when
+  the audio is already in that language. `ladderPick(..., admitLocked=true)` asks the ladder the
+  same question as if the viewer could run the translation; only `markUpsell` reads that answer.
+  Rendered as `data-upsell`. The sentence the pill shows ("Translate to Portuguese", localized)
+  travels as `data-offer-label` on any chip that is `Offered` or `Upsell`.
+- **When.** Decided once, on the first `play`. Up for `offerTiming.lingerMs` (10 s), afterwards
+  only together with the controls. The catch-up pill wins the slot (`offerVisible`). A subtitle
+  choice made anywhere (`onSubtitleSelect`) withdraws the offer.
+- **`start`.** A click on the pill is `el.click()` on the chip: the same delegated handler, PUT,
+  marks and poll. The × hides it for this page only — it is an action the viewer can take, so
+  nothing is remembered.
+- **`upsell`.** A click opens `.wt-offer-card` without pausing the film: the sentence and the
+  `/donate` link are read from the picker's own `#translate-cta` (`readUpsellCard`; the link
+  opens in a new tab and reports `donate-subtitle-translate` with `source=player`), plus **Not
+  now** and **Don't offer again**. The × and **Not now** store `{until: now + 30 d}`, **Don't
+  offer again** stores `{never: true}`, both under `localStorage['wt-subtitle-offer']` — per
+  browser, across all films. Storage that throws reads as "not suppressed".
+- **Not covered by tests:** the 10 s linger timer against real controls auto-hide, and fullscreen.
+
+### Starting a run over a playing film holds it
+
+Owner, 2026-09-18: pressing the offer (or the chip) over a playing film showed nothing — no
+banner, no subtitles — until the first batch landed. A run that has counted nothing answers `0/0`
+with no `X-Subtitle-Pending-From`, and no frontier reads as "not behind" (`trailing`, `caughtUp`).
+That is right for a run the player merely finds in that state and wrong for one the viewer has
+just started, where nothing counted means nothing translated at the spot they are watching.
+
+- `startTranslationProgress` opens the **same hold window a seek opens** (`seekHoldPendingRef`,
+  `seekSettledAtRef`) when the film is playing, the tab is visible and the viewer is not already
+  waiting; during a session seek (the resume prompt's answer, then the pill) the window is stamped
+  when the seek settles. A paused film holds nothing.
+- While `startHoldRef` is set, `nothingCountedYet(p)` (`0/0`, not final) counts as **behind**: for
+  the hold decision, for an ongoing wait, and for the passive banner. The first counted answer
+  clears the flag and the frontier speaks for itself. The banner carries no cue count then
+  (`bannerRemaining` → the `…Short` copy).
+- Bounds are the seek's: the hold is taken within `seekWatchMs` (8 s) or not at all;
+  `subtitle-translate-wait {auto: true}` reports it. Like every hold it has no time cap.
+- Side effect, the same one a seek has: run-mismatch counting is suspended while the window is
+  open, so a persistent mismatch is noticed up to 8 s later on a run started over a playing film.
+- The tests about the passive banner, the manual **Wait** and the run mismatch start their run
+  with `pickPausedThenPlay` (track chosen before play) — a run that is behind, not one just started.
+
+### The film a hold releases has its subtitles
+
+The `<track>` reload is throttled to one swap per 15 s. The first counted answer used to spend
+that window on a revision with nothing translated (`done = 0`), so when a hold ended — the
+service comfortably ahead — the track still held that revision and the film played without
+subtitles until the window ran out; pause → play made them appear, because its `kick()` bypasses
+the throttle (owner, 2026-09-18). Now a `done = 0` revision is never worth a swap, and the end of
+a wait that was caught up, or of a trailing stretch, forces one.
+
+### The silent hold (`beginPreHold`)
+
+A seek's hold used to be decided by an answer that arrives *after* the seek settles, so the film
+played for a moment and was paused again. Now the film is paused the instant the seek settles
+(session: `onSessionSeekingChange(false)`; direct: `handleSeek`), with nothing on screen but the
+seek's own spinner (`preHolding` keeps the big play button away), and the first answer **about
+this run** decides: *behind* → the ordinary hold takes the pause over (banner, cap), *not behind*
+→ the film goes on. An answer about another run decides nothing. Bounded by
+`catchUpTiming.seekPreHoldMaxMs` (1.5 s) for a service that says nothing.
+
+- Only for a seek that may yet be held: the film was playing, a translation is being polled, the
+  tab is visible. `sleep()` leaves the poll awake and keeps the hold question while it lasts.
+- **A toggle during the silent hold means "pause".** The element is paused by the player while the
+  viewer is looking at an unfinished seek, so `togglePlay` (one wrapper for click, space, the big
+  button and the bar) ends the hold without playing and withdraws the hold question.
+- **Live sources keep a residue of the old behaviour.** A live run that names no frontier may
+  simply not have read the new run's cues yet (the transcoder closes a subtitle segment only with
+  the next cue, seconds later). Holding blind for that would stall every seek on a translation
+  that is keeping up, so such an answer releases the film, and a hold can still arrive after a
+  moment of playback. File sources answer against the position the poll carried, and are exact.
+
+### Lead-in belongs to the service
+
+For a few hours on 2026-09-18 the client sent `pos = playhead − 60 s` to give file jobs a
+lead-in. Reverted the same day: `pos` means the position, and a lead-in applied on the client
+cannot reach a live job at all. The service applies it (its `--lead-in`, 30 s) to the ORDER of
+batches for both kinds of source, and keeps the frontier on the true position.
+
+### A seek silences the run it leaves (`session-seek.js`)
+
+The frozen frame hid the old run's picture while the seek POST was out, but nothing hid its sound:
+it kept playing the old position for as long as the transcoder took to start the new one (owner,
+2026-09-18). `seek()` now pauses the element before the POST (after `setIsSeeking(true)`, so the
+player's pause listener does not take it for the viewer's) and plays it once the new source is
+loading; a refused POST undoes the pause. A viewer who seeks while paused stays paused, as before.
+`seek(t, { play: true })` is for the resume prompt's answer: the film is held, the seek is what
+ends the hold — and `handleResume` no longer plays *before* seeking, which was audible as the
+film's opening under the frozen frame.
+
+### Play is "Keep watching"
+
+During a wait the big play button and the banner's **Keep watching** do the same thing, so the
+`play` listener now flips the banner to its non-waiting state at once instead of on the next 3 s
+tick.
+
+### A revision's load must not switch the track off (`subtitle-track-reload.js`)
+
+**The bug behind "no subtitles until pause → play", on file and live sources alike** (owner,
+2026-09-18). `reloadSubtitleTrack` snapshotted the track before swapping `src` — cues *and mode* —
+and put both back on `load`. The snapshot could be taken at the worst moment: a session seek's
+`hls.loadSource()` disables every element-backed track; a progress tick inside that window swapped
+the revision with `mode = 'disabled'` on record; the seek settled and the picker's selection
+switched the track back on; and then the revision's `load` "restored" the snapshot — switching the
+track off with its fresh cues in it. Nothing re-asserted: the player's re-assertion listens to
+hls.js events (`SUBTITLE_TRACK_SWITCH`, `SUBTITLE_TRACKS_UPDATED`), and a `<track>` load is
+neither. So: a running translation, a banner saying it had caught up, no subtitles — until
+something re-applied the selection, which pause → play happened to do. "Continue from…" is a
+session seek, which is why it showed up right after resuming.
+
+- The module now restores **cues only** (when the new revision is empty or failed). The mode that
+  is right after a load is the picker's answer *now*, which the module cannot know.
+- `reloadSubtitleTrack(video, id, src, onError, onSettled)`: `onSettled` fires after `load` and
+  after `error`. `Player.jsx` passes `reassertSelection` — `readSelection` →
+  `selectionHolds` → `applySubtitleSelection`, the one writer of modes — guarded by the run id.
+- Pinned at both levels: the module test reproduces the switch-off (red before the fix), the
+  wiring test disables the track, fires `load`, and expects `showing` (red without `onSettled`).
+- **Not observed in a browser.** The chain was derived from the code and reproduced under jsdom;
+  hls.js does not run in the automation's hidden tab, so the real `loadSource` wipe was not seen.
+
+### What a cold seek looks like on the wire (measured 2026-09-18)
+
+Silo S01E09, seek to 433 s on a position nobody had used: the transcoder answered in 837 ms with
+the run's real start, 418.002 s (the keyframe, 15 s before the request), and the subtitle playlist
+of the new run covered the film up to 425 s at 0.8 s of wall time, 452 s at 2.5 s, 505 s at 5 s,
+666 s at 12 s and 1067 s at 25 s — **20–25 s of film per second**. A seek onto a position that
+already has a run (shared FFmpeg runs) lists every segment to the end of the film in the first
+answer. So the transcoder is not what a live translation waits for after a seek; one upstream
+model call is (10–15 s). Three consequences, all applied the same day:
+
+- **No cue count on the pill, on any source.** `total − done` on a live source is everything the
+  transcoder has emitted minutes ahead of the viewer ("~300 cues to go" within ten seconds of a
+  seek), which reads as "never". The service reports no count of cues between the viewer and the
+  frontier, so none is shown; the `…Short` copies are the only ones used. The `%v` copies
+  (`player.subtitleCatchUp` / `player.subtitleCatchUpWaiting`), `remaining()` and the banner
+  state's `remaining` field were removed with it: two `: 0` fallbacks could still put "~0 cues to
+  go" on screen.
+- **`seekHoldMaxMs` 10 → 20 s**, and later the same day **removed altogether** (owner): 20 s
+  still gave up on cold starts.
+- **The player holds the film whenever the translation is behind, not only after a seek**
+  (owner, same day). A trailing tick mid-film starts the same automatic wait
+  (`beginWait(true)`); the passive "Wait for it" offer is now what the pill says only after the
+  viewer overruled a hold. Three rules keep it from fighting the viewer: × (`dismissedRef`)
+  and an overruled wait — **Keep watching** or the play button pressed over one
+  (`overruledRef`) — switch the automatic hold off for the rest of that stretch of
+  untranslated film (both reset once the run is ahead again), and nothing is held mid-seek.
+- **The brake.** The 3 s tick can find the frontier 2.5 s ahead and the next one find it a
+  second behind, so the hold is also decided on `timeupdate`: `shouldBrake(pendingFrom,
+  playhead)` pauses `CATCHUP_BRAKE_S` (1 s) before the first untranslated line and kicks the
+  poll. `pendingFrom` is that line's start, so nothing is lost; a stale frontier costs a pause
+  one HEAD long.
+- **The rewind.** A wait that ends on its own puts the film back to the first line the viewer
+  had no subtitle for: `resumeRewind(waitFrom, playhead)` = `missed + 2 s`, at most 10 s, where
+  `waitFrom` is the frontier when the wait began and `missed = playhead − waitFrom`. A wait the
+  brake started missed nothing and rewinds nothing. Done with `video.currentTime` inside the
+  playing playlist — never a session seek, which would restart the transcoder — and clamped at
+  the run's zero. `subtitle-translate-wait-done` carries `rewind` (seconds) instead of `capped`.
+- The first cues of **embedded** subtitles going missing after a seek is therefore a client-side
+  matter — hls.js re-selects the subtitle track after `loadSource` and starts loading its
+  fragments later than the video starts. **Not fixed, not investigated further.**
+
+### A service that answers about another run
+
+After a seek the player names its run on every poll (`sof`, the run's start in movie time) and the
+service names the one it is reading (`X-Subtitle-Session-Offset`). Answers about another run decide
+nothing; `runMismatchRef` counts them outside a seek's window, and past
+`catchUpTiming.runMismatchLimit` (5) the player stops waiting for the service to come round.
+
+Until 2026-09-19 "stops waiting" meant: drop `sof` and take answers at their word. Measured on a
+seek to 44:27 that the service never followed: without `sof` the service lost the hint that makes it
+re-read the playlist *and* filed the viewer's position under the run it was still on; that run's
+document has no cue past 38:16, so "nothing pending" came back, the hold ended and the pill said
+"caught up" over a film with no subtitles. Now:
+
+- `sof` is sent on every poll of a session, whatever the count.
+- Past the limit, with the answer still about another run, what the viewer has decides
+  (`coverageEnd()`, the last cue actually in the `<track>`): cues still ahead of the playhead → the
+  answer is taken at its word, as before (the permanent-mismatch cases — two sessions on one key, a
+  failed offset read at mount — where the translation works and only the labels disagree); the
+  viewer **past** everything loaded → the film is held (owner: no subtitles where the viewer is is
+  what the hold exists for), never "caught up". Keep watching / × / play end it, and after that the
+  pill only offers. A matching answer, or cues arriving past the playhead, puts everything back.
+
+Why the service stays on another run is the transcoder's subtitle playlist: until the new run's
+first subtitle segment closes (a slow source can take minutes) it serves a stub with no
+`#EXT-X-SESSION-OFFSET`, which reads as offset 0 — see content-transcoder.
+
+### A revision swap never interrupts a load
+
+Production, 18–19.09: both `subtitle-translate-error {code: track}` events came 0.2–0.4 s after a
+`subtitle-translate-done`, on a page load of a **finished** translation — and the viewer saw a
+selected chip with no subtitles until they pressed it again. The mount restores the saved
+translation (the `<track>` starts its first GET), the first HEAD answers "done" and
+`reload()` swaps in the final revision while that GET is still in flight. Chrome (checked
+2026-09-19) then fires `error` for the load that was cut short — at once, on the same element,
+with the src already swapped — and loads the new src fine a few milliseconds later. The error was
+taken for the new revision's: the run was reported dead, both listeners came off, and the load
+that followed had nobody to re-assert the selection hls.js had switched off.
+
+`reloadSubtitleTrack` therefore waits for a load in flight (`readyState === LOADING`) to settle,
+whichever way, before it swaps; the newest revision wins the wait and an overtaken one is never
+requested; `loadSettle.maxMs` (5 s) bounds a load that never settles. A swap that has to wait
+still reports `true` — it will happen — so the caller's throttle is spent.
+
+### Cue offsets follow the run that is playing
+
+Two holes, both "the subtitles do not match the dialogue at all" after a seek or a resume:
+
+- The capture `load` listener shifted a freshly loaded `<track>` by the `seekOffset` its effect
+  closure had seen. A seek sets `seekOffsetRef` at once, but the effect re-subscribes a render
+  later; a track that loaded in between was shifted by the OLD run's offset (0 on a resume — cues
+  from the film's opening at the resume point). It now reads the ref.
+- An empty or failed revision makes `reloadSubtitleTrack` put back the cue objects it had
+  snapshotted, and those carry the shift of the run they were loaded in. The capture listener
+  cannot help (it runs before the restore, over an empty list), so `reassertSelection` re-applies
+  `applyCueOffset` to the track after every settle. Pinned by a wiring test (the harness's fake
+  `TextTrack` has cues since this change); the closure race is **not** pinned — it is a
+  render-timing race that jsdom does not reproduce.
+
+### The viewer's frontier, not the service's (`viewerFrontier`, `needsReload`)
+
+Owner, 2026-09-18: "the subtitles do not keep up", with no pill to say why. The banner was decided
+by `X-Subtitle-Pending-From` — where the SERVICE is — while what is on screen is whatever revision
+the `<track>` last loaded, and that swap is throttled to one per 15 s. On a live source the
+translation runs only a little ahead of the viewer, so the usual state was: service ahead, banner
+silent, cues not in the track.
+
+- Every swap records `loaded = { done, frontier }` (the service's count and frontier at that
+  moment). While the service has more than the track (`p.done > loaded.done`), the frontier used
+  for everything — the hold, a wait, the passive pill — is the nearer of the service's and the
+  track's edge: `loaded.frontier`, or, when the swap happened with nothing pending, the end of the
+  last cue actually in the `<track>` (`coverageEnd`, read from `track.cues`, movie time via
+  `__absEnd`). When neither can be read the service's word stands, as before.
+- `needsReload`: the service has cues the track lacks and the viewer is within
+  `CATCHUP_CLEAR_MARGIN_S` (5 s) of that edge → swap **now**, bypassing the throttle. Also during a
+  wait (the film is paused then, and without the swap the edge never moves and the wait never
+  ends — caught by the tests). Not for a film the viewer paused. At worst this is a swap per poll
+  tick (3 s) on a translation that is barely ahead; the throttle exists to spare the viewer a
+  flicker, and a flicker beats no subtitles.
+- Consequence for the pill: it stays up for as long as the viewer really has no subtitles —
+  after **Keep watching**, after a hold that ran into its cap — not for as long as the service
+  says so.
+
+### "Caught up" is said
+
+When a wait ends caught up, or a trailing stretch ends, the pill turns into
+`.wt-catchup--done` — a check, `player.subtitleCaughtUp`, cyan border, no buttons — for
+`catchUpTiming.caughtUpFlashMs` (3 s) and then goes. `showCatchUp(null)` from the following tick
+does not cut it short; anything with something to say does. Never after a × (the viewer asked not
+to hear about it). Tests address the two states separately: `behindBanner` / `doneBanner`.
+
+### The pill on a phone
+
+Under 600 px the catch-up pill drops the cue count (a sibling `.wt-catchup-text-short` carries the
+`…Short` copy; CSS shows exactly one of the two), and shrinks type and paddings. The count made it
+three lines tall over the picture.
+
+Both pills (`.wt-catchup`, and the offer `.wt-catchup.wt-offer`) carry `width: max-content` under
+their `max-width`. Centred by `left: 50%` + `translateX(-50%)`, an absolute box with an automatic
+width may only fill the half of the picture right of its left edge, so until 2026-10-16 every pill
+wrapped at half the player's width — "✦ AI Перевести на русский" was two lines on a 375 px phone
+(capped at 188 px), and the `max-width` never applied. Measured in headless Chrome against
+`player.css` at 320/375/414 px: two lines (three for the Czech offer at 320) before, one line at
+206–244 px after; a 200 px player still wraps inside its edges.
+
+## Deploy order
+
+Three things dated "2026-09-16" here are **client-side halves of contracts the other services had
+not deployed yet** when this was written. All three degrade to the previous behaviour, so web-ui
+can ship first — but until the other side lands they are inert, and two of them make a field
+permanently empty rather than wrong:
+
+| What | Needs | Until then |
+|---|---|---|
+| `200` + `Retry-After` → `SubtitlesNotReadyError` | video-info | no retry, `notReady` always `false` |
+| `moviehash_match` | video-info | `MovieHashMatch` always nil, `hashMatched` reads the `source` enum — today's behaviour |
+| `X-Subtitle-Status` | subtitle-translate | the counts decide alone, as before |
+| `X-Subtitle-Pending-From` | subtitle-translate | no catching-up banner: absence is read as "nothing pending ahead" |
+
+So do not read a `notReady` rate or a `source=hash/imdb` split as measurement before video-info
+deploys: they are measuring the deploy, not the traffic.
+
+## Telemetry (Umami)
+
+| Event | Fields | Notes |
+|---|---|---|
+| `subtitle-resolved` | `level` (`'0'`–`'5'`/`'none'`), `hasUiLang`, `count`, `badge`, `defaultLang`, `needed`, `translated`, `uiLang`, `audioLang`, `notReady` | Fires on the `stream-start` gate (playback ≥ `ENGAGEMENT_SECONDS`). `needed = audioLang base != preferred content language base` (`data-preferred-lang` — profile, then browser, see "Preferred language"; the UI language only when unset; unknown audio ⇒ needed). `translated = badge === 'ai'`. `defaultLang` (from 2026-09-28) is the base language of the track that plays: `''` with subtitles off, `'und'` when the source never declared one (`data-lang-guessed`, or an upload without a language) — `level` is the best level on the list, not what plays, and cannot say which rule chose the track. `notReady` (`data-subtitles-not-ready`) says the OpenSubtitles lookup never finished on this render — exclude those rows before reading a `'none'` rate as "files with no subtitles". Level `'5'` = AI translation; `'6'` reserved for whisper (phase 3), not emitted yet. |
+| `subtitle-select` | `provider`, `srclang`, `source`, `badge` | `badge` is an additive field vs. phase 1's schema. Fires for every activation the viewer asked for — a chip press **and** the subtitles switch turning them back on (`trackSubtitleSelect`, one call site each); never for `none`, and never for the activation the player performs by itself (the audio-switch re-pick). |
+| `subtitle-translate-start` | `lang`, `source` | `source` = the item's `data-source-badge` (`SourceBadge`), i.e. what human track is being translated. **Since 2026-09-16 it cannot fire without an explicit act**: the server never defaults the AI item and the engagement-gate auto-start is gone, so a run begins on a click of the chip, on the switch restoring `data-last-subtitle` (a translation the viewer already ran this session), or on the mount-time restore of one they saved in an earlier session. Rates before and after that date are not comparable — and the two restore paths **do** emit `start`/`done`, as replays of a cached file rather than new work, so the event counts a translation being *shown*, not one being *produced*. |
+| `subtitle-translate-done` | `lang`, `seconds`, `cues` | `seconds` = wall time since start, rounded to 0.1; `cues` = last `total` seen. |
+| `subtitle-translate-error` | `lang`, `code` | `code` = HTTP status, `0` network error, `'track'` the reloaded `<track>` failed to parse/load, `'timeout'` the run passed `POLL_TIMEOUT_MS`, `'stopped'` the service reported `X-Subtitle-Status: stopped` (`source_gone`/`too_large`) — the one code that leaves the chip's count on screen. |
+| `subtitle-translate-wait` | `lang`, `behind`, `auto` | A wait started: the viewer pressed **Wait for it** (`auto: false`), or a seek landed on untranslated film and held playback (`auto: true`). `behind` = `round(playhead - pendingFrom)` in seconds at that moment (`0` when the frontier was unknown). |
+| `subtitle-translate-wait-done` | `lang`, `seconds`, `auto`, `rewind` | The wait ended by itself and playback resumed: the run got `CATCHUP_CLEAR_MARGIN_S` (5 s) ahead of the playhead. There is no other automatic ending since the hold cap was removed (2026-09-18; the field used to be `capped`). `seconds` = wall time waited, rounded to 0.1; `rewind` = how far back the film was put (`resumeRewind`, 0 when the wait began before the untranslated line). A wait the viewer ended themselves (play, **Keep watching**, ×) emits nothing, and neither does a run that died while they waited. `seconds` on `auto` waits is the number to watch: it is what a viewer pays for subtitles at a seek point. |
+| `subtitle-translate-lock-click` | `lang` | Free viewer clicked the locked AI item. |
+| `donate-subtitle-translate` | (button attrs: `data-umami-event-tier=free\|anon`, `data-umami-event-source=player` when clicked in the on-screen card) | CTA inside the lock card, or inside the on-screen upsell card. |
+| `subtitle-offer-shown` | `lang`, `kind` (`start`\|`upsell`) | The on-screen offer was decided and shown, once per page, at first play. `kind` doubles as the tier split: `upsell` is a viewer who cannot run a translation. |
+| `subtitle-offer-click` | `lang`, `kind` | The pill was clicked: a run starts (`start`), or the card opens (`upsell`; fires again if toggled). |
+| `subtitle-offer-dismiss` | `lang`, `kind`, `how` (`close`\|`later`\|`never`) | The viewer closed the offer. For `upsell`, `close`/`later` snooze 30 days and `never` is for good. |
+| `subtitle-preferred-lang` | `from`, `to` | The viewer changed the preferred language in the subtitles dialog; fires after the PUT succeeded, before the player is re-rendered. |
+
+**Telemetry: not comparable across this release.** Do not read a day-over-day or week-over-week
+line through the deploy date. `subtitle-resolved.count` grows for reasons that are not "more
+subtitles were found" — forced tracks are now listed in any language, and the `Translated` item is
+an extra list entry; `subtitle-select` gained a `badge` field (rows before the deploy have none);
+and level `'5'` did not exist before, so any level histogram changes shape rather than moving.
+Compare within a period on one side of the deploy, or re-baseline.
+
+**The English track beside an offer (2026-09-28) moves two lines.** Sessions of paying viewers
+that get an offer (`subtitle-offer-shown kind=start`) now resolve to an English track wherever the
+file has one: their `subtitle-resolved` `badge` moves from `''` to that track's badge (`emb`,
+`sc`, `os`…, never `ai`). `level` does **not** move — it is the best level on the list, not the
+level of what plays — so the rule's reach is read off `defaultLang` (added with the rule, absent
+before it): `needed && defaultLang === 'en'`, joined per session with
+`subtitle-offer-shown kind=start`. `badge` alone moves for other reasons too.
+And the offer is now read over subtitles that are already on, so a change in
+`subtitle-offer-click` / `subtitle-translate-start` per `kind=start` offer across that deploy is
+the rule's effect as much as the viewers' — the question worth answering with it, not noise to
+smooth over. `kind=upsell` is untouched (free viewers keep the phase-1 fallback).
+
+Disagreement with spec: the design spec (line ~219) also calls for a "bad translation" variant of
+the existing `report-problem` control with `data-provider=Translated`. **Not implemented** — no
+code path sets that variant. Deferred to a follow-up by controller ruling (the form lives on the
+resource page); the spec is amended.
+
+## Template attributes (`data-*` per chip)
+
+Since the picker redesign there is one flat container per group and no sub-views. Every chip is a
+`<button type="button">`; the `.audio`/`.subtitle` marker classes and the whole `data-*` set are
+unchanged from the `<li>` era, so `readAllTracks`, `readTracks`, `findSubtitleItem` and
+`initDefaultTracks` kept working across the change untouched. One reader did change:
+`remapTrackGroup` (`hls-manager.js`) matched a manifest track name against the element's
+`textContent`, and a chip's text is now decorated (origin code, property tag, source suffix), so
+it reads `data-label` — which is why every audio chip carries one (R7). `activateSubtitle` reads
+the same attribute for the `<track label>` it creates, and no longer falls back to the chip text
+for the same reason.
+
+### Ids (`templates/views/action/stream_video.html`)
+
+| id | element | role |
+|---|---|---|
+| `#subtitles` | `<dialog class="modal">` | the picker; carries `data-resource-id`, `data-item-id`, `data-preferred-lang`, `data-subtitles-off` (`"true"` while subtitles are off) and, once the viewer has switched them off in this session, `data-last-subtitle` (the id to restore) |
+| `#subtitles-toggle` | `<input type="checkbox" class="toggle toggle-soft">` | the subtitles on/off switch, **first child of `#subtitle-langs`** — where the "Off" chip used to be (owner, 2026-09-16) — in a `<label class="flex items-center">` with an `sr-only` name. Checked iff the default item is not `none` |
+| `.lang-row` | `<div>` inside `#subtitle-langs` | the language chips, "+N" and the `<template>`. Exists so the muted state can dim the chips without dimming the switch beside them; `applyOffState` writes `.picker-off` here, never on `#subtitle-langs` |
+| `#audio-tracks` | `<div role="radiogroup">` | audio chip row |
+| `#subtitle-langs` | `<div role="group">` | the switch plus the language row (`aria-label` = `action.stream.subtitleControls`, which names both — the chips alone are a filter, not a choice) |
+| `#subtitle-lang-more` | `<button aria-expanded>` | the "+N" disclosure; its whole visible label lives in the single `.more-count` span |
+| `#lang-chip-template` | `<template>` | one blank `.lang.lang-chip` that `track-picker.js` clones when an upload introduces a language the server rendered no chip for |
+| `#subtitle-tracks` | `<div role="radiogroup">` | subtitle chip row |
+| `#subtitle-none` | first child of `#subtitle-tracks` | the `none` list item, since 2026-09-15 a **hidden state carrier** and not a control (renamed from `#subtitle-off`, which read like the button it no longer is): `hidden`, `aria-hidden="true"`, `tabindex="-1"`, no label and no chip classes. The player still activates it by `data-id="none"` (`findSubtitleItem`, `pickDefaultSubtitle`, `hasSavedDefault`, `dropDeletedTracks`); the act of turning subtitles off belongs to `#subtitles-toggle` |
+| `#my-subtitles` | `<div class="flex flex-wrap …">` | the async swap target for uploads, a **sibling after** `#subtitle-tracks` (a11y, 2026-09-16): it holds the disclosure and the panel, and a radiogroup holds radios and nothing else. Carries `data-upload-open` (the panel state that survives the swap) |
+| `#my-upload-chips` | `<div class="contents">` | rendered **only** on the async reload (`UserSubtitleView.RenderChips`), inside `#my-subtitles`. Wraps that response's MY chips and says "this is the viewer's complete current upload list"; `adoptUploadChips` moves the chips into the radiogroup, reconciles the row's MY set against them and removes the wrapper |
+| `#my-uploads-toggle` | `<button aria-controls="my-uploads-panel">` | the dashed "+ My Subtitles" disclosure (label = `action.stream.mySubtitles`), rendered by the uploads partial |
+| `#my-uploads-panel` | `<div class="basis-full" hidden>` | heading line (`action.stream.mySubtitles` + the close control), upload form, one row per file, each row with its own delete form |
+| `#my-uploads-close` | `<button type="button" class="btn btn-ghost btn-xs">` | the panel's own "×", in its heading line (`aria-label` = `action.stream.close`). Closes the panel exactly as pressing the chip again does — same function in `Player.jsx`, same three writes |
+| `#translate-cta` | `<div hidden>` | the locked-AI card, below the track row |
+| `#subtitle-hint` | `<p class="text-xs text-w-muted">` | the pending offer in words: this language has no subtitles yet and the translation is there to be started. Visible exactly while some chip is `Offered`, is not the track playing, and its language holds nothing else activatable. Between the track row and the CTA card |
+
+### Chips
+
+| Kind | Where | Attributes |
+|---|---|---|
+| `.audio` | `#audio-tracks` | `data-id`, `data-mp-id`, `data-srclang`, `data-provider`, `data-label`, `data-lang`, `data-lang-name`, `data-lang-flag`, `data-default` |
+| `.subtitle#subtitle-none` | first child of `#subtitle-tracks`, hidden | `data-id="none"`, `data-provider=""`, `data-srclang=""`, `data-kind`, `data-rank`, `data-lang="und"`, `data-default`, `data-saved`. No label and no display strings: nothing renders it |
+| `.subtitle` (track) | `#subtitle-tracks` — embedded, sidecar, OpenSubtitles, embed externals, AI (and uploads, see below) | `data-id`, `data-mp-id`, `data-srclang`, `data-provider`, `data-src`, `data-label`, `data-kind`, `data-badge`, `data-source`, `data-rank`, `data-lang`, `data-lang-name`, `data-lang-flag`, `data-source-badge` (Translated only), `data-lang-guessed` (`ListItem.LangGuessed`: an embedded stream with no language tag, labelled English for display; the English rule beside an offer skips it), `data-forced`, `data-locked` (+ `aria-disabled="true"`), `data-default`, `data-saved`, `data-suggested` (the track the switch would turn on while subtitles are off — `ListItem.Suggested`), `data-offered` (the translation the viewer may start — `ListItem.Offered`, Translated, unlocked, and never the track already playing), `data-upsell` (`ListItem.Upsell` — the locked translation the ladder would have offered) and `data-offer-label` (the localized "Translate to …" sentence, on an Offered or Upsell chip; read by the on-screen offer), plus `aria-disabled="true"` on every chip while the block is muted |
+| `.subtitle` (MY) | `#subtitle-tracks`, like every other track. On a page load the dialog's own loop renders them (they are `UserSubtitle` items of the same `GetSubtitles` result); on an async reload `templates/partials/action/user_subtitles.html` renders them into `#my-upload-chips` and the client moves them in | `data-id`, `data-provider="UserSubtitle"`, `data-src`, `data-label`, `data-srclang`, `data-kind="subtitles"`, `data-badge="user"`, `data-rank="0"` (fixed — this view model has no ladder), `data-lang`, `data-lang-name`, `data-lang-flag`, `data-default`, `data-saved`, `data-suggested`, `data-autoselect="true"` when just uploaded, `aria-disabled="true"` while the block is muted |
+| `.lang` | `#subtitle-langs` | `data-lang`, `aria-pressed="true\|false"` |
+
+The `none` carrier never takes the active look: `setChipActive` refuses it by `data-id`, the way it
+refuses a locked chip. `data-default` still moves onto it — that is the state the switch is read
+from — but an invisible chip claiming to be the chosen one, in a group where nothing appears
+checked, is not a state worth drawing.
+
+**Classes.** `.track-chip` / `.track-chip-active` on audio and subtitle chips, `.lang-chip` /
+`.lang-chip-active` on language chips, `.chip-locked` on a locked AI chip, `.picker-off` on
+`#subtitle-langs` and `#subtitle-tracks` while the switch is off (`@apply opacity-50` — dimming
+only: every chip stays clickable). They are defined once
+in `assets/src/styles/style.css` and are the only thing JS touches: `setChipActive` toggles
+`track-chip-active` (plus `aria-checked` and the check icon's `hidden`) and never writes a
+Tailwind utility string, never rebuilds a chip's `innerHTML` — which is why `.tr-progress` and
+`.tr-spinner` survive every selection.
+
+**Children of a chip**, in order: `svg.chip-check` (hidden unless active) · `span.chip-origin`
+(the `EM`/`IN`/`OS`/`MY`/`AI` badge, `title` = the localized origin name) · the label span
+(`title` = the full label, visually truncated) · property-tag badges · `· Source` ·
+`· from <CODE>` · on `Provider == "Translated"` `span.tr-progress` (text `· 37%`, `title` =
+the localized `player.subtitleTranslating` sentence) and `span.tr-spinner`, both `hidden` until a
+translation polls and hidden again together on done/error/stop · on a locked chip a padlock `<svg>`
+and an `sr-only` explanation. A language chip holds `span.chip-flag`, `span.lang-name`,
+`span.lang-count` and `span.lang-dot` (hidden unless the playing track is in that language).
+
+**ARIA.** Audio and subtitle chips are `role="radio"` with `aria-checked`; language chips are
+plain buttons with `aria-pressed` — **never** `aria-selected` / `role="tab"`, because there are no
+tab panels and the one real choice (which track plays) lives in the radiogroup underneath.
+
+**Server-side `hidden`.** The dialog and the uploads partial both render the bare `hidden`
+attribute on every subtitle chip whose `data-lang` differs from the expanded language
+(`LangRow.Expanded`), so a page whose picker JS never loaded still shows one coherent language.
+The `none` carrier is the one chip the filter never touches: `applyLangFilter` hides it in every
+language (it is not a control), and it renders `hidden` from the server. `ExpandedLang` is empty on the async reload of the uploads partial (it has no language row
+to consult), so nothing is collapsed for the instant between the swap and the client's `refresh`.
+
+**Refresh order.** `refresh(container)` in `assets/src/js/lib/player/track-picker.js` is
+`adoptUploadChips` → `syncLangRow` → `applyLangFilter` → `applyFlagSupport` → `applyOffState`
+(→ `syncNow`, a no-op since the "Now:" lines were dropped), and returns the language it settled
+on. `adoptUploadChips` leads because every pass after it is scoped to `#subtitle-tracks`, and the
+chips of an async reload land outside it; on an ordinary page there is no `#my-upload-chips` and
+it is a no-op. `applyOffState`
+re-derives the muted state from `data-subtitles-off`, which is how an SSR-rendered "off" picks up
+the parts only JS can add (`aria-disabled`). `Player.jsx` calls it after mount, on dialog open, and after the `#my-subtitles` async
+swap (upload **and** delete). A plain selection calls `refreshMarks` (`syncLangRow`)
+instead: picking a track moves the dot without yanking the viewer out of the language they were
+browsing.
+
+**"+N".** `maxVisibleLangChips = 6` (`handlers/action/picker.go`) is mirrored by
+`MAX_VISIBLE_LANGS = 6` (`track-picker.js`). `#subtitle-lang-more` is a toggle, not a one-way
+expand: collapsed it reads `+N` (N = language chips currently hidden; a language whose count fell
+to zero is gone, not collapsed), expanded it reads `×`. `aria-label` stays
+`action.stream.moreLanguages` in both states, and the button hides itself at N = 0.
+
+**Origin codes.** `EM` embedded, `IN` in torrent, `OS` OpenSubtitles, `MY` my uploads, `AI`
+translation — the same two letters in every locale. Their meaning is carried by the chip's `title`
+and by the legend line under the row, both built from `action.stream.origin.{em,in,os,my,ai}`
+(`Helper.OriginKey`). **`OS` covers two origins**: a moviehash match on this very file and an
+imdb (title) match that may belong to another release. The code and the colour are the same; the
+imdb case wears a muted `~` **inside** the badge, and the badge's `title` gains a second sentence,
+`action.stream.origin.osImdbHint` ("Matched by title, may be out of sync",
+`Helper.OriginHintKey`). Inside the badge because the badge never truncates — the label span is
+what does — and because a tilde needs no translation: it replaced a `· hash` / `· imdb` suffix
+that printed video-info's raw enum in English in every locale (review M6). `ListItem.Source` is
+still carried as `data-source` for telemetry; it is simply not drawn.
+Which of the two a track is comes from `moviehash_match` when video-info sends it (since
+2026-09-16) and from the `source` enum otherwise (`hashMatched`); `imdbMatched` tests that enum
+for `"imdb"` and not for being non-empty, because "the service reported something else" is not
+the claim "matched by title" — a placeholder value in the test fixture was enough to put the
+warning on seven chips (review I4). The ladder rank is unchanged either way: hash 3, imdb 4. The older `action.stream.badge.*` keys stay in the locale files for
+telemetry and back-compat but are no longer rendered — except `action.stream.badge.forced`, because
+`forced` is a **property tag**, not an origin: a forced embedded track shows `EM` + `forced`
+(`Helper.PropertyTags`). `sdh` is drawn in the uikit and waits for `content-prober` to expose
+ffprobe's disposition flags. Since 2026-09-16 an AI chip's `data-source-badge` (the `· from <CODE>`
+suffix) can also read `EM`: `pickTranslationSource` accepts an embedded track that carries a
+transcoder-session playlist `Src`, where before `embedded` never appeared there. It is now the
+*rarest* of the four, not the most common one — the same day's source ruling made a file source
+win over the live playlist, so `EM` appears only on files with nothing else to translate.
+
+`data-lang` is the base language tag the chip groups under, `und` when unknown;
+`data-lang-name`/`data-lang-flag` carry the display strings so the client can clone a new language
+chip out of `#lang-chip-template` without a language table of its own. All three come from
+`stremio.NewLangDisplay`.
+
+`data-default`/`data-saved`/`data-suggested` on the uploads list come from
+`UserSubtitleTrack.Default`/`.Saved`/`.Suggested`, copied by `Helper.UserSubtitleView` out of the
+matching `ListItem` (`us-<uuid>`) of the same `GetSubtitles` call the dialog renders from.
+`Suggested` matters most here: an upload is rank 0, so whenever the viewer has subtitles off and
+has ever uploaded a file in their language, the track the switch would turn on **is** that
+upload — and without the copy the one chip most often suggested was the one chip carrying no
+`data-suggested` for the client to find. The view model also carries `SubtitlesOff` (derived from
+the same list: the `none` item being default), because while subtitles are off it is the suggested
+chip, not the default one, that wears the check and the fill, and this partial has to agree with
+the dialog's own track row rather than wait for the client's first `refresh` — the partial has its own view model, so without that
+copy the player's audio-switch rule read every upload as "nothing chosen" and could switch away
+from a subtitle the viewer had uploaded and picked.
+
+**Only the initial render carries them.** The async reload (`handlers/user_subtitle`, `buildView`)
+sends `data-autoselect` and nothing else, and that is deliberate rather than a gap: `markTrack`
+returns early when the element already has `data-default="true"`, so a server-rendered default on
+the just-uploaded chip would make the client's `activateSubtitle` a no-op — it would never PUT
+`ud.SubtitleID`, never clear the previously active chip's mark (two defaults in the DOM at once),
+and never mark the upload as playing. The client owns both markers after a reload:
+`activateSubtitle` sets and persists the uploaded one, and `syncUploadMarks` in `Player.jsx`
+re-derives `data-default` from the live `textTracks` for every other reload.
+
+`syncUploadMarks` reads "the uploads" as `.subtitle[data-provider="UserSubtitle"]` anywhere in
+the dialog — containment in `#my-subtitles` stopped being the test when the chips moved into the
+radiogroup, and for one instant after a swap a fresh chip is in the wrapper anyway. It falls back
+to the `<track default>` attribute when no `textTrack` is showing —
+but only while no chip outside the uploads already carries `data-default`. An embedded
+(`MediaProbe`) track is driven by hls.js and has no `<track>` element, so "nothing showing" is
+also what an embedded track playing looks like; taking a stale `default` as the answer there
+marked an upload as well and left two chips with a check. When it does mark a chip it clears
+every other `.subtitle` in the dialog, exactly as `markTrack` does, without the PUT: nothing was
+chosen here, the DOM is catching up with what is already playing.
+
+`readTracks` (`subtitle-telemetry.js`) matches every subtitle chip via the
+`.subtitle[data-provider]` selector, filtering out `data-id="none"`.
+
+## Picker behaviour
+
+One screen, no sub-views (`docs/uikit.html` §19). Audio is a chip row; subtitles are a language
+row plus the tracks of the expanded language.
+
+- **The language row filters only.** Pressing a language chip collapses the other languages in the
+  track row and changes nothing about playback. The chip of the language currently playing keeps a
+  cyan dot, so the selection stays visible while the viewer browses another language — since
+  2026-09-15 the row opens on the **preferred** language rather than the playing one, so that dot
+  is regularly on a chip whose tracks are collapsed. Past six
+  chips the tail goes behind "+N" — except the expanded language, which is never collapsed
+  wherever it sorts, and is not counted into "+N": a pressed but invisible filter leaves its
+  tracks on screen with no chip pointing at them.
+- **Subtitles are switched, not chosen off** (owner, 2026-09-15). A `toggle toggle-soft`
+  leads the language row — where the "Off" chip used to be (owner, 2026-09-16) — and there is no
+  "Off" chip in either row. Off does **not** empty the block:
+  the chips go `.picker-off` (dimmed — `.lang-row` and `#subtitle-tracks`, never the switch itself), every chip keeps its classes — including the active mark on
+  the track that comes back, which also carries `aria-checked="true"`, since a chip drawn as
+  chosen and announced as unchosen is the worst of both — and the language chip of that track
+  keeps its dot. The chips stay
+  clickable, and clicking one is "on, with this track": one activation, one `PUT`.
+  - Switching off activates the `none` item through the normal path (`persist: true`, so the next
+    page load reproduces it), and that activation is what remembers the outgoing track.
+  - **The `PUT` is retried once, and only for the latest choice.** `persistTrackChoice`
+    (`Player.jsx`) resends `PUT /stream-video/{audio,subtitle}` after `PUT_RETRY_DELAY_MS` (1 s)
+    on a rejected fetch or a 5xx, and never on a 4xx — a stale CSRF token or a refused id would be
+    refused again. Added 2026-09-16 after two of these came back 503 from the edge on stage
+    without reaching the pod and the choice was silently lost; the request is fire-and-forget, so
+    nothing noticed. Still fire-and-forget: one retry, no UI, every failure swallowed.
+    The body is read eagerly at `markTrack` time, so the retry needs a guard or it becomes a worse
+    bug than the one it fixes: click A (503), click B (200) inside the second, and A's retry lands
+    last and the next page load restores A. A lost write only ever lost itself; an overwriting one
+    corrupts a newer choice. Each call takes the next number for **its kind** (audio and subtitle
+    count separately — two independent choices, neither may cancel the other's retry) and the
+    retry stands down when it is no longer holding it. `destroyPlayer` bumps a generation counter
+    for the same reason: a write queued by a page the viewer has left must not land in the next
+    file's session.
+  - **The switch has one writer.** "Subtitles are off" means exactly "the `none` item is the
+    active one", and `markTrack` (`Player.jsx`) is the only place that writes it: every
+    activation moves the switch with it, including the ones the player performs for the viewer —
+    a deleted upload landing on `none`, the audio-switch re-pick returning `none`, an upload
+    selected while the switch was off. The decision is the pure
+    `offStateAfterActivate(prevDefaultId, newId, lastId)` (`track-picker.js`): off iff the new id
+    is `none`, and `data-last-subtitle` is written **only** on the way out — the track being
+    replaced, or nothing at all when nothing was playing (an older memory is dropped rather than
+    kept, since it would name a chip that may be gone). A second writer is exactly how the switch
+    and the row drifted apart before.
+  - Either way the switch reports itself as a manual choice (`hooks.onSubtitleSelect`, the same
+    hook a chip press uses): that is what sets `manualSubtitleRef`, without which the next **audio**
+    switch would re-run the ladder and turn subtitles back on over an explicit off. It also stops a
+    translation poll the viewer switched away from, and starts one when the track that came back is
+    an AI item.
+  - Switching on activates, in order: `data-last-subtitle` (this session), the server's
+    `data-suggested`, then the ladder rule (`pickDefaultSubtitle`). A candidate counts only while
+    it is still in the list and not locked. With nothing activatable at all the switch goes back to
+    off rather than claiming a track: nothing is activated and nothing is persisted —
+    `toggleDecision` (`track-picker.js`) is that whole rule as a pure function.
+  - `ListItem.Suggested` (`data-suggested`) is the server's half: whenever the render's default is
+    `none` — the viewer saved it, or the ladder arrived there because the audio is already in their
+    language — `GetSubtitles` names the track the switch would turn on. `offSuggestion`'s rungs, in
+    order: **1.** the best full human track in the preferred language, **2.** a forced (signs-only)
+    track in that language — a real subtitle in the right language beats a full one in a language
+    the viewer did not ask for, and this is what the switch offers when the audio is in a third
+    language, **3.** the Accept-Language pick, **4.** the best activatable track whatever its
+    language. (An AI-translation rung sat between 2 and 3 until 2026-09-16; the switch never
+    starts a translation.) Never the `none` item, never a locked one, and never while subtitles
+    are on: with a track playing, `data-default` already answers that question.
+    One case is answered before `offSuggestion` runs: subtitles saved off while the ladder's
+    answer is an offer. The switch then restores what the ladder plays beside the offer when
+    nothing is saved — the English track of rule 4 (`markSuggested(offeredDefault)` in the
+    saved-off branch; 2026-09-28) — not rung 2's forced track, which covers signs and none of the
+    dialogue. With no English track `offSuggestion` decides as before.
+    Deliberately *not* routed through `ladderPick`, close as the orders are — every state that
+    reaches `offSuggestion` already has `none` marked `Default`, and `ladderPick` answers with the
+    first `Default` it finds (index 0) before it can consider anything else, so the call would be
+    dead code that silently costs rung 2. The saved-off branch of `applyLadder` still uses
+    `ladderPick`, where it runs *before* the defaults are cleared and can therefore answer.
+- **A translation is offered, never started for the viewer** (owner, 2026-09-16). Running one
+  spends tokens, so nothing but an explicit act begins it:
+  - the server never makes the AI item `Default`. Where the ladder's answer was the translation,
+    `applyLadder` marks it `Offered` and `offeredDefault` decides what plays: the best English
+    track by rank, or nothing when the file has none (rule 4 of *Default-track rules*).
+  - no rule picks it up either: `pickDefaultSubtitle` (the audio-switch rule) skips
+    `provider === "Translated"`, `toggleDecision` accepts one only through `data-last-subtitle`
+    (already run this session, therefore cached and free), and `offSuggestion` lost its AI rung.
+  - the 5-second engagement-gate auto-start in `Player.jsx` is **gone**. A run starts on a click
+    of the chip, on the switch restoring `data-last-subtitle`, or on the **mount-time restore of a
+    saved translation**: a translation is not a `<track>` in the page (`markPreload` skips it), so
+    unlike every other saved choice it cannot resume by itself, and the deleted gate was what used
+    to start it. `restoreSavedTranslation` (`track-picker.js`) answers whether to — saved **and**
+    playing **and** unlocked — and `Player.jsx` runs the click path once with `persist: false`.
+    That run is the viewer's own and already cached, which is what makes it the one automatic
+    start left.
+  - an offer taken is an offer spent: `setChipActive` drops `data-offered` and `.chip-offered`
+    when the chip is activated, so the accent and the hint cannot resurface after a run.
+  - **`Offered` is a different field from `Suggested`** (owner review, 2026-09-16). They answer
+    two questions — "what can the viewer start here" and "what would the switch bring back" — and
+    one list usually needs both, on two different chips. `data-offered` marks the translation the
+    ladder would have chosen, and never the one already playing — a translation the viewer saved
+    comes back as `Default`, and inviting them to start what is on screen is nonsense;
+    `data-suggested` stays the switch's restore candidate, computed by `offSuggestion` (which
+    still runs when an offer exists — the two fields do not share a slot), and is never a
+    translation. A **locked** item is never `Offered`: a free
+    viewer cannot run it, so its chip keeps the old name-plus-lock shape and the upsell CTA.
+  - the chip says which it is: offered, it reads as a verb (`✦` + the `AI` badge +
+    `action.stream.translate.action`, "Translate to Portuguese") and wears `.chip-offered`, an
+    accent outline instead of the cyan fill that means "this is playing"; otherwise it reads as
+    before (`Portuguese · from IN` + progress). Two spans, `.ai-action` and `.ai-label`, flipped
+    by `setChipActive` — no `innerHTML`, so `.tr-progress` survives. The verb spans are rendered
+    only for an offered item, so nothing hidden lingers on a locked chip, and `setChipActive`
+    flips nothing on a chip that has no verb (a locked one, or one whose offer was taken: without
+    that test the clearing pass hid the label and left an empty button — found in review,
+    2026-09-16).
+    **A finished translation reads as the verb again after a reload.** The client drops
+    `data-offered` when the run starts, but the ladder does not know the run happened, so the next
+    render offers it again — "Translate to Portuguese" on a file that is already translated.
+    Harmless, because re-selecting it costs nothing (the VTT is in S3), but it is why the chip's
+    wording cannot be read as "this has never been translated".
+  - `#subtitle-hint` under the track row (`action.stream.translate.hint`) is the **offer in
+    words** — "no subtitles in your language yet, turn on the AI translation" — and says nothing
+    about the switch. Three conditions, all of them needed for the sentence to be true: a chip is
+    `Offered`, it is not the track already playing, and **its language holds nothing else the
+    viewer could turn on** (one forced sidecar in that language and "no subtitles yet" is simply
+    false). The server renders those three; the client reads the same three off the chips
+    (`offerNeedsHint`, `track-picker.js`) and re-applies them in `refresh` and `refreshMarks` —
+    which every activation ends in, so an offer taken stops being explained at once.
+  - both sentences are rendered **server-side** with the language name substituted: Go templates
+    take `{{.Param}}`, the client's `tf` takes `%v`, and a chip Go renders once has no reason to
+    learn the client's formatter. **The name inside these two sentences is localized into the UI
+    language** (`langDisplayIn $.Lang <tag>` → `.Localized`, `golang.org/x/text/language/display`
+    — "немецкий" for German on a Russian UI, falling back to the English name when the UI locale
+    has no CLDR entry or the tag itself is unlisted), added 2026-09-16 (item 9 of the track-picker
+    work) so a Russian viewer reads "Перевести на немецкий", not "Перевести на Russian". Chips
+    keep the plain `langDisplay` → `.Name`, the same **English** name every other chip shows
+    (Discover-style, deliberately not localized) — only the two sentences changed.
+- **The active chip is a check icon plus a cyan fill** (`track-chip-active`), never an underline —
+  underline vanished on touch hover and did not read under colour blindness. Exactly one chip is
+  active per group, and a locked chip can never take the mark.
+- **No "Now:" summary**: the active chip (check + fill) is the only indicator of what is playing;
+  the heading-line summary from the first mockup was dropped as noise (2026-09-15). `#audio-now` /
+  `#subtitle-now` no longer exist; `syncNow` no-ops when they are absent.
+- **Uploads are inline, and split across the radiogroup boundary** (a11y, 2026-09-16). The MY
+  chips are radios and sit in `#subtitle-tracks` with every other track, grouped by language. The
+  dashed `+ My Subtitles` disclosure (`action.stream.mySubtitles`, the same key the old tab used)
+  and `#my-uploads-panel` are not radios and sit in `#my-subtitles`, a sibling block **after** the
+  row: the panel holds a heading, a close control, the upload form and one delete form per file,
+  and a `role="radiogroup"` contains radios and nothing else.
+  Each delete form still posts to the unchanged `POST /user-subtitle/delete/:id` with
+  `data-async-target="#my-subtitles"` — one swap target, as before.
+  Deletion is deliberately not on the chip — a chip is a radio button, and an accidental tap must
+  not destroy a file. After the swap `Player.jsx` re-runs `refresh`, so the chip row, the language
+  counts and the expanded language all follow; the panel re-opens from `data-upload-open` on
+  `#my-subtitles` (the wrapper survives the swap, the toggle and panel inside it do not).
+  - **Who renders the chips depends on which render it is** (`UserSubtitleView.RenderChips`). On a
+    page load the dialog's own `$subs` loop renders every upload into the row — they are
+    `UserSubtitle` items of the same `GetSubtitles` result — and the partial emits none, so a page
+    whose JS never ran is already correct. On the async reload nothing re-runs that loop (the
+    partial *is* the response), so it renders them into `#my-upload-chips` and
+    `adoptUploadChips` (`track-picker.js`) moves them into the radiogroup.
+  - **The marker is what makes a delete work.** `adoptUploadChips` replaces *every* MY chip in the
+    row with what came back, so an upload's chip is the fresh element (de-dup by `data-id` falls
+    out of that) and a deleted one leaves the row instead of being orphaned in markup nothing
+    re-renders. That is only safe because `#my-upload-chips` says "this response is the complete
+    current list": an empty wrapper is a delete, an absent wrapper is an ordinary page. The
+    wrapper is removed once drained, so the next `refresh` does not read a consumed answer as
+    "this viewer has no uploads".
+  - **"I do not know" must not render as "there are none."** `buildView` takes `listOK` and sets
+    `RenderChips` from it, so a failed `List` — which returns a nil slice — renders the panel and
+    the error and **no marker**. Without that gate a transient DB blip during an upload would emit
+    an empty authoritative list: every MY chip out of the row, the playing upload's `<track>`
+    dropped by `dropDeletedTracks`, playback on Off, from an error the UI only shows as a toast.
+  - **The adopted block keeps the place the server gave it.** `adoptUploadChips` re-inserts at the
+    position of the outgoing MY block (the first element after it, captured before anything is
+    removed), not at the tail. Uploads are rank 0 and the dialog renders them ahead of the AI
+    item; appending moved them past it on every upload and delete, and the next page load moved
+    them back. On a viewer's very first upload there is no block to restore and the chip goes to
+    the end, which the next render puts right.
+  The panel closes from the chip again **or** from the "×" in its heading line
+  (`#my-uploads-close`, owner 2026-09-15): the way back should not depend on remembering which
+  chip opened it. Both controls go through `setUploadPanel`, so the state left behind is the same
+  one either way.
+- **Deleting the upload that is playing lands on Off.** The swap replaces `#my-subtitles`, so the
+  chip goes, but the `<track>` lives in `<video>` and would keep the deleted file's subtitles on
+  screen with nothing marked. `dropDeletedTracks` (`subtitle-track-reload.js`)
+  removes every `<track>` no chip claims any more — the test is the id against **all** chips in
+  the dialog, since the preloaded OpenSubtitles and sidecar tracks are `<track>` elements too —
+  and reports whether one of them was showing; when it was, the player activates `none` with
+  `persist: false`. The viewer chose a deletion, not a track, so nothing is PUT.
+- **Every player dialog closes on a click outside its box** (owner, 2026-09-15). `#subtitles` and
+  `#embed` each end with DaisyUI's backdrop — `<form method="dialog" class="modal-backdrop">` with
+  a submit button, as the dialog's **last** child. The form stretches across the same grid cell as
+  `.modal-box` at `z-index: -1`, so markup order is what keeps the box's own controls on top, and
+  `method="dialog"` is what closes the dialog (a `type="button"` there would submit nothing and the
+  click would do nothing). The dialog is modal, so the click never reaches the player underneath.
+  The button's label is literal and untranslated, like every other modal here: it is visually
+  hidden but focusable, and a translated one makes a screen reader announce "Close" twice.
+- **Flags fall back.** `supportsFlagEmoji()` (`lib/discover/lang.js`) hides every `.chip-flag`
+  where the platform draws bare letter pairs (Windows outside Firefox); the language names stay.
+- **Language-row order** (owner, 2026-09-15): the viewer's **preferred** language first — including
+  a group whose only track is the AI translation — then the language of the track playing, then the
+  language of the track the switch would turn on (`Suggested`, which exists only while subtitles
+  are off, so it never competes with the playing one), then by track count, then the order
+  `GetSubtitles` produced. Expanded and first are always the same chip: `Overflow` is assigned by
+  index, so a language expanded from further down the row would be pressed and collapsed at once. The row opens on that first chip
+  (`LangRow.Expanded`), so a page opens in the viewer's own language whatever is playing; the
+  playing track keeps the cyan dot on its chip wherever it sorts, and may sit hidden under the
+  filter, which is accepted. A preferred language with no tracks at all changes nothing — the
+  playing language leads again, as before.
+  `SubtitleLangGroups` (Go) and `groupByLang` (JS) must stay identical — the client recomputes the
+  row after an upload changes the counts — and the same fixture is in both test suites. On the
+  client the viewer's own browsing choice still comes first: `expandedLangFor` keeps the pressed
+  language whenever it still has tracks, and falls back to this order otherwise (on a first open
+  the pressed chip *is* the server's `Expanded`). The suggested-language rule needs no clause of
+  its own there: `readChips` already reads the muted choice — `data-last-subtitle` this session,
+  else the `data-suggested` chip — as the active one, so it sorts into the same slot. The client
+  never reorders the row itself; `syncLangRow` updates the chips in place and the order stays the
+  server's. There is deliberately **no** alphabetical
+  tie-break: it would reshuffle every equal-count group on the first refresh after an upload.
+- **Without JS** (picker JS failed, player loaded): every chip renders, the expanded language's
+  tracks are visible, the active track carries its check and fill from SSR and the counts are
+  right, and the muted state is drawn (the server renders `data-subtitles-off`, the toggle's
+  `checked` and `.picker-off`). Missing are the filter (the language row is inert), the dot, the
+  switch itself (a checkbox nothing listens to) and the `aria-disabled` markers, which
+  `applyOffState` adds on the first `refresh`.
+  Switching tracks needed JS before the redesign too — the handlers were always client-side.
+
+**A11y wart — resolved (2026-09-16, ruling R8).** `#my-uploads-toggle` and `#my-uploads-panel`
+used to render *inside* `#subtitle-tracks[role="radiogroup"]`, because the uploads partial is a
+single async swap target that had to emit both the MY chips and the panel, and its `#my-subtitles`
+wrapper (`display:contents`) sat inside the row — so the radiogroup contained a disclosure button
+and, when open, two forms. `#my-subtitles` is now a sibling **after** the row and keeps the panel;
+the chips stay in the radiogroup, rendered by the dialog's own loop on a page load and moved in by
+`adoptUploadChips` after a swap (see "Uploads are inline" above).
+
+What it cost, since the estimate was wrong: not markup plus a re-scope of `readChips`, but a
+render-mode field (`UserSubtitleView.RenderChips`) so one upload is not rendered twice, a marker
+element (`#my-upload-chips`) so a delete is distinguishable from a page load, and a re-scope of
+`syncUploadMarks` (`Player.jsx`) from "inside `#my-subtitles`" to
+`data-provider="UserSubtitle"`. `readChips` itself needed no change — it was already scoped to
+`#subtitle-tracks`, which is where the chips ended up. The two multi-target alternatives were
+rejected: `loadAsyncView` swaps exactly one element, and the `data-async-update-*` slot mechanism
+that could carry a second fragment is a **layout** facility whose key→action map lives in
+`app/layout.js` — adding a picker-specific slot there would put a player detail in the global
+navigation updater.
+
+Server side: `handlers/action/picker.go` (`SubtitleLangGroups`, `OriginCode`, `OriginCodeForBadge`,
+`OriginKey`, `PropertyTags`, `AudioSuffix`) and `services/stremio/lang_display.go`
+(`langDisplay`/`Name` for chips, `langDisplayIn`/`Localized` for the two sentences). Client side:
+`assets/src/js/lib/player/track-picker.js`, wired in `Player.jsx`.
+
+## Known limitations
+
+- **Job cache key and the preferred language.** The 10-minute streaming-job cache key
+  (`jobs/scripts/action.go`, `Action`) includes the tier (`Role`), the audio/subtitle choice, the
+  UI language, the viewer's upload hashes and — since 2026-09-16 — the resolved preferred content
+  language (`streamprefs.PreferredContentLang`), so a profile change is visible on the next stream
+  start rather than after the bucket rolls over. It costs one settings read per stream start for
+  signed-in viewers.
+- **Embedded-track translations follow the viewer's transcode.** Since the 2026-09-16 source
+  ruling this is the *last* resort — it is reached only when the file has no upload, no sidecar
+  and no OpenSubtitles track to translate — but where it is reached the source is the live
+  subtitle playlist of the current transcoder session, so the translation runs at transcode
+  speed and stops when the viewer leaves (`--live-idle` on the service) or seeks far (a new run
+  with a non-zero offset). A seeked session never produces a cached final artifact; the partial
+  progress is kept 24 h and reused by cue identity. Native MP4 without a transcoder session
+  still has no embedded source.
+- **After a seek, translated cues can sit up to one GOP off.** Measured on the stand
+  (2026-09-16): the same line lands 1.66 s apart in two runs of one file (seek 600 vs 570) —
+  the transcoder starts each run at the keyframe before the quantized offset, and the player's
+  own timeline carries the same per-run shift, so embedded tracks stay in sync while every
+  side-loaded track (OpenSubtitles, uploads, AI) is off by that shift. The service dedups cues
+  by text within a 3 s window so a seek does not duplicate lines; the timing it keeps is the
+  first run's. A transcoder-side fix (report the real run start) would remove it for all tracks.
+- **Each reload refetches the whole partial VTT.** The `rev` reload swaps the `<track>` `src` and
+  lets the browser reparse from scratch — no incremental cue-append; the file is just short early
+  on and grows with each revision. The 15 s throttle bounds the cost (and the blank-cue window) but
+  does not remove it: the subtitle text catches up in steps while the percentage moves smoothly.
+- **A translation is reported once per item per page load.** `translationAction(track, status)`
+  (`subtitle-rules.js`) reads a per-item status map (`'running'`/`'done'`/`'stopped'`) and answers `'start'`,
+  `'resume'` or `'none'`. `'start'` emits `subtitle-translate-start`; `'resume'` polls again
+  **silently** after the viewer selected another track mid-run and came back (same translation, so
+  no second start event — `done` still fires once, with the wall time since the *first* start);
+  `'none'` covers a finished item, a locked one and anything that is not an AI track, so a warm
+  cache cannot fire a second start/done pair when the same item is activated again (the
+  mount-time restore of a saved translation, say). Re-selecting the
+  item whose poll is running right now is also a no-op (`pollingIdRef` in `Player.jsx`) rather than
+  a self-inflicted stop.
+- **After an error, the item stays `'running'`.** Re-selecting it resumes (a silent retry) rather
+  than reporting a fresh start; each attempt can still emit its own `subtitle-translate-error`.
+  The one exception is `'stopped'`: the service ended that run for good, so `fail` marks the item
+  `'stopped'` and `translationAction` answers `'none'` — re-selecting the chip neither polls nor
+  reports, which is what its own "reload to retry" title already promised. A reload is a fresh
+  status map, and that is the retry.
+- **Polling gives up after 15 minutes without a sign of life** (`POLL_TIMEOUT_MS`,
+  `subtitle-progress.js`) with `subtitle-translate-error {code:'timeout'}`. What the 15 minutes are
+  measured from depends on the source: for a batch source the cap is **absolute** (the deadline is
+  set once, at the start of the run — its end is minutes away, not film-length), while for a live
+  source (`X-Subtitle-Live`) it is an **inactivity** cap — the deadline moves forward on every tick
+  that reports a *new* translated cue. A live run therefore lasts as long as it keeps producing,
+  i.e. the length of the transcode, but a wedged live job that keeps answering the same count still
+  times out after 15 minutes: answering is not progress. Time the poll spends suspended (paused or
+  hidden, see *Client behaviour*) is not counted at all.
+- **A `rev` can go backwards into a browser cache after a seek.** A session seek starts a new run
+  at a non-zero offset, so `done` drops; `withRev(src, done)` then reuses a `rev` the browser
+  already has, and the `<track>` GET carries no `no-store`, so the viewer can get the previous
+  run's shorter VTT back.
+- **A finished translation reads as the verb again when it is deselected.** The `.ai-action` span
+  is rendered `{{ if .Offered }}` and stays in the DOM after the offer is spent, so
+  `setChipActive(el, false)` (`track-picker.js`) re-shows "Translate to <language>" for a track
+  that is already translated and cached. Harmless; the guard's comment claims to cover this case
+  and only covers the locked one.
+- **`markPreload` follows the browser's languages, not the preferred one.** It reads
+  `ud.AcceptLangTags[0]`, not `opts.PreferredLang`, so a signed-in viewer whose
+  `stremio_settings.preferred_language` differs from their browser gets no preloaded `<track>` in
+  the language the ladder just ran on — and the native iOS menu then offers the wrong two.
+- **A live run is suspended, not finished, when the film ends.** The media spec fires `pause`
+  before `ended`, so a viewer who watches to the end of a file whose translation is still behind
+  the transcode leaves the poll asleep on the last count: the chip keeps its spinner, no
+  `subtitle-translate-done` and no `-error` is emitted, and the remaining cues are never fetched.
+  Consistent with "suspending is not stopping", but it means the `-done` rate for
+  `source=embedded` is lower than the funnel would otherwise suggest — and the cached final
+  artifact for a contiguous run from 0 may be lost exactly for the viewers who watched the whole
+  film. Watch it before reading the funnel as a regression.
+
+## Testing
+
+- Go: `make test` (not bare `go test ./...` — the proto registration conflict between the
+  abuse-store and torrent-store protobufs panics test binaries without
+  `-ldflags -X google.golang.org/protobuf/reflect/protoregistry.conflictPolicy=ignore`, which the
+  Makefile target sets). Relevant packages: `handlers/action` (ladder, `badgeFor`, `applyLadder`
+  negative controls; the English track beside an offer in `english_fallback_test.go`, including
+  the Go check that `FALLBACK_LANG` in `subtitle-rules.js` matches the server), `models`
+  (`SubtitleOpts`), `services/streamprefs`, `services/api` (`translate_url_test.go`),
+  `jobs/scripts` (`translate_opts_test.go`).
+- **Test user data without a fallback language.** A `VideoStreamUserData` literal carries a zero
+  `FallbackLangTag`, which both fallbacks read as "no language" — phase 1's matcher and
+  `offeredDefault` alike — so such a test never sees the English track beside an offer. Production
+  always builds it with `NewVideoStreamUserData` (English). Tests about the offer's default set
+  `FallbackLangTag: language.English` or use the constructor; the picker fixture
+  (`subtitles_dialog_fixture_test.go`) keeps the zero tag on purpose, for its off state.
+- Render guard: `services/template/stream_video_render_test.go` renders
+  `templates/views/action/stream_video.html` with a minimal `StreamContent` so an arity mismatch or
+  nil-field panic in `getSubtitles`/`getAudioTracks` template bindings goes red under `make test`
+  instead of only surfacing at runtime (the template funcs are bound by reflection; arity is
+  checked at `tm.Init()`, not compile time). `services/template/user_subtitles_partial_render_test.go`
+  covers the upload partial, including the `RenderChips` split (initial render: panel only; async
+  reload: chips wrapped in `#my-upload-chips`).
+  `TestStreamVideoRendersUploadChipsInsideTheTrackRow` renders the real partial inside the dialog
+  and balances `<div>` tags to prove the chip is *inside* the radiogroup and the disclosure, the
+  panel and every form are *outside* it — a substring order check cannot tell nesting from
+  adjacency, which is how the wart survived the first review.
+- JS: `npm test` (`node --test`). **`Player.jsx` is covered now** —
+  `assets/src/js/test/register.mjs` (passed as `--import` by the `test` script) installs the
+  module hooks in `assets/src/js/test/jsx-hooks.mjs`, which transpile `.jsx` with `@babel/core`
+  through the repo's own `babel.config.json`, resolve the extensionless relative imports webpack
+  resolves, and answer the `.css` and `locales/*.json?prefix=` imports with empty modules.
+  `jsdom` (pinned devDependency) supplies the DOM.
+  `Player.wiring.test.js` drives the wiring against
+  `assets/src/js/lib/player/__fixtures__/subtitles-dialog.html` — the dialog as
+  `services/template/subtitles_dialog_fixture_test.go` renders it, committed so `npm test` needs
+  no Go toolchain — along with `user-subtitles-async.html` and `user-subtitles-async-empty.html`,
+  the uploads partial rendered with `RenderChips: true` for the upload and the delete case, which
+  is what `asyncSwap()` replays. **Regenerate all three** whenever the picker markup changes:
+
+  ```
+  UPDATE_FIXTURES=1 go test \
+    -ldflags '-X google.golang.org/protobuf/reflect/protoregistry.conflictPolicy=ignore' \
+    ./services/template/ -run TestSubtitlesDialogFixture
+  ```
+
+  The `-ldflags` are not optional: without them the test binary panics at init on the
+  abuse-store/torrent-store proto conflict, exactly as `go test ./...` does. That Go test fails
+  with this command in the message when the fixtures drift, so a wiring test cannot go on passing
+  against markup the server stopped producing.
+  Covered: a chip click (mark, `<track>` creation, PUT body, telemetry), a click landing on an
+  inner span, the switch off/on/off with one PUT each, a chip click while off, the language filter,
+  the "+N" toggle, the uploads swap (adoption, autoselect, de-dup, panel state), a delete of the
+  playing upload landing on Off without a PUT, `syncUploadMarks` including the stale-`default`
+  guard, the PUT retry, the offered-AI chip's verb/label flip, the locked chip's CTA, and — through
+  a real `initPlayer` mount — a click starting a translation run, a saved translation restoring
+  once without persisting, and nothing starting a run on its own.
+  The subtitle invariant has its own four: a side-loaded choice disabling hls.js's tracks rather
+  than hiding them, `initDefaultTracks` finishing the selection an activation made before the HLS
+  instance existed, an hls.js track that latches on mid-playback being put back (with a second pass
+  proving the re-assertion terminates), and a seek re-applying the chip rather than its start-of-seek
+  snapshot. The harness models the two renderers: `mount({hlsTracks})` adds `<track>`s **without an
+  id** for the manifest tracks (no id is exactly what marks a track as hls.js's), and `installHls`
+  puts a fake with recorded `subtitleTrack`/`subtitleDisplay` writes and an event bus on
+  `window.hlsPlayer`. That fake models the two *synchronous* reactions the fix is defined against —
+  a `subtitleTrack` write runs a `toggleTrackModes` pass and fires `SUBTITLE_TRACK_SWITCH` at once,
+  and a `subtitleDisplay` write toggles modes only while a track is selected. They are the contract,
+  not an implementation: leaving them out is what let a stack-exhausting recursion through the first
+  round of these tests, and putting them in is what makes the bounded-write assertions
+  (`≤ 2` `subtitleTrack` writes per selection) mean something. hls.js's *asynchronous* half
+  (`onTextTracksChanged`) is still driven by hand in the tests that want the latch.
+  Still by hand: fullscreen, and anything about actual playback.
+  The catching-up banner adds four through the same mount: a run at the playhead showing the pill
+  (with no cue count on it) and a run that gets ahead taking it away, a service that sends no
+  `X-Subtitle-Pending-From` showing nothing at all, **Wait** pausing the film while the HEADs keep
+  coming and a later caught-up answer resuming it with both events emitted, and × surviving a
+  trailing tick but not a caught-up-then-trailing pair. The harness stubs `play`/`pause` (jsdom
+  implements neither) and **queues their events** the way HTML does rather than dispatching inside
+  the call — synchronous dispatch would land the `pause` before `handleWait`'s `resume()` and undo
+  it, which hides the very guard the test is for (negative control: with the `waitingRef` check
+  removed from `sleep()`, "the poll must stay awake while waiting" fails at 1 HEAD).
+  The plain-JS modules keep their own suites: `subtitle-rules.test.js`
+  (`pickDefaultSubtitle`, `baseLang`, `translationAction`, `hasSavedDefault`),
+  `subtitle-progress.test.js` (`parseProgress`, `withRev`, `pollProgress`, `onTick`),
+  `subtitle-catchup.test.js` (`trailing`, `caughtUp` — the margins, the hysteresis
+  band in both directions, and a NaN playhead never pausing the film),
+  `subtitle-telemetry.test.js` (`readAllTracks`, `readTracks`, `selectEventData`,
+  `resolveSubtitleLevel`), `subtitle-track-reload.test.js` (`reloadSubtitleTrack`: listener
+  lifetime, latest-snapshot restore, the did-it-reload return value), and `track-picker.test.js`
+  (`adoptUploadChips`: no marker means no move, an upload replaces the chip of its id, a delete —
+  including of the last file — takes the chip out of the row), and `subtitle-apply.test.js`
+  (`applySubtitleSelection`/`selectionHolds`: every selection shape, the write order, the no-hls
+  guard, and that applying twice is a fixed point) — no DOM needed, a text track there is an id and
+  a mode.
