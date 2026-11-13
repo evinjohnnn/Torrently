@@ -1897,6 +1897,18 @@
     "aboutPage.osP2": "Creemos que la transparencia genera confianza. Puedes inspeccionar el código, reportar problemas, sugerir mejoras o contribuir directamente.",
     "aboutPage.ctaText": "¿Listo para probarlo?",
     "aboutPage.ctaButton": "Probar Torrently",
+    "toolsPage.title": "Todas las herramientas — reproduce, descarga y convierte torrents online",
+    "toolsPage.description": "Todas las herramientas de Torrently en un solo lugar: descarga torrents por HTTPS, reprodúcelos en el navegador, convierte enlaces magnet y archivos .torrent y míralos en Stremio. Sin instalar nada.",
+    "toolsPage.heading": "Todas las herramientas, en un solo lugar",
+    "toolsPage.lede": "Descarga, reproduce y convierte torrents directamente en tu navegador. Elige lo que necesitas hacer.",
+    "toolsPage.search": "Buscar una herramienta",
+    "toolsPage.empty": "Ninguna herramienta coincide con «{{.Query}}». Prueba con una palabra más corta.",
+    "toolsPage.count": {
+        "one": "{{.Count}} herramienta",
+        "other": "{{.Count}} herramientas"
+    },
+    "toolsPage.resultCount": "Mostrando {{.Count}} de {{.Total}}",
+    "toolsPage.clear": "Borrar búsqueda",
     "time.now": "justo ahora",
     "time.seconds": "hace %v segundos",
     "time.minute": "hace 1 minuto",

@@ -40,6 +40,7 @@ GET /lib/            handler builds its Data as always ──► tb.Build("libra
 | Area | Views (templates/views/…) | Builder (handlers/spa) | Page (frontend/src/pages) |
 |---|---|---|---|
 | Home and the 22 tool landings | `index` | `home.go` | `home/` |
+| Every tool, by group | `tools/index` | `tools.go` | `tools/` |
 | Torrent page; file actions | `resource/get`; fragment `action/post` | `resource.go`, `action.go` | `torrent/` |
 | Sign-in | `auth/{login,password,verify,callback,logout,refresh}` | `auth.go` | `auth/` |
 | Discover | `discover/index` | `discover.go` | `discover/` |
@@ -131,6 +132,12 @@ Torrently: paper, ink and olive, seen through reeded glass. Keep to it:
   `.check`, `.progress`, `.spinner`, `Dialog`.
 - Lists are rows with hairlines, not grids of identical cards. Numbers only
   for real sequences.
+- Editorial sections use `.split`: the heading on the left (360px), the body
+  on the right. The FAQ uses it, and so does every tool-page block (`ToolBlock`
+  in `pages/home/Sections.tsx`): prose, checklist and compare open under a
+  hairline, the subtitle or first paragraph set as the lead. A compare's two
+  columns share their rows (subgrid), so line n of one faces line n of the
+  other.
 - Motion only in answer to an action; respect `prefers-reduced-motion`.
 - 44px touch targets, visible focus, 4.5:1 text contrast, works at 360px.
 

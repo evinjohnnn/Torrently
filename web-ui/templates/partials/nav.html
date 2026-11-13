@@ -112,6 +112,12 @@
             <span class="hidden lg:inline">{{ t $.Lang "nav.vault" }}</span>
         </a>
         {{ end }}
+        {{ end }}
+        <a class="hidden lg:inline-flex btn btn-ghost btn-sm px-3 border border-w-line text-w-sub hover:border-w-cyan hover:text-base-content whitespace-nowrap" href="{{ langPath $.Lang "/tools" }}" data-async-target="main" aria-label="{{ t $.Lang "footer.tools" }}">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="size-5"><path stroke-linecap="round" stroke-linejoin="round" d="M21.75 6.75a4.5 4.5 0 0 1-4.884 4.484c-1.076-.091-2.264.071-2.95.904l-7.152 8.684a2.548 2.548 0 1 1-3.586-3.586l8.684-7.152c.833-.686.995-1.874.904-2.95a4.5 4.5 0 0 1 6.336-4.486l-3.276 3.276a3.004 3.004 0 0 0 2.25 2.25l3.276-3.276c.256.565.398 1.192.398 1.852Z"/></svg>
+            <span class="hidden lg:inline">{{ t $.Lang "footer.tools" }}</span>
+        </a>
+        {{ if .User | hasAuth }}
         <a class="hidden lg:inline-flex btn btn-ghost btn-sm btn-square w-9 border border-w-line text-w-sub hover:border-w-pink hover:text-base-content whitespace-nowrap relative" href="{{ langPath $.Lang "/notifications" }}" data-async-target="main" aria-label="{{ t $.Lang "nav.notifications" }}">
             <svg xmlns="http://www.w3.org/2000/svg" class="size-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M14.857 17.082a23.848 23.848 0 0 0 5.454-1.31A8.967 8.967 0 0 1 18 9.75V9A6 6 0 0 0 6 9v.75a8.967 8.967 0 0 1-2.312 6.022c1.733.64 3.56 1.085 5.455 1.31m5.714 0a24.255 24.255 0 0 1-5.714 0m5.714 0a3 3 0 1 1-5.714 0"/>
@@ -182,6 +188,9 @@
                         <svg class="size-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
                         {{ t $.Lang "nav.vault" }}</a></li>
                     {{ end }}
+                    <li><a href="{{ langPath $.Lang "/tools" }}" data-async-target="main" class="text-w-sub hover:text-base-content gap-3">
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="size-5"><path stroke-linecap="round" stroke-linejoin="round" d="M21.75 6.75a4.5 4.5 0 0 1-4.884 4.484c-1.076-.091-2.264.071-2.95.904l-7.152 8.684a2.548 2.548 0 1 1-3.586-3.586l8.684-7.152c.833-.686.995-1.874.904-2.95a4.5 4.5 0 0 1 6.336-4.486l-3.276 3.276a3.004 3.004 0 0 0 2.25 2.25l3.276-3.276c.256.565.398 1.192.398 1.852Z"/></svg>
+                        {{ t $.Lang "footer.tools" }}</a></li>
                     <li><a href="{{ langPath $.Lang "/notifications" }}" data-async-target="main" class="text-w-sub hover:text-base-content gap-3">
                         <svg xmlns="http://www.w3.org/2000/svg" class="size-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14.857 17.082a23.848 23.848 0 0 0 5.454-1.31A8.967 8.967 0 0 1 18 9.75V9A6 6 0 0 0 6 9v.75a8.967 8.967 0 0 1-2.312 6.022c1.733.64 3.56 1.085 5.455 1.31m5.714 0a24.255 24.255 0 0 1-5.714 0m5.714 0a3 3 0 1 1-5.714 0"/></svg>
                         {{ t $.Lang "nav.notifications" }}
@@ -196,6 +205,7 @@
                     <li><a href="{{ langPath $.Lang "/" }}#how" class="text-w-sub hover:text-base-content">{{ t $.Lang "nav.howItWorks" }}</a></li>
                     <li><a href="{{ langPath $.Lang "/" }}#features" class="text-w-sub hover:text-base-content">{{ t $.Lang "nav.features" }}</a></li>
                     <li><a href="{{ langPath $.Lang "/" }}#faq" class="text-w-sub hover:text-base-content">{{ t $.Lang "nav.faq" }}</a></li>
+                    <li><a href="{{ langPath $.Lang "/tools" }}" data-async-target="main" class="text-w-sub hover:text-base-content">{{ t $.Lang "footer.tools" }}</a></li>
                     <li><a href="{{ langPath $.Lang "/login" }}" data-async-target="main" class="text-w-sub hover:text-base-content">{{ t $.Lang "nav.login" }}</a></li>
                     {{ end }}
                 </ul>

@@ -1897,6 +1897,18 @@
     "aboutPage.osP2": "We geloven dat transparantie vertrouwen opbouwt. Je kunt de code inspecteren, problemen melden, functies voorstellen of direct bijdragen.",
     "aboutPage.ctaText": "Klaar om het te proberen?",
     "aboutPage.ctaButton": "Probeer Torrently",
+    "toolsPage.title": "Alle tools — torrents online streamen, downloaden en converteren",
+    "toolsPage.description": "Alle tools van Torrently op één plek: download torrents via HTTPS, stream ze in de browser, converteer magnetlinks en .torrent-bestanden en kijk via Stremio. Niets te installeren.",
+    "toolsPage.heading": "Alle tools op één plek",
+    "toolsPage.lede": "Download, stream en converteer torrents direct in je browser. Kies wat je wilt doen.",
+    "toolsPage.search": "Zoek een tool",
+    "toolsPage.empty": "Geen tool gevonden voor ‘{{.Query}}’. Probeer een korter woord.",
+    "toolsPage.count": {
+        "one": "{{.Count}} tool",
+        "other": "{{.Count}} tools"
+    },
+    "toolsPage.resultCount": "Toont {{.Count}} van {{.Total}}",
+    "toolsPage.clear": "Zoekopdracht wissen",
     "time.now": "zojuist",
     "time.seconds": "%v seconden geleden",
     "time.minute": "1 minuut geleden",

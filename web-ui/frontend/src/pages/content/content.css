@@ -20,6 +20,18 @@
   color: var(--ink-2);
 }
 
+/* a search-first landing: title, lede and whatever comes after centered
+   in the column, instead of running the full measure */
+.page-head.center .wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+.page-head.center .lede {
+  margin-inline: auto;
+}
+
 .page-sheet {
   flex: 1;
   padding: 64px 0 96px;

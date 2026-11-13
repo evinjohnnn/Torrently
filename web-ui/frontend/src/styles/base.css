@@ -232,6 +232,34 @@ main {
   font-size: 17px;
   line-height: 1.6;
 }
+/* the split: heading left, body right (the FAQ, tool page blocks) */
+.split {
+  display: grid;
+  grid-template-columns: 360px minmax(0, 1fr);
+  gap: 72px;
+  align-items: start;
+}
+.split-head {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.split-head h2 {
+  font-size: clamp(40px, 4.6vw, 56px);
+  letter-spacing: -0.045em;
+  line-height: 0.96;
+}
+.split-head p {
+  font-size: 17px;
+  color: var(--ink-2);
+}
+
+@media (max-width: 860px) {
+  .split {
+    grid-template-columns: 1fr;
+    gap: 32px;
+  }
+}
 .lede {
   font-size: 18px;
   line-height: 1.6;

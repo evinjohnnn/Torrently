@@ -11,16 +11,19 @@ export function PageHead({
   title,
   lede,
   wide,
+  center,
   children,
 }: {
   title: ReactNode;
   lede?: ReactNode;
   /** lines up with a wide sheet */
   wide?: boolean;
+  /** title, lede and children centered, for a search-first landing */
+  center?: boolean;
   children?: ReactNode;
 }) {
   return (
-    <header className="page-head">
+    <header className={center ? "page-head center" : "page-head"}>
       <div className={wide ? "wrap" : "wrap narrow"}>
         <h1>{title}</h1>
         {lede && <p className="lede">{lede}</p>}
@@ -31,9 +34,9 @@ export function PageHead({
 }
 
 /** Paper over the glass for everything past the head. */
-export function Sheet({ children, wide }: { children: ReactNode; wide?: boolean }) {
+export function Sheet({ children, wide, className }: { children: ReactNode; wide?: boolean; className?: string }) {
   return (
-    <div className="page-sheet">
+    <div className={className ? `page-sheet ${className}` : "page-sheet"}>
       <div className={wide ? "wrap" : "wrap narrow"}>{children}</div>
     </div>
   );

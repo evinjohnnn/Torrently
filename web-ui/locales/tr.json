@@ -1897,6 +1897,18 @@
     "aboutPage.osP2": "Şeffaflığın güven inşa ettiğine inanıyoruz. Kodu inceleyebilir, sorunları bildirebilir, özellikler önerebilir veya doğrudan katkıda bulunabilirsin.",
     "aboutPage.ctaText": "Denemeye hazır mısın?",
     "aboutPage.ctaButton": "Torrently'yi dene",
+    "toolsPage.title": "Tüm araçlar — torrentleri çevrimiçi izleyin, indirin ve dönüştürün",
+    "toolsPage.description": "Torrently'nin tüm araçları tek bir yerde: torrentleri HTTPS üzerinden indirin, tarayıcıda izleyin, magnet bağlantılarını ve .torrent dosyalarını dönüştürün, Stremio'da izleyin. Kurulacak bir şey yok.",
+    "toolsPage.heading": "Tüm araçlar tek bir yerde",
+    "toolsPage.lede": "Torrentleri doğrudan tarayıcınızda indirin, izleyin ve dönüştürün. Ne yapmak istediğinizi seçin.",
+    "toolsPage.search": "Bir araç bul",
+    "toolsPage.empty": "“{{.Query}}” ile eşleşen bir araç yok. Daha kısa bir kelime deneyin.",
+    "toolsPage.count": {
+        "one": "{{.Count}} araç",
+        "other": "{{.Count}} araç"
+    },
+    "toolsPage.resultCount": "{{.Total}} içinden {{.Count}} gösteriliyor",
+    "toolsPage.clear": "Aramayı temizle",
     "time.now": "az önce",
     "time.seconds": "%v saniye önce",
     "time.minute": "1 dakika önce",

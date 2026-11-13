@@ -616,28 +616,8 @@ a.bento-card:hover {
   }
 }
 
-/* faq: heading left, ruled questions right; answers unfold on hover, on
-   keyboard focus, or pinned open by a click (touch) */
-.faq-split {
-  display: grid;
-  grid-template-columns: 360px minmax(0, 1fr);
-  gap: 72px;
-  align-items: start;
-}
-.faq-head {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-.faq-head h2 {
-  font-size: clamp(40px, 4.6vw, 56px);
-  letter-spacing: -0.045em;
-  line-height: 0.96;
-}
-.faq-head p {
-  font-size: 17px;
-  color: var(--ink-2);
-}
+/* faq: ruled questions on the right; answers unfold on hover, on keyboard
+   focus, or pinned open by a click (touch) */
 .faq {
   border-bottom: 1px solid var(--hairline);
 }
@@ -724,10 +704,6 @@ a.bento-card:hover {
   }
 }
 @media (max-width: 860px) {
-  .faq-split {
-    grid-template-columns: 1fr;
-    gap: 32px;
-  }
   .faq-answer {
     padding-left: 0;
   }
@@ -756,11 +732,31 @@ a.bento-card:hover {
   color: var(--ink-2);
 }
 
-/* tool pages */
-.prose h2 {
-  font-size: var(--step-4);
-  letter-spacing: -0.04em;
-  margin-bottom: 20px;
+/* a tool page's steps title is a whole sentence: set at the split's size, wider */
+#how.tool-steps .section-head h2 {
+  max-width: 14ch;
+  font-size: clamp(36px, 4.6vw, 56px);
+}
+
+/* tool pages: every block is a split, its body opening under a hairline */
+.tool-block .split-head h2 {
+  font-size: clamp(30px, 3.2vw, 40px);
+  letter-spacing: -0.035em;
+  line-height: 1.04;
+}
+.split-body {
+  max-width: 720px;
+  padding-top: 22px;
+  border-top: 1px solid var(--hairline);
+}
+/* the subtitle, or a prose block's first paragraph, reads as the lead */
+.split-lead,
+.prose p:first-child {
+  margin-bottom: 24px;
+  font-size: 20px;
+  line-height: 1.5;
+  letter-spacing: -0.01em;
+  color: var(--ink);
 }
 .prose p {
   font-size: 17px;
@@ -804,72 +800,51 @@ a.bento-card:hover {
   margin-top: 24px;
   max-width: 760px;
 }
+/* compare: two columns split by a hairline, like the steps; they share
+   their rows (--rows, set by the page), so line n faces line n */
 .compare {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 16px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 .compare-col {
-  padding: 24px;
-  border-radius: var(--r-lg);
-  border: 1px solid var(--hairline);
+  display: grid;
+  grid-row: span var(--rows);
+  grid-template-rows: subgrid;
+  padding-right: 32px;
+}
+.compare-col + .compare-col {
+  padding: 0 0 0 32px;
+  border-left: 1px solid var(--hairline);
 }
 .compare-col h3 {
-  font-size: var(--step-1);
-  margin-bottom: 12px;
-}
-.compare-col.ours h3 {
-  color: var(--olive-ink);
+  padding-bottom: 14px;
+  border-bottom: 2px solid var(--ink);
+  font-size: 24px;
+  letter-spacing: -0.02em;
 }
 .compare-col ul {
-  margin: 0;
-  padding-left: 18px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  color: var(--ink-2);
+  display: contents;
 }
-@media (max-width: 760px) {
-  .compare {
-    grid-template-columns: 1fr;
-  }
-}
-.related {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 0 24px;
-  margin: 0;
-  padding: 0;
+.compare-col li {
   list-style: none;
-}
-.related a {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  height: 100%;
-  padding: 16px 0;
+  padding: 14px 0;
   border-bottom: 1px solid var(--hairline);
-  color: var(--ink);
-  text-decoration: none;
-}
-.related a:hover strong {
-  color: var(--olive-ink);
-}
-.related span {
-  font-size: 14px;
   color: var(--ink-2);
 }
-@media (max-width: 960px) {
-  .related {
-    grid-template-columns: repeat(2, 1fr);
+@media (max-width: 560px) {
+  .compare-col {
+    padding-right: 16px;
+  }
+  .compare-col + .compare-col {
+    padding-left: 16px;
+  }
+  .compare-col h3 {
+    font-size: 20px;
+  }
+  .compare-col li {
+    font-size: 15px;
   }
 }
-@media (max-width: 600px) {
-  .related {
-    grid-template-columns: 1fr;
-  }
-}
-
 @media (max-width: 640px) {
   .hero {
     padding-top: 16px;

@@ -73,5 +73,4 @@ export interface HomeData {
   onboarding?: { done: number; total: number; steps: OnboardingStep[] };
   ai?: { provider: string; freeQuota: number; paidQuota: number };
   faq: FAQItem[];
-  related?: { url: string; benefit: string; description: string }[];
 }

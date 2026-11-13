@@ -7,7 +7,6 @@ import {
   Features,
   FinalCall,
   HowItWorks,
-  RelatedTools,
   ToolSections,
 } from "./Sections";
 import { ContinueWatching, Onboarding } from "./Signed";
@@ -65,7 +64,6 @@ export default function Home() {
         <ContinueWatching />
         {data.tool ? <ToolSections /> : <HowItWorks />}
         <Features />
-        <RelatedTools />
         <Faq />
         <FinalCall />
       </div>

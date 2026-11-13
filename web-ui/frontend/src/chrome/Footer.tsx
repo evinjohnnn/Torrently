@@ -31,7 +31,7 @@ function In({ href, children }: { href: string; children: ReactNode }) {
 }
 
 /** Tool columns in reading order, three to a row (common.ToolGroups + guides). */
-const GROUPS = ["download", "stream", "alternatives", "convert", "stremio", "guides"];
+export const GROUPS = ["download", "stream", "alternatives", "convert", "stremio", "guides"];
 
 /**
  * Brand, resources and legal on the left; every tool page on the right,
@@ -57,6 +57,7 @@ export function Footer() {
               <div className="footer-pair">
                 <Column title={t("footer.resources")}>
                   <In href={path("/about")}>{t("footer.about")}</In>
+                  <In href={path("/tools")}>{t("footer.tools")}</In>
                   <In href={path("/speedtest")}>{t("footer.speedTest")}</In>
                   <Out href={session.apiDocs}>API</Out>
                   {session.support && (

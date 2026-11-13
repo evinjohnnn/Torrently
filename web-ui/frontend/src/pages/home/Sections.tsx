@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type CSSProperties, type ReactNode } from "react";
 import { Link, usePage } from "../../app/router";
 import { useI18n } from "../../i18n";
 import { Icon } from "../../ui/Icon";
@@ -160,8 +160,8 @@ export function Faq() {
   };
   return (
     <section id="faq" className="section">
-      <div className="wrap faq-split">
-        <header className="faq-head">
+      <div className="wrap split">
+        <header className="split-head">
           <h2>{i18n.t("about.faq.title")}</h2>
           <p>{i18n.t("about.faq.subtitle")}</p>
         </header>
@@ -243,7 +243,7 @@ function ToolSection({ section }: { section: Section }) {
   switch (section.kind) {
     case "steps":
       return (
-        <section id="how" className="section">
+        <section id="how" className="section tool-steps">
           <div className="wrap">
             <SectionHead title={section.title} subtitle={section.subtitle} rich />
             <Steps steps={section.steps ?? []} rich />
@@ -253,9 +253,8 @@ function ToolSection({ section }: { section: Section }) {
       );
     case "prose":
       return (
-        <section className="section">
-          <div className="wrap narrow prose">
-            <h2>{i18n.t(section.title)}</h2>
+        <ToolBlock title={section.title}>
+          <div className="prose">
             {section.paras?.map((key) => <p key={key}>{i18n.rich(key)}</p>)}
             {section.link && (
               <p>
@@ -264,86 +263,81 @@ function ToolSection({ section }: { section: Section }) {
             )}
             {section.footer && <p>{i18n.rich(section.footer)}</p>}
           </div>
-        </section>
+        </ToolBlock>
       );
     case "checklist":
       return (
-        <section className="section">
-          <div className="wrap">
-            <SectionHead title={section.title} subtitle={section.subtitle} rich />
-            <ul className="checklist">
-              {section.items?.map((key) => (
-                <li key={key}>
-                  <Icon name="check" size={18} />
-                  <span>{i18n.t(key)}</span>
-                </li>
-              ))}
-            </ul>
-            {section.footer && <p className="section-foot">{i18n.rich(section.footer)}</p>}
-            {section.extra && (
-              <div className="notice">
-                <Icon name="info" />
-                <div>
-                  <strong>{i18n.t(section.extra.title)}</strong>
-                  <p>{i18n.t(section.extra.text)}</p>
-                </div>
+        <ToolBlock title={section.title} lead={section.subtitle}>
+          <ul className="checklist">
+            {section.items?.map((key) => (
+              <li key={key}>
+                <Icon name="check" size={18} />
+                <span>{i18n.t(key)}</span>
+              </li>
+            ))}
+          </ul>
+          {section.footer && <p className="section-foot">{i18n.rich(section.footer)}</p>}
+          {section.extra && (
+            <div className="notice">
+              <Icon name="info" />
+              <div>
+                <strong>{i18n.t(section.extra.title)}</strong>
+                <p>{i18n.t(section.extra.text)}</p>
               </div>
-            )}
-          </div>
-        </section>
-      );
-    case "compare":
-      return (
-        <section className="section">
-          <div className="wrap">
-            <SectionHead title={section.title} subtitle={section.subtitle} />
-            <div className="compare">
-              {section.cols?.map((col, index) => (
-                <div key={col.label} className={index === 0 ? "compare-col ours glass" : "compare-col"}>
-                  <h3>{i18n.t(col.label)}</h3>
-                  <ul>
-                    {col.items.map((key) => (
-                      <li key={key}>{i18n.t(key)}</li>
-                    ))}
-                  </ul>
-                </div>
-              ))}
             </div>
-            {section.cap && section.rate ? (
-              <p className="section-foot">{i18n.t(section.cap, { Rate: section.rate })}</p>
-            ) : null}
-            {section.footer && <p className="section-foot">{i18n.rich(section.footer)}</p>}
-            {section.note && <p className="fine">{i18n.t(section.note)}</p>}
-          </div>
-        </section>
+          )}
+        </ToolBlock>
       );
+    case "compare": {
+      // the columns share their rows, so line n of one sits beside line n of the other
+      const rows = 1 + Math.max(0, ...(section.cols ?? []).map((col) => col.items.length));
+      return (
+        <ToolBlock title={section.title} lead={section.subtitle}>
+          <div className="compare" style={{ "--rows": rows } as CSSProperties}>
+            {section.cols?.map((col) => (
+              <div key={col.label} className="compare-col">
+                <h3>{i18n.t(col.label)}</h3>
+                <ul role="list">
+                  {col.items.map((key) => (
+                    <li key={key}>{i18n.t(key)}</li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+          </div>
+          {section.cap && section.rate ? (
+            <p className="section-foot">{i18n.t(section.cap, { Rate: section.rate })}</p>
+          ) : null}
+          {section.footer && <p className="section-foot">{i18n.rich(section.footer)}</p>}
+          {section.note && <p className="fine">{i18n.t(section.note)}</p>}
+        </ToolBlock>
+      );
+    }
   }
+}
+
+/**
+ * A tool page block in the FAQ's frame: the heading on the left, the body
+ * on the right under a hairline, opened by the subtitle as a lead.
+ */
+function ToolBlock({ title, lead, children }: { title: string; lead?: string; children: ReactNode }) {
+  const i18n = useI18n();
+  return (
+    <section className="section tool-block">
+      <div className="wrap split">
+        <header className="split-head">
+          <h2>{i18n.t(title)}</h2>
+        </header>
+        <div className="split-body">
+          {lead && <p className="split-lead">{i18n.rich(lead)}</p>}
+          {children}
+        </div>
+      </div>
+    </section>
+  );
 }
 
 export function ToolSections() {
   const { data } = usePage<HomeData>();
   return <>{data.tool?.sections.map((section) => <ToolSection key={section.title} section={section} />)}</>;
-}
-
-export function RelatedTools() {
-  const { t, path } = useI18n();
-  const { data } = usePage<HomeData>();
-  if (!data.related?.length) return null;
-  return (
-    <section className="section">
-      <div className="wrap">
-        <SectionHead title="tool.related.title" subtitle="tool.related.subtitle" />
-        <ul className="related">
-          {data.related.map((tool) => (
-            <li key={tool.url}>
-              <Link href={path(`/${tool.url}`)}>
-                <strong>{t(tool.benefit)}</strong>
-                <span>{t(tool.description)}</span>
-              </Link>
-            </li>
-          ))}
-        </ul>
-      </div>
-    </section>
-  );
 }

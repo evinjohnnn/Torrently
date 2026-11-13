@@ -79,6 +79,12 @@ func (h *Handler) sitemap(c *gin.Context) {
 		ChangeFreq: "monthly",
 		Priority:   "0.7",
 		Links:      h.langLinks("/about"),
+	}, URL{
+		Loc:        h.baseURL + "/tools",
+		LastMod:    now,
+		ChangeFreq: "weekly",
+		Priority:   "0.8",
+		Links:      h.langLinks("/tools"),
 	})
 
 	for _, tool := range common.Tools {

@@ -8,6 +8,7 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/webtor-io/web-ui/handlers/about"
+	"github.com/webtor-io/web-ui/handlers/tools"
 	wa "github.com/webtor-io/web-ui/handlers/action"
 	japi "github.com/webtor-io/web-ui/handlers/api"
 	wau "github.com/webtor-io/web-ui/handlers/auth"
@@ -496,6 +497,9 @@ func serve(c *cli.Context) error {
 
 	// Setting About
 	about.RegisterHandler(r, tm)
+
+	// Setting Tools
+	tools.RegisterHandler(r, tm)
 
 	// Setting Speedtest
 	speedtest.RegisterHandler(r, tm, sapi, pg, offers)

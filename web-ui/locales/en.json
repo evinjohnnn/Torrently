@@ -1990,6 +1990,18 @@
     "aboutPage.osP2": "We believe that transparency builds trust. You can inspect the code, report issues, suggest features, or contribute directly.",
     "aboutPage.ctaText": "Ready to try it?",
     "aboutPage.ctaButton": "Try Torrently",
+    "toolsPage.title": "All Torrent Tools — Stream, Download & Convert Online",
+    "toolsPage.description": "Every Torrently tool in one place: download torrents over HTTPS, stream them in the browser, convert magnet links and .torrent files, and watch on Stremio. Nothing to install.",
+    "toolsPage.heading": "Every tool, one place",
+    "toolsPage.lede": "Download, stream and convert torrents right in your browser. Pick what you need to do.",
+    "toolsPage.search": "Find a tool",
+    "toolsPage.empty": "No tool matches “{{.Query}}”. Try a shorter word.",
+    "toolsPage.count": {
+        "one": "{{.Count}} tool",
+        "other": "{{.Count}} tools"
+    },
+    "toolsPage.resultCount": "Showing {{.Count}} of {{.Total}}",
+    "toolsPage.clear": "Clear search",
     "time.now": "just now",
     "time.seconds": "%v seconds ago",
     "time.minute": "1 minute ago",

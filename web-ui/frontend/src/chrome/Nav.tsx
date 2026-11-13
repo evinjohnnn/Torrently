@@ -22,6 +22,7 @@ function useItems(): Item[] {
       { href: path("/lib/"), label: t("nav.library"), icon: "library" },
     ];
     if (session.vault) items.push({ href: path("/vault"), label: t("nav.vault"), icon: "vault" });
+    items.push({ href: path("/tools"), label: t("footer.tools"), icon: "puzzle" });
     items.push({
       href: path("/notifications"),
       label: t("nav.notifications"),
@@ -37,6 +38,7 @@ function useItems(): Item[] {
     { href: `${base}#how`, label: t("nav.howItWorks"), icon: "info" },
     { href: `${base}#features`, label: t("nav.features"), icon: "sparkle" },
     { href: `${base}#faq`, label: t("nav.faq"), icon: "info" },
+    { href: path("/tools"), label: t("footer.tools"), icon: "puzzle" },
   ];
 }
 
@@ -195,16 +197,18 @@ export function Nav() {
         <div className="nav-end">
           <LanguageMenu />
           <Account />
-          <button
-            type="button"
-            className="icon-button nav-toggle"
-            aria-expanded={open}
-            aria-controls="nav-sheet"
-            aria-label={t("nav.menu")}
-            onClick={() => setOpen(!open)}
-          >
-            <Icon name={open ? "close" : "menu"} />
-          </button>
+          {items.length > 0 && (
+            <button
+              type="button"
+              className="icon-button nav-toggle"
+              aria-expanded={open}
+              aria-controls="nav-sheet"
+              aria-label={t("nav.menu")}
+              onClick={() => setOpen(!open)}
+            >
+              <Icon name={open ? "close" : "menu"} />
+            </button>
+          )}
         </div>
       </nav>
       {open && (

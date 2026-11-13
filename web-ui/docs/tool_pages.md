@@ -61,8 +61,8 @@
 | Ключ | Где виден |
 |---|---|
 | `Title` | начало `<title>` и `og:title` (`Title – Benefit`), `name` в JSON-LD `WebApplication`, анкор ссылки в футере (у гайдов — в отдельной колонке); у гайда ещё и H1 |
-| `Benefit` | хвост `<title>`, заголовок карточки в «related tools» на всех остальных tool-страницах; у не-гайда — H1, у гайда — строка под H1 |
-| `Description` | `<meta name="description">`, абзац под hero, текст карточки «related tools» |
+| `Benefit` | хвост `<title>`, строка под названием в списке `/tools` (в классическом UI — заголовок карточки «related tools» на остальных tool-страницах); у не-гайда — H1, у гайда — строка под H1 |
+| `Description` | `<meta name="description">`, абзац под hero; в классическом UI — текст карточки «related tools» |
 
 H1 рендерит `tool_heading` (`templates/partials/about/heading.html`), его
 вызывает hero в `templates/views/index.html`. У обычной tool-страницы H1 —

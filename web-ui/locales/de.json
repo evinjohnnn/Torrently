@@ -1897,6 +1897,18 @@
     "aboutPage.osP2": "Wir glauben, dass Transparenz Vertrauen schafft. Sie können den Code inspizieren, Fehler melden, Verbesserungen vorschlagen oder direkt beitragen.",
     "aboutPage.ctaText": "Bereit es auszuprobieren?",
     "aboutPage.ctaButton": "Torrently starten",
+    "toolsPage.title": "Alle Tools — Torrents online streamen, herunterladen und konvertieren",
+    "toolsPage.description": "Alle Torrently-Tools an einem Ort: Torrents über HTTPS herunterladen, im Browser streamen, Magnet-Links und .torrent-Dateien konvertieren und mit Stremio ansehen. Nichts zu installieren.",
+    "toolsPage.heading": "Alle Tools an einem Ort",
+    "toolsPage.lede": "Lade Torrents direkt im Browser herunter, streame und konvertiere sie. Wähle, was du tun möchtest.",
+    "toolsPage.search": "Tool finden",
+    "toolsPage.empty": "Kein Tool passt zu „{{.Query}}“. Versuch es mit einem kürzeren Wort.",
+    "toolsPage.count": {
+        "one": "{{.Count}} Tool",
+        "other": "{{.Count}} Tools"
+    },
+    "toolsPage.resultCount": "Zeigt {{.Count}} von {{.Total}}",
+    "toolsPage.clear": "Suche leeren",
     "time.now": "gerade eben",
     "time.seconds": "vor %v Sekunden",
     "time.minute": "vor 1 Minute",

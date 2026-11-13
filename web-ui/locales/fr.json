@@ -1901,6 +1901,18 @@
     "aboutPage.osP2": "Nous pensons que la transparence bâtit la confiance. Vous pouvez inspecter le code, signaler des bugs, proposer des fonctionnalités ou contribuer directement.",
     "aboutPage.ctaText": "Prêt à essayer ?",
     "aboutPage.ctaButton": "Essayer Torrently",
+    "toolsPage.title": "Tous les outils — regardez, téléchargez et convertissez des torrents en ligne",
+    "toolsPage.description": "Tous les outils Torrently au même endroit : téléchargez des torrents en HTTPS, regardez-les dans le navigateur, convertissez liens magnet et fichiers .torrent, et regardez sur Stremio. Rien à installer.",
+    "toolsPage.heading": "Tous les outils, au même endroit",
+    "toolsPage.lede": "Téléchargez, regardez et convertissez des torrents directement dans votre navigateur. Choisissez ce que vous voulez faire.",
+    "toolsPage.search": "Trouver un outil",
+    "toolsPage.empty": "Aucun outil ne correspond à « {{.Query}} ». Essayez un mot plus court.",
+    "toolsPage.count": {
+        "one": "{{.Count}} outil",
+        "other": "{{.Count}} outils"
+    },
+    "toolsPage.resultCount": "Affichage de {{.Count}} sur {{.Total}}",
+    "toolsPage.clear": "Effacer la recherche",
     "time.now": "à l'instant",
     "time.seconds": "il y a %v secondes",
     "time.minute": "il y a 1 minute",

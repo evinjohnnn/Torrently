@@ -25,14 +25,6 @@ type Home struct {
 	Onboarding       *Onboarding    `json:"onboarding,omitempty"`
 	AI               *AI            `json:"ai,omitempty"`
 	FAQ              []FAQItem      `json:"faq"`
-	// Related are the other tool pages, linked under a tool page.
-	Related []RelatedTool `json:"related,omitempty"`
-}
-
-type RelatedTool struct {
-	URL         string `json:"url"`
-	Benefit     string `json:"benefit"`
-	Description string `json:"description"`
 }
 
 // AI is set when the instance runs AI recommendations: the home page then
@@ -149,11 +141,6 @@ func (cfg *config) home(ctx *web.Context) (any, error) {
 	}
 	if tool != nil {
 		out.Tool = cfg.toolOf(tool)
-		for _, t := range common.Tools {
-			if t.Url != tool.Url {
-				out.Related = append(out.Related, RelatedTool{URL: t.Url, Benefit: t.Benefit, Description: t.Description})
-			}
-		}
 	}
 	out.FAQ = cfg.faq(tool)
 	for _, w := range watch {
